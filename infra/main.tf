@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.9"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -72,7 +72,7 @@ resource "aws_security_group" "gpu_nodes" {
     from_port   = var.container_port
     to_port     = var.container_port
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.allowed_ingress_cidrs
   }
 
   egress {
@@ -122,6 +122,12 @@ resource "aws_launch_template" "gpu" {
   image_id      = data.aws_ssm_parameter.ecs_gpu_ami.value
   instance_type = var.instance_type
 
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
   iam_instance_profile { arn = aws_iam_instance_profile.ecs_instance.arn }
 
   network_interfaces {
@@ -153,7 +159,7 @@ resource "aws_autoscaling_group" "gpu" {
 
   launch_template {
     id      = aws_launch_template.gpu.id
-    version = "$Latest"
+    version = aws_launch_template.gpu.latest_version
   }
 
   tag {
