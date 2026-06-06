@@ -88,6 +88,10 @@ python3 llm_decode_bench.py --host https://openrouter.ai --api-key sk-or-... --m
 # Skip prefill phase for quick decode-only testing
 python3 llm_decode_bench.py --skip-prefill --concurrency 1,2,4 --contexts 0
 
+# Distinct-prefix KV mode: each concurrent request gets its own prefix, reused across sizes
+python3 llm_decode_bench.py --port 5001 --distinct-prefixes \
+    --concurrency 1,2,4,8 --contexts 16384,32768,65536
+
 # Manual KV cache budget (for vLLM where auto-detection is unreliable)
 python3 llm_decode_bench.py --port 5199 --kv-budget 692736
 
@@ -147,6 +151,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--output` | `benchmark_results.json` | Output file path |
 | `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
 | `--skip-prefill` | | Skip prefill reporting entirely |
+| `--distinct-prefixes` | `false` | Give each concurrent request a distinct, cross-size-reusable KV prefix; column-by-column traversal (each concurrency swept through contexts ascending) so lanes reuse their smaller-size prefix; per-(ctx,conc) prefill grid; fixed-token decode per lane |
 
 ## Measurement Methodology
 
@@ -203,6 +208,44 @@ validation fields are unavailable.
 Use this section as the main tuning/regression signal for kernels, NCCL, DCP,
 MTP, scheduler, and KV-cache changes. It answers: "How much decode throughput
 can the engine sustain once it is already running this concurrency?"
+
+### Distinct-Prefix KV Mode
+
+By default every concurrent request in a cell sends the same prompt, so the
+engine keeps one shared prefix and decode runs under almost no KV-prefix
+pressure. `--distinct-prefixes` instead gives each of the `C` requests its own
+distinct prefix, modelling `C` long-context users, to find the context and
+concurrency where the KV cache runs out and throughput collapses. It traverses
+**column-by-column** — each concurrency level is swept through the contexts
+ascending — so a lane runs 8k → 32k → 128k consecutively and each size re-hits
+the prefix the previous (smaller) cell just cached, with nothing in between to
+evict it.
+
+Each cell first warms its `C` distinct prefixes with `max_tokens=1` scouts,
+reported as a per-`(ctx, conc)` **prefill-speed grid** counting only the
+**newly-computed** tokens (`(prompt_tokens − cached_tokens) / wall`), so a larger
+context that reuses its cached smaller prefix doesn't inflate the rate. Each lane
+then sends one fixed-token request the cell waits to complete. Two reuse signals
+are shown by their source: the server-side prefix-cache **hit %** (vLLM
+`/metrics` counters, baselined after the scout so it reflects decode reuse) in
+the prefill grid; and the client-side **c%** (`cached_tokens` reported in the
+decode response, needs `--enable-prompt-tokens-details`) in the decode grid. The
+hit % also shows live in the SERVER panel with a sparkline and as a grid in the report.
+Repeating a prompt re-uses its warm prefix, so the hit % is high at low
+concurrency; once `C` distinct prefixes exceed KV they evict each other and
+re-prefill every time, so the hit % falls toward zero and throughput collapses.
+
+The decode and prefill grids render side-by-side, and capacity-limited cells show
+their measured tok/s with a `*` marker rather than `∅`, since underfilling the
+requested concurrency is the expected signal here. In this mode `--duration` defaults to 6s and the readiness warmup is capped at
+10s, so a capacity-limited cell doesn't sit in the scaled warmup timeout (up to
+180s at 128k) before measuring. The mode is Sustained Decode only and is mutually
+exclusive with `--completion-stats`/`--test-profile`,
+`--request-count`/`--run-burst`, and the standalone-prefill flags. JSON gains
+`prefill_grid`, per-cell `prefill_*`/`prefix_cache_*` fields, and `prefix_mode` /
+`matrix_traversal` metadata. For per-request `cached_tokens` in `usage`, start
+vLLM with `--enable-prompt-tokens-details` (off by default); the per-cell
+cross-size reuse % is then shown next to the hit %.
 
 ### Burst / E2E Decode
 
