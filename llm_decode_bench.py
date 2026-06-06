@@ -57,7 +57,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.24"
+VERSION = "0.4.25"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -4089,6 +4089,18 @@ class CellResult:
     server_utilization: float = 0.0
     server_spec_accept_rate: float = 0.0
     server_spec_accept_length: float = 0.0
+    # Server prefix-cache hit rate over this cell (Prometheus counter delta).
+    # -1.0 = unavailable (server exposes no prefix-cache counters).
+    prefix_cache_hit_rate: float = -1.0
+    prefix_cache_queries: int = 0
+    prefix_cache_hits: int = 0
+    # Separate measurement: actual usage.prompt_tokens_details.cached_tokens summed
+    # across this cell's decode requests (only when the server reports the field,
+    # i.e. vLLM --enable-prompt-tokens-details). decode_cached_available gates display.
+    decode_cached_tokens: int = 0
+    decode_input_tokens: int = 0
+    decode_cached_fraction: float = 0.0
+    decode_cached_available: bool = False
     # Queue / effective concurrency tracking
     avg_running_reqs: float = 0.0
     max_running_reqs: int = 0
@@ -4103,6 +4115,21 @@ class CellResult:
     timeout_reason: str = ""
     capacity_limited: bool = False
     hardware_summary: dict = field(default_factory=dict)
+    # --- distinct-prefixes prefill grid (populated only in --distinct-prefixes mode) ---
+    prefill_measured: bool = False          # True only when the C-scout grid cell ran
+    prefill_tps: float = 0.0                # sum(prompt_tokens) / prefill_wall (cell aggregate)
+    prefill_prompt_tokens: int = 0          # sum of per-lane prompt_tokens
+    prefill_wall: float = 0.0               # wall time of the C-scout asyncio.gather
+    prefill_ttft_avg: float = 0.0
+    prefill_ttft_p50: float = 0.0
+    prefill_ttft_p90: float = 0.0
+    prefill_ttft_p99: float = 0.0
+    prefill_lanes: int = 0                  # how many scouts fired (== concurrency normally)
+    prefill_lanes_ok: int = 0               # scouts that returned a usable TTFT/prompt_tokens
+    prefill_cached_tokens: int = 0          # sum of usage.prompt_tokens_details.cached_tokens
+    prefill_cached_tokens_available: bool = False  # server reported the field at all
+    prefill_reused_fraction: float = 0.0    # cached_tokens / prompt_tokens (0..1)
+    prefill_per_lane: list = field(default_factory=list)  # [{lane, ttft, prompt_tokens, cached_tokens, ok}]
 
 
 @dataclass
@@ -4197,6 +4224,10 @@ class TUIState:
     srv_utilization: float = 0.0
     srv_spec_accept_rate: float = 0.0
     srv_spec_accept_length: float = 0.0
+    srv_prefix_cache_hit_rate: float = -1.0  # -1 = unavailable; else 0..1 over current cell
+    pc_cell_baseline: object = None          # (queries, hits) counter snapshot at cell start
+    pc_details_seen: bool = False            # any request reported prompt_tokens_details (flag is on)
+    pc_hit_history: list = field(default_factory=list)  # rolling 0..1 hit-rate samples over the run
     # Results
     results: dict = field(default_factory=dict)  # (ctx, conc) -> aggregate_tps
     errors: dict = field(default_factory=dict)   # (ctx, conc) -> num_errors
@@ -4204,6 +4235,9 @@ class TUIState:
     client_info: dict = field(default_factory=dict)  # (ctx, conc) -> compact per-cell client metrics
     concurrency_levels: list = field(default_factory=list)
     context_lengths: list = field(default_factory=list)
+    # Distinct-prefixes mode (per-(ctx,conc) prefill grid)
+    distinct_prefixes: bool = False
+    prefill_grid: dict = field(default_factory=dict)  # (ctx, conc) -> {tps, reused, cached_available}
     # Prefill results: ctx -> {ttft, tok_per_sec}
     prefill_results: dict = field(default_factory=dict)
     prefill_contexts: list = field(default_factory=list)
@@ -7501,10 +7535,13 @@ def render_live_stats_panel(state: TUIState) -> Panel:
         )
     else:
         rows.append("[dim]client latency: waiting for completed stream samples[/dim]")
-    rows.append(
+    server_row = (
         f"[dim]server[/dim] run={state.srv_running_reqs} q={state.srv_queue_reqs} "
         f"kv={state.srv_utilization:.2%}"
     )
+    if state.srv_prefix_cache_hit_rate >= 0:
+        server_row += f" [dim]pchit[/dim] {state.srv_prefix_cache_hit_rate:.1%}"
+    rows.append(server_row)
     if state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0:
         rows.append(
             f"[dim]spec[/dim] accept={state.srv_spec_accept_rate:.1%} "
@@ -7706,6 +7743,68 @@ def sum_metric(metrics: dict, name: str, label_filter: str = "") -> float:
     return total
 
 
+def read_prefix_cache_counters(metrics: dict, engine: str):
+    """Return cumulative (queries, hits) prefix-cache counters, or None.
+
+    Used to compute a per-cell prefix-cache hit rate from the counter delta.
+    Currently counter-based for vLLM; SGLang exposes a cumulative rate gauge
+    instead (handled separately at the call site)."""
+    qname = metric_name(engine, "prefix_cache_queries")
+    hname = metric_name(engine, "prefix_cache_hits")
+    if not qname or not hname:
+        return None
+    if not has_metric(metrics, qname):
+        return None
+    return (sum_metric(metrics, qname), sum_metric(metrics, hname))
+
+
+def update_state_prefix_cache(state, metrics: dict, engine: str) -> None:
+    """Update the live server prefix-cache hit rate on ``state`` from a metrics dict.
+
+    Prefers the per-cell counter delta (vLLM); falls back to a cumulative rate
+    gauge (SGLang). Leaves the value at -1 when the server exposes neither."""
+    base = getattr(state, "pc_cell_baseline", None)
+    if base is not None:
+        cur = read_prefix_cache_counters(metrics, engine)
+        if cur is not None:
+            dq = cur[0] - base[0]
+            dh = cur[1] - base[1]
+            if dq > 0:
+                state.srv_prefix_cache_hit_rate = max(0.0, min(1.0, dh / dq))
+            return
+    gname = metric_name(engine, "prefix_cache_hit_rate")
+    if gname and has_metric(metrics, gname):
+        v = extract_metric(metrics, gname)
+        state.srv_prefix_cache_hit_rate = (v / 100.0) if v > 1.5 else max(0.0, v)
+    if state.srv_prefix_cache_hit_rate >= 0:
+        state.pc_hit_history.append(state.srv_prefix_cache_hit_rate)
+        if len(state.pc_hit_history) > 240:
+            state.pc_hit_history = state.pc_hit_history[-240:]
+
+
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def render_hit_trace(samples: list, width: int = 16) -> str:
+    """Fixed-scale 0..1 sparkline for the prefix-cache hit rate over time."""
+    if not samples:
+        return ""
+    if len(samples) > width:
+        values = []
+        for i in range(width):
+            start = int(i * len(samples) / width)
+            end = int((i + 1) * len(samples) / width)
+            chunk = samples[start:max(end, start + 1)]
+            values.append(sum(chunk) / len(chunk))
+    else:
+        values = samples
+    out = []
+    for v in values:
+        v = max(0.0, min(1.0, v))
+        out.append(SPARK_BLOCKS[int(round(v * (len(SPARK_BLOCKS) - 1)))])
+    return "".join(out)
+
+
 def has_metric(metrics: dict, name: str, label_filter: str = "") -> bool:
     if not name:
         return False
@@ -7828,6 +7927,7 @@ def metric_name(engine: str, key: str) -> str:
             "request_success_total": "sglang:num_requests_total",
             "prefill_time_count": "sglang:per_stage_req_latency_seconds_count",
             "prefill_time_sum": "sglang:per_stage_req_latency_seconds_sum",
+            "prefix_cache_hit_rate": "sglang:cache_hit_rate",
         },
         ENGINE_VLLM: {
             "gen_throughput": "vllm:avg_generation_throughput_toks_per_s",
@@ -7844,6 +7944,8 @@ def metric_name(engine: str, key: str) -> str:
             "request_success_total": "vllm:request_success_total",
             "prefill_time_count": "vllm:request_prefill_time_seconds_count",
             "prefill_time_sum": "vllm:request_prefill_time_seconds_sum",
+            "prefix_cache_queries": "vllm:prefix_cache_queries_total",
+            "prefix_cache_hits": "vllm:prefix_cache_hits_total",
         },
         ENGINE_OPENAI_PROXY: {},
     }
@@ -7931,6 +8033,7 @@ async def wait_prefill_task_with_live(
             state.srv_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
             state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
             state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
+            update_state_prefix_cache(state, metrics, engine)
         live.update(build_display(state))
         await asyncio.sleep(0.5)
     return await request_task
@@ -7968,6 +8071,7 @@ async def stream_one_request(
     shared_usage_token_count: list = None,
     shared_usage_last_time: list = None,
     shared_token_last_time: list = None,
+    shared_cached: list = None,   # separate cell counter: [cached_tokens, prompt_tokens, available]
 ) -> StreamResult:
     """Stream requests in a loop until cancel_event. When a request finishes
     (hits max_tokens or EOS), immediately start a new one to keep concurrency
@@ -7988,6 +8092,7 @@ async def stream_one_request(
             # await, so this is enough to hand out exact request slots.
             shared_started_count[0] += 1
         usage_tokens = None
+        usage = None
         prompt_tokens = 0
         req_start = time.monotonic()
         req_first = None
@@ -7997,6 +8102,8 @@ async def stream_one_request(
         req_chunks = 0
         req_completed = False
         req_last_usage_tokens = 0
+        req_cached_tokens = 0
+        req_cached_available = False
         try:
             async with client.stream("POST", url, json=payload, timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
                 if resp.status_code != 200:
@@ -8083,6 +8190,19 @@ async def stream_one_request(
         except Exception as e:
             result.error = f"{type(e).__name__}: {e}"
             break
+
+        # Separate cell counter: actual cached_tokens for this request (needs vLLM
+        # --enable-prompt-tokens-details). Count EVERY completed prefill in the
+        # denominator — a cold lane reports no prompt_tokens_details (cached 0), so
+        # excluding it would inflate the fraction (e.g. one warm + one cold lane).
+        # availability flag is set only when at least one lane reported the field,
+        # so we don't claim 0% when the flag is simply off.
+        if shared_cached is not None and req_completed and usage and prompt_tokens:
+            shared_cached[1] += int(prompt_tokens)
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict) and "cached_tokens" in details:
+                shared_cached[0] += int(details["cached_tokens"] or 0)
+                shared_cached[2] = 1
 
         req_output_tokens = usage_tokens if usage_tokens is not None else req_chunks
         if req_first is not None and req_output_tokens > 0:
@@ -8341,6 +8461,8 @@ async def run_one_cell(
     request_count: int = 0,
     warmup_request_count: int = 0,
     cell_warmup_timeout_seconds: Optional[float] = None,
+    distinct_payloads: list = None,        # distinct mode: per-lane decode payloads (len == concurrency)
+    distinct_scout_payloads: list = None,  # distinct mode: per-lane scout payloads (max_tokens=1)
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     stream_options = {"include_usage": True}
@@ -8370,6 +8492,7 @@ async def run_one_cell(
     shared_request_samples = []
     shared_usage_last_time = [0.0]
     shared_token_last_time = [0.0]
+    shared_cached = [0, 0, 0]  # [cached_tokens, prompt_tokens, available] over the cell
 
     # Fresh client per cell — avoids stale keepalive connections from previous cells
     cell_limits = httpx.Limits(
@@ -8401,10 +8524,150 @@ async def run_one_cell(
     hw_measurement_start_idx = hw_cell_start_idx
     add_event(state, f"cell start C={concurrency} ctx={format_context(context_tokens)}")
 
+    # Prefix-cache hit-rate state for THIS cell. The baseline is snapshotted AFTER
+    # the scout (below), so the rate measures decode reuse and is not dragged down
+    # by the one-time cold scout prefill (which would otherwise put a lightly-loaded
+    # cell near ~50%: one cold scout + one warm decode = half the queries).
+    state.srv_prefix_cache_hit_rate = -1.0
+    state.pc_cell_baseline = None
+
+    cell_prefill = None  # distinct mode: per-cell prefill-grid measurement
+
+    # Distinct-prefixes prefill-grid cell: fire C concurrent scouts, one per lane,
+    # each warming its OWN distinct prefix. The aggregate (sum prompt_tokens / wall)
+    # is this (ctx, conc) cell's prefill throughput; usage.prompt_tokens_details.
+    # cached_tokens (when exposed) measures how much of each lane's prefix was
+    # re-hit from the same lane's smaller-size run.
+    if context_tokens > 0 and distinct_scout_payloads is not None:
+        old_prefill_phase = state.prefill_phase
+        old_prefill_status = state.prefill_status
+        state.prefill_phase = True
+        state.prefill_status = (
+            f"distinct prefill: warming {concurrency} lanes ctx={format_context(context_tokens)}"
+        )
+        state.prefill_method = "distinct_grid"
+        add_event(state, f"distinct prefill start C={concurrency} ctx={format_context(context_tokens)}")
+        live.update(build_display(state))
+
+        async def _scout_lane(lane_payload):
+            t0 = time.monotonic()
+            ttft = None
+            prompt_tokens = None
+            cached_tokens = 0
+            cached_available = False
+            ok = False
+            try:
+                async with client.stream("POST", url, json=lane_payload,
+                                         timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            ok = True
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        usage = data.get("usage")
+                        if usage:
+                            if "prompt_tokens" in usage:
+                                prompt_tokens = usage["prompt_tokens"]
+                            details = usage.get("prompt_tokens_details")
+                            if isinstance(details, dict) and "cached_tokens" in details:
+                                cached_tokens = int(details["cached_tokens"] or 0)
+                                cached_available = True
+                        if ttft is None and data.get("choices"):
+                            delta = data["choices"][0].get("delta", {})
+                            if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
+                                ttft = time.monotonic() - t0
+                    if prompt_tokens is not None or ttft is not None:
+                        ok = True
+            except Exception:
+                ok = False
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            return {
+                "ttft": ttft,
+                "prompt_tokens": int(prompt_tokens or 0),
+                "cached_tokens": cached_tokens,
+                "cached_available": cached_available,
+                "ok": ok,
+            }
+
+        prefill_t0 = time.monotonic()
+        # asyncio.gather(...) returns a (_Gathering)Future, not a coroutine, so it
+        # must NOT be wrapped in create_task. It is awaitable and has .done(), which
+        # is all wait_prefill_task_with_live needs to pump the live dashboard.
+        gather_task = asyncio.gather(*[_scout_lane(p) for p in distinct_scout_payloads])
+        lane_results = await wait_prefill_task_with_live(
+            gather_task, client, base_url, engine, state, live,
+            f"distinct prefill: warming {concurrency} lanes",
+        )
+        prefill_wall = time.monotonic() - prefill_t0
+
+        ok_lanes = [r for r in lane_results if r.get("ok")]
+        prompt_total = sum(r["prompt_tokens"] for r in lane_results)
+        cached_total = sum(r["cached_tokens"] for r in lane_results)
+        cached_available = any(r["cached_available"] for r in lane_results)
+        ttfts = [r["ttft"] for r in ok_lanes if r["ttft"] and r["ttft"] > 0]
+        # Prefill speed counts only NEW tokens actually computed: when a larger
+        # context reuses its smaller cached prefix, the cached portion was a near-
+        # instant cache hit, not real prefill work. Counting the full prompt would
+        # inflate the rate as context grows. (cached_total is 0 without the flag.)
+        new_total = max(0, prompt_total - cached_total) if cached_available else prompt_total
+        prefill_tps = (new_total / prefill_wall) if prefill_wall > 0 else 0.0
+        reused_fraction = (cached_total / prompt_total) if (prompt_total > 0 and cached_available) else 0.0
+        cell_prefill = {
+            "tps": prefill_tps,
+            "new_tokens": new_total,
+            "prompt_tokens": prompt_total,
+            "wall": prefill_wall,
+            "ttft_avg": (mean(ttfts) if ttfts else 0.0),
+            "ttft_p50": percentile(ttfts, 50) if ttfts else 0.0,
+            "ttft_p90": percentile(ttfts, 90) if ttfts else 0.0,
+            "ttft_p99": percentile(ttfts, 99) if ttfts else 0.0,
+            "lanes": len(lane_results),
+            "lanes_ok": len(ok_lanes),
+            "cached_tokens": cached_total,
+            "cached_available": cached_available,
+            "reused_fraction": reused_fraction,
+            "per_lane": [
+                {
+                    "lane": i,
+                    "ttft": r["ttft"],
+                    "prompt_tokens": r["prompt_tokens"],
+                    "cached_tokens": r["cached_tokens"],
+                    "ok": r["ok"],
+                }
+                for i, r in enumerate(lane_results)
+            ],
+        }
+        state.prefill_grid[(context_tokens, concurrency)] = {
+            "tps": prefill_tps,
+            "reused": reused_fraction,
+            "cached_available": cached_available,
+        }
+        state.prefill_last_tps = prefill_tps
+        state.prefill_last_tokens = prompt_total
+        state.prefill_last_seconds = prefill_wall
+        state.prefill_status = "distinct prefill complete"
+        add_event(
+            state,
+            f"distinct prefill done C={concurrency} ctx={format_context(context_tokens)} "
+            f"{prefill_tps:,.0f} tok/s"
+            + (f" reuse {reused_fraction:.0%}" if cached_available else ""),
+        )
+        state.prefill_phase = old_prefill_phase
+        state.prefill_status = old_prefill_status
+        live.update(build_display(state))
+
     # Scout request: ensure prefix cache is warm before launching full concurrency.
     # Send one request with max_tokens=1 to populate/refresh prefix cache,
     # then all C requests will get cache hits instead of competing for prefill.
-    if context_tokens > 0:
+    elif context_tokens > 0:
         scout_payload = {
             "model": model,
             "messages": messages,
@@ -8513,7 +8776,185 @@ async def run_one_cell(
             state.prefill_status = old_prefill_status
         live.update(build_display(state))
 
+    # Baseline the prefix-cache counters now (after the scout warmed the prefixes),
+    # so the per-cell hit % and the live readout measure decode reuse only.
+    if state.metrics_available:
+        try:
+            state.pc_cell_baseline = read_prefix_cache_counters(
+                await scrape_metrics(client, base_url), engine
+            )
+        except Exception:
+            state.pc_cell_baseline = None
+
     metrics_interval = 1.0
+
+    # ---- Distinct-prefixes: fixed-token decode. Each lane sends ONE request and we
+    # WAIT for it to finish (deterministic work per lane) instead of measuring a fixed
+    # time window. No re-prefill churn, no window-timing artifacts; requests complete
+    # so the server returns usage.prompt_tokens_details.cached_tokens. ----
+    if distinct_payloads is not None:
+        state.cell_warmup = False
+        state.benchmark_mode = "fixed-token"
+        state.request_count_target = concurrency
+        state.cell_tokens = 0
+        state.cell_live_tps = 0.0
+        decode_t0 = time.monotonic()
+        state.cell_measurement_start = decode_t0
+        decode_cancel = asyncio.Event()
+        decode_deadline = decode_t0 + 120.0  # bound the wait so a thrashing cell can't hang
+        tasks = [
+            asyncio.create_task(
+                stream_one_request(
+                    cell_client, url, distinct_payloads[i], i, decode_cancel,
+                    shared_token_count, shared_active_streams, shared_request_samples,
+                    shared_started_count=[0],   # per-worker: exactly ONE request per lane
+                    target_request_count=1,
+                    shared_usage_token_count=shared_usage_token_count,
+                    shared_usage_last_time=shared_usage_last_time,
+                    shared_token_last_time=shared_token_last_time,
+                    shared_cached=shared_cached,
+                )
+            )
+            for i in range(concurrency)
+        ]
+        last_scrape = 0.0
+        timed_out = False
+        while not all(t.done() for t in tasks):
+            now = time.monotonic()
+            state.cell_tokens = shared_token_count[0]
+            state._active_streams = shared_active_streams[0]
+            update_state_request_stats(state, shared_request_samples)
+            el = now - decode_t0
+            if el > 0.3 and shared_usage_token_count[0] > 0:
+                state.cell_live_tps = shared_usage_token_count[0] / el
+            if now - last_scrape > metrics_interval:
+                metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
+                if state.metrics_available:
+                    state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
+                    state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
+                    state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+                    update_state_prefix_cache(state, metrics, engine)
+                last_scrape = now
+            live.update(build_display(state))
+            if _skip_event.is_set():
+                _skip_event.clear()
+                decode_cancel.set()
+                break
+            if now > decode_deadline:
+                timed_out = True
+                add_event(state, f"fixed-token deadline C={concurrency} ctx={format_context(context_tokens)}")
+                decode_cancel.set()
+                break
+            await asyncio.sleep(0.2)
+        _, pending = await asyncio.wait(tasks, timeout=15.0)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=5.0)
+        decode_wall = time.monotonic() - decode_t0
+        stream_results = []
+        for t in tasks:
+            try:
+                stream_results.append(t.result())
+            except (asyncio.CancelledError, Exception):
+                stream_results.append(StreamResult(error="cancelled"))
+        samples = list(shared_request_samples)
+        rs = summarize_request_samples(samples)
+        total_tokens = shared_usage_token_count[0] or sum(s.output_tokens for s in samples)
+        num_completed = sum(1 for s in samples if s.completed and s.output_tokens > 0)
+        num_errors = sum(1 for sr in stream_results if getattr(sr, "error", None))
+        # Decode throughput over the burst, excluding the time before the first token.
+        min_ttft = min((s.ttft for s in samples if s.ttft > 0), default=0.0)
+        decode_window = max(0.001, decode_wall - min_ttft)
+        agg_tps = total_tokens / decode_window if total_tokens > 0 else 0.0
+        # Prefix-cache hit % (decode-phase counter delta) + actual decode cached_tokens.
+        final_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
+        cell_pc_hit_rate, cell_pc_q, cell_pc_h = -1.0, 0, 0
+        if state.pc_cell_baseline is not None:
+            pc_end = read_prefix_cache_counters(final_metrics, engine)
+            if pc_end is not None:
+                cell_pc_q = int(pc_end[0] - state.pc_cell_baseline[0])
+                cell_pc_h = int(pc_end[1] - state.pc_cell_baseline[1])
+                if cell_pc_q > 0:
+                    cell_pc_hit_rate = max(0.0, min(1.0, cell_pc_h / cell_pc_q))
+        # Once ANY request anywhere has reported prompt_tokens_details, we know the
+        # flag is on, so a completed cold cell (no field) is a real 0% — show it,
+        # don't hide it. Without ever seeing the field we can't tell 0 from flag-off.
+        if shared_cached[2]:
+            state.pc_details_seen = True
+        dcc, dcp = int(shared_cached[0]), int(shared_cached[1])
+        dcav = bool(state.pc_details_seen) and dcp > 0
+        dcf = (dcc / dcp) if (dcav and dcp > 0) else 0.0
+        if (context_tokens, concurrency) in state.prefill_grid:
+            state.prefill_grid[(context_tokens, concurrency)]["hit_rate"] = cell_pc_hit_rate
+            if dcav:
+                state.prefill_grid[(context_tokens, concurrency)]["decode_cached"] = dcf
+        cap_limited = num_completed < concurrency
+        cell = CellResult(
+            concurrency=concurrency,
+            context_tokens=context_tokens,
+            benchmark_mode="fixed-token",
+            request_count_target=concurrency,
+            measurement_seconds=round(decode_window, 6),
+            measurement_wall_seconds=round(decode_wall, 6),
+            client_output_tokens=total_tokens,
+            server_output_tokens=total_tokens,
+            aggregate_source="fixed_token_burst",
+            aggregate_tps=agg_tps,
+            per_request_avg_tps=rs["output_tps_per_user"]["avg"],
+            ttft_avg=rs["ttft"]["avg"], ttft_p50=rs["ttft"]["p50"], ttft_p90=rs["ttft"]["p90"], ttft_p99=rs["ttft"]["p99"],
+            time_to_second_token_avg=rs["time_to_second_token"]["avg"], time_to_second_token_p50=rs["time_to_second_token"]["p50"],
+            time_to_second_token_p90=rs["time_to_second_token"]["p90"], time_to_second_token_p99=rs["time_to_second_token"]["p99"],
+            request_latency_avg=rs["request_latency"]["avg"], request_latency_p50=rs["request_latency"]["p50"],
+            request_latency_p90=rs["request_latency"]["p90"], request_latency_p99=rs["request_latency"]["p99"],
+            inter_token_latency_avg=rs["inter_token_latency"]["avg"], inter_token_latency_p50=rs["inter_token_latency"]["p50"],
+            inter_token_latency_p90=rs["inter_token_latency"]["p90"], inter_token_latency_p99=rs["inter_token_latency"]["p99"],
+            output_tps_per_user_avg=rs["output_tps_per_user"]["avg"], output_tps_per_user_p50=rs["output_tps_per_user"]["p50"],
+            output_tps_per_user_p90=rs["output_tps_per_user"]["p90"], output_tps_per_user_p99=rs["output_tps_per_user"]["p99"],
+            e2e_output_tps_per_user_avg=rs["e2e_output_tps_per_user"]["avg"], e2e_output_tps_per_user_p50=rs["e2e_output_tps_per_user"]["p50"],
+            e2e_output_tps_per_user_p90=rs["e2e_output_tps_per_user"]["p90"], e2e_output_tps_per_user_p99=rs["e2e_output_tps_per_user"]["p99"],
+            chunk_inter_token_latency_avg=rs["chunk_inter_token_latency"]["avg"], chunk_inter_token_latency_p50=rs["chunk_inter_token_latency"]["p50"],
+            chunk_inter_token_latency_p90=rs["chunk_inter_token_latency"]["p90"], chunk_inter_token_latency_p99=rs["chunk_inter_token_latency"]["p99"],
+            input_seq_len_avg=rs["input_seq_len"]["avg"],
+            output_seq_len_avg=rs["output_seq_len"]["avg"], output_seq_len_p50=rs["output_seq_len"]["p50"],
+            output_seq_len_p90=rs["output_seq_len"]["p90"], output_seq_len_p99=rs["output_seq_len"]["p99"],
+            request_count=rs["request_count"], completed_request_count=rs["completed_request_count"],
+            request_samples=[asdict(s) for s in samples],
+            total_tokens=total_tokens, wall_time=decode_wall,
+            num_completed=num_completed, num_errors=num_errors,
+            capacity_limited=cap_limited,
+            timeout_reason=("incomplete (deadline)" if timed_out else ("incomplete" if cap_limited else "")),
+            prefix_cache_hit_rate=cell_pc_hit_rate, prefix_cache_queries=cell_pc_q, prefix_cache_hits=cell_pc_h,
+            decode_cached_tokens=dcc, decode_input_tokens=dcp, decode_cached_fraction=dcf, decode_cached_available=dcav,
+            prefill_measured=bool(cell_prefill),
+            prefill_tps=(cell_prefill or {}).get("tps", 0.0),
+            prefill_prompt_tokens=(cell_prefill or {}).get("prompt_tokens", 0),
+            prefill_wall=(cell_prefill or {}).get("wall", 0.0),
+            prefill_ttft_avg=(cell_prefill or {}).get("ttft_avg", 0.0),
+            prefill_ttft_p50=(cell_prefill or {}).get("ttft_p50", 0.0),
+            prefill_ttft_p90=(cell_prefill or {}).get("ttft_p90", 0.0),
+            prefill_ttft_p99=(cell_prefill or {}).get("ttft_p99", 0.0),
+            prefill_lanes=(cell_prefill or {}).get("lanes", 0),
+            prefill_lanes_ok=(cell_prefill or {}).get("lanes_ok", 0),
+            prefill_cached_tokens=(cell_prefill or {}).get("cached_tokens", 0),
+            prefill_cached_tokens_available=(cell_prefill or {}).get("cached_available", False),
+            prefill_reused_fraction=(cell_prefill or {}).get("reused_fraction", 0.0),
+            prefill_per_lane=(cell_prefill or {}).get("per_lane", []),
+            hardware_summary=summarize_hardware_history(state.hw_history[hw_cell_start_idx:]),
+        )
+        state.cell_running = False
+        state.results[(context_tokens, concurrency)] = cell.aggregate_tps
+        state.errors[(context_tokens, concurrency)] = cell.num_errors
+        state.queue_info[(context_tokens, concurrency)] = (float(num_completed), 0.0, cap_limited)
+        state.client_info[(context_tokens, concurrency)] = compact_client_info_from_cell(cell)
+        add_event(
+            state,
+            f"cell done C={concurrency} ctx={format_context(context_tokens)} "
+            f"{cell.aggregate_tps:.1f} tok/s ({num_completed}/{concurrency} done)",
+        )
+        live.update(build_display(state))
+        await cell_client.aclose()
+        return cell
 
     if request_count > 0:
         async def run_fixed_request_batch(target_count: int, record_samples: bool):
@@ -8673,6 +9114,7 @@ async def run_one_cell(
                     state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
                     state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
                     state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+                    update_state_prefix_cache(state, metrics, engine)
                 if engine == ENGINE_SGLANG:
                     state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
                     state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
@@ -8860,15 +9302,21 @@ async def run_one_cell(
         await cell_client.aclose()
         return cell
 
-    # Launch all streams on fresh client (no stale keepalive connections)
+    # Launch all streams on fresh client (no stale keepalive connections).
+    # In distinct mode each worker uses its OWN lane payload (distinct prefix),
+    # which stream_one_request reuses on every restart → the lane keeps re-hitting
+    # its own warmed prefix for the whole measured window.
     tasks = [
         asyncio.create_task(
-            stream_one_request(cell_client, url, payload, i, cancel_event,
+            stream_one_request(cell_client, url,
+                               (distinct_payloads[i] if distinct_payloads is not None else payload),
+                               i, cancel_event,
                                shared_token_count, shared_active_streams,
                                shared_request_samples,
                                shared_usage_token_count=shared_usage_token_count,
                                shared_usage_last_time=shared_usage_last_time,
-                               shared_token_last_time=shared_token_last_time)
+                               shared_token_last_time=shared_token_last_time,
+                               shared_cached=shared_cached)
         )
         for i in range(concurrency)
     ]
@@ -8948,6 +9396,7 @@ async def run_one_cell(
                 state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
                 state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
                 state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+                update_state_prefix_cache(state, metrics, engine)
             if engine == ENGINE_SGLANG:
                 state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
                 state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
@@ -9168,6 +9617,34 @@ async def run_one_cell(
 
     # Final metrics scrape
     metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
+    # Per-cell prefix-cache hit rate from the counter delta over this whole cell
+    # (prefill scout + decode). -1 when the server exposes no prefix-cache counters.
+    cell_pc_hit_rate = -1.0
+    cell_pc_queries = 0
+    cell_pc_hits = 0
+    if state.pc_cell_baseline is not None:
+        pc_end = read_prefix_cache_counters(metrics, engine)
+        if pc_end is not None:
+            cell_pc_queries = int(pc_end[0] - state.pc_cell_baseline[0])
+            cell_pc_hits = int(pc_end[1] - state.pc_cell_baseline[1])
+            if cell_pc_queries > 0:
+                cell_pc_hit_rate = max(0.0, min(1.0, cell_pc_hits / cell_pc_queries))
+    # Separate measurement: actual decode-request cached_tokens for the cell.
+    cell_decode_cached = int(shared_cached[0])
+    cell_decode_prompt = int(shared_cached[1])
+    cell_decode_cached_available = bool(shared_cached[2])
+    cell_decode_cached_fraction = (
+        max(0.0, min(1.0, cell_decode_cached / cell_decode_prompt))
+        if (cell_decode_cached_available and cell_decode_prompt > 0)
+        else 0.0
+    )
+    # Stash the finished cell's hit rate + cached fraction into the live prefill grid
+    # so the panel can show them inside the cell (alongside prefill tok/s).
+    if (context_tokens, concurrency) in state.prefill_grid:
+        state.prefill_grid[(context_tokens, concurrency)]["hit_rate"] = cell_pc_hit_rate
+        if cell_decode_cached_available:
+            state.prefill_grid[(context_tokens, concurrency)]["decode_cached"] = cell_decode_cached_fraction
+    update_state_prefix_cache(state, metrics, engine)
     if engine == ENGINE_SGLANG:
         final_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
     else:
@@ -9356,6 +9833,27 @@ async def run_one_cell(
         timeout_reason=timeout_reason,
         capacity_limited=capacity_limited,
         hardware_summary=summarize_hardware_history(state.hw_history[hw_measurement_start_idx:]),
+        prefix_cache_hit_rate=cell_pc_hit_rate,
+        prefix_cache_queries=cell_pc_queries,
+        prefix_cache_hits=cell_pc_hits,
+        decode_cached_tokens=cell_decode_cached,
+        decode_input_tokens=cell_decode_prompt,
+        decode_cached_fraction=cell_decode_cached_fraction,
+        decode_cached_available=cell_decode_cached_available,
+        prefill_measured=bool(cell_prefill),
+        prefill_tps=(cell_prefill or {}).get("tps", 0.0),
+        prefill_prompt_tokens=(cell_prefill or {}).get("prompt_tokens", 0),
+        prefill_wall=(cell_prefill or {}).get("wall", 0.0),
+        prefill_ttft_avg=(cell_prefill or {}).get("ttft_avg", 0.0),
+        prefill_ttft_p50=(cell_prefill or {}).get("ttft_p50", 0.0),
+        prefill_ttft_p90=(cell_prefill or {}).get("ttft_p90", 0.0),
+        prefill_ttft_p99=(cell_prefill or {}).get("ttft_p99", 0.0),
+        prefill_lanes=(cell_prefill or {}).get("lanes", 0),
+        prefill_lanes_ok=(cell_prefill or {}).get("lanes_ok", 0),
+        prefill_cached_tokens=(cell_prefill or {}).get("cached_tokens", 0),
+        prefill_cached_tokens_available=(cell_prefill or {}).get("cached_available", False),
+        prefill_reused_fraction=(cell_prefill or {}).get("reused_fraction", 0.0),
+        prefill_per_lane=(cell_prefill or {}).get("per_lane", []),
     )
 
     state.cell_running = False
@@ -9376,6 +9874,55 @@ async def run_one_cell(
 # ---------------------------------------------------------------------------
 # TUI rendering
 # ---------------------------------------------------------------------------
+
+def render_prefill_matrix_panel(state: TUIState, mode: str, narrow: bool, col_width: int) -> Panel:
+    """Distinct-mode prefill-speed grid: same ctx x conc axes as the decode grid.
+
+    Each cell is the (ctx, conc) NEW-token prefill rate (sum of newly-computed
+    tokens / wall of the concurrent C-scout warm-up) — the cached/reused portion is
+    excluded, so the rate doesn't inflate as a lane's context grows.
+    """
+    table = Table(
+        title=render_title("PREFILL tok/s", "new"),
+        title_justify="left",
+        box=TABLE_BOX,
+        border_style=FRAME_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+        expand=False,
+        pad_edge=False,
+    )
+    table.add_column("ctx\\C", style=f"bold {PHOSPHOR_SOFT}", min_width=5, no_wrap=True)
+    for conc in state.concurrency_levels:
+        table.add_column(str(conc), justify="right", min_width=col_width, max_width=col_width)
+    for ctx in state.context_lengths:
+        row = [format_context(ctx)]
+        for conc in state.concurrency_levels:
+            key = (ctx, conc)
+            cell = state.prefill_grid.get(key)
+            if ctx == 0:
+                row.append("[dim]-[/dim]")
+            elif cell:
+                # New-token prefill speed + the server-side prefix-cache hit %
+                # (from vLLM /metrics counters). The client-reported c% lives in
+                # the decode grid instead.
+                txt = f"[bold {PHOSPHOR}]{compact_decode_cell(cell['tps'], mode)}[/bold {PHOSPHOR}]"
+                hr = cell.get("hit_rate", -1)
+                if hr is not None and hr >= 0:
+                    hr_color = PHOSPHOR if hr >= 0.70 else (PHOSPHOR_SOFT if hr >= 0.30 else PHOSPHOR_WARN)
+                    txt += f" [{hr_color}]{hr*100:.0f}%[/{hr_color}]"
+                row.append(txt)
+            elif state.cell_running and key == (state.current_context, state.current_concurrency):
+                row.append("[dim]warm[/dim]" if not narrow else "[dim].[/dim]")
+            else:
+                row.append("[dim]...[/dim]")
+        table.add_row(*row)
+    return Panel(
+        table,
+        box=PANEL_BOX,
+        border_style=SUBTLE_BORDER,
+        padding=(0, 1) if not narrow else (0, 0),
+    )
+
 
 def build_display(state: TUIState) -> Layout:
     mode, term_width, term_height = live_layout_mode()
@@ -9521,10 +10068,12 @@ def build_display(state: TUIState) -> Layout:
                 # Measurement phase: progress bar from measurement_start or
                 # completed requests in request-count mode.
                 measure_elapsed = (time.monotonic() - state.cell_measurement_start) if state.cell_measurement_start > 0 else elapsed
-                if state.benchmark_mode == "request-count" and state.request_count_target > 0:
+                if state.benchmark_mode in ("request-count", "fixed-token") and state.request_count_target > 0:
+                    # Completion-based: each lane runs a fixed-token request we wait
+                    # for, so show lanes done out of C and the open-ended elapsed time.
                     pct = min(state.cell_completed_requests / state.request_count_target, 1.0)
                     progress_label = (
-                        f"{state.cell_completed_requests}/{state.request_count_target} req "
+                        f"{state.cell_completed_requests}/{state.request_count_target} done "
                         f"({measure_elapsed:.0f}s)"
                     )
                 else:
@@ -9582,6 +10131,13 @@ def build_display(state: TUIState) -> Layout:
         srv_table.add_row("running_reqs", str(state.srv_running_reqs))
         srv_table.add_row("queue_reqs", str(state.srv_queue_reqs))
         srv_table.add_row("utilization", f"[{PHOSPHOR_DIM}]{state.srv_utilization:.2%}[/{PHOSPHOR_DIM}]")
+        if state.srv_prefix_cache_hit_rate >= 0:
+            pchr = state.srv_prefix_cache_hit_rate
+            pc_color = PHOSPHOR if pchr >= 0.70 else (PHOSPHOR_SOFT if pchr >= 0.30 else PHOSPHOR_WARN)
+            srv_table.add_row("prefix_hit", f"[{pc_color}]{pchr:.1%}[/{pc_color}]")
+            trace = render_hit_trace(state.pc_hit_history, width=10 if narrow else 16)
+            if trace:
+                srv_table.add_row("hit trace", f"[{pc_color}]{trace}[/{pc_color}]")
     if state.metrics_available and (state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0):
         srv_table.add_row("spec_accept_rate", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_rate:.2%}[/{PHOSPHOR_SOFT}]")
         srv_table.add_row("spec_accept_len", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_length:.1f}[/{PHOSPHOR_SOFT}]")
@@ -9616,9 +10172,16 @@ def build_display(state: TUIState) -> Layout:
         middle_size,
         prefill_visible,
     )
+    if state.distinct_prefixes:
+        # Keep the decode grid compact so it can sit side-by-side with the prefill grid;
+        # the prefill grid carries the extra per-cell detail in this mode.
+        detail_mode = "none"
     show_cell_details = detail_mode != "none"
     inline_cell_details = detail_mode == "inline"
     col_width = live_decode_column_width(mode, detail_mode=detail_mode)
+    if state.distinct_prefixes:
+        # Decode cells carry tok/s + capacity marker + c%, so widen them.
+        col_width = max(col_width, 13)
     decode_suffix = "tok/s + TTFT/ITL" if show_cell_details else ("" if narrow else "tok/s")
     results_table = Table(
         title=render_title("DECODE tok/s" if narrow else "AGGREGATE DECODE", decode_suffix),
@@ -9629,7 +10192,7 @@ def build_display(state: TUIState) -> Layout:
         expand=False,
         pad_edge=False,
     )
-    compact_header = narrow or show_cell_details
+    compact_header = narrow or show_cell_details or state.distinct_prefixes
     results_table.add_column(
         "ctx\\C" if compact_header else "ctx \\ conc",
         style=f"bold {PHOSPHOR_SOFT}",
@@ -9678,19 +10241,26 @@ def build_display(state: TUIState) -> Layout:
                     cell = capacity_limit_cell()
                 else:
                     cell = compact_decode_cell(val, mode)
+                compact_marker = narrow or show_cell_details or state.distinct_prefixes
                 if errs > 0:
-                    cell += f"[red]e[/red]" if narrow or show_cell_details else f" [red]({errs}e)[/red]"
+                    cell += f"[red]e[/red]" if compact_marker else f" [red]({errs}e)[/red]"
                 # Show running/requested when scheduler did not sustain the
                 # requested concurrency. This catches vLLM KV-capacity cases
                 # where queue drains to zero after only a subset is admitted.
+                # In distinct mode the grid is compact, so use the short "*" marker.
                 if qi:
                     avg_run, avg_q, limited = qi
                     if limited or avg_q > 0 or (avg_run > 0 and avg_run < conc * 0.98):
                         mark = "*" if limited else ""
-                        if narrow or show_cell_details:
+                        if compact_marker:
                             cell += f"[{PHOSPHOR_WARN}]*[/{PHOSPHOR_WARN}]"
                         else:
                             cell += f" [{PHOSPHOR_WARN}]({avg_run:.0f}/{conc}){mark}[/{PHOSPHOR_WARN}]"
+                if state.distinct_prefixes:
+                    _pg = state.prefill_grid.get(key)
+                    _dc = _pg.get("decode_cached") if _pg else None
+                    if _dc is not None:
+                        cell += f" [{PHOSPHOR_SOFT}]c{_dc*100:.0f}%[/{PHOSPHOR_SOFT}]"
                 detail = compact_client_cell_detail(state.client_info.get(key, {}))
                 if show_cell_details and detail:
                     if inline_cell_details:
@@ -9724,8 +10294,49 @@ def build_display(state: TUIState) -> Layout:
         else results_table
     )
 
+    # Distinct-prefixes mode: show the decode grid and the prefill grid side-by-side
+    # (same ctx x conc axes). Both grids are compact (detail forced off above), so on
+    # a wide enough terminal they fit next to each other with the event log on the
+    # right; otherwise fall back to stacking them vertically.
+    if state.distinct_prefixes:
+        decode_panel = Panel(
+            decode_body,
+            box=PANEL_BOX,
+            border_style=SUBTLE_BORDER,
+            padding=(0, 1) if not narrow else (0, 0),
+        )
+        # Prefill cells carry new-token tok/s + hit %; same column width as decode.
+        pcol_width = col_width
+        prefill_matrix_panel = render_prefill_matrix_panel(state, mode, narrow, pcol_width)
+        results_height = max(8, term_height - middle_size - 6)
+        event_rows = 4 if results_height >= 18 else 3
+        # Width of each grid: ctx label (~8) + one column per concurrency + box
+        # separators + panel border/padding (~6). Oversize slightly so Rich never
+        # squeezes a data column down to a truncated ".".
+        n_conc = len(state.concurrency_levels)
+        decode_w = 18 + n_conc * (col_width + 1)
+        prefill_w = 14 + n_conc * (pcol_width + 1)
+        results_layout = Layout()
+        if not narrow and term_width >= decode_w + prefill_w + 4:
+            # Side-by-side. Events go underneath the full width so both grids stay wide.
+            grids = Layout()
+            grids.split_row(
+                Layout(decode_panel, size=decode_w),
+                Layout(prefill_matrix_panel, ratio=1, minimum_size=prefill_w),
+            )
+            results_layout.split_column(
+                Layout(grids, ratio=1, minimum_size=6),
+                Layout(render_events_panel(state, limit=max(2, event_rows - 1)), size=event_rows),
+            )
+        else:
+            results_layout.split_column(
+                Layout(decode_panel, ratio=1, minimum_size=5),
+                Layout(prefill_matrix_panel, ratio=1, minimum_size=5),
+                Layout(render_events_panel(state, limit=max(2, event_rows - 1)), size=event_rows),
+            )
+        layout["results"].update(results_layout)
     # Prefill table (shown alongside decode results)
-    if state.prefill_contexts:
+    elif state.prefill_contexts:
         prefill_table = Table(
             title=render_title("PREFILL" if not narrow else "PF", "C=1" if not narrow else ""),
             title_justify="left",
@@ -11355,6 +11966,16 @@ async def run_benchmark(args):
             f"{[format_context(c) for c in decode_prefill_contexts]}{extra}"
         )
 
+    if args.distinct_prefixes:
+        # The per-(ctx,conc) prefill grid is the only prefill artifact in this mode.
+        # Suppress the legacy single-column scout-only / standalone prefill phases so
+        # default --prefill-contexts (8k,64k,128k) don't leak in as a separate table.
+        prefill_contexts = []
+        prefill_scout_only_contexts = []
+        standalone_prefill_contexts = []
+        console.print("[cyan]Prefill tests:[/cyan] distinct-prefix per-cell grid (size-major)")
+        remember_startup("prefill tests: distinct-prefix per-cell grid")
+
     # --- Step 3: Generate padding text calibrated to actual token counts ---
     # Default to one calibration request and extrapolate all contexts. Exact
     # /tokenize targeting is available, but it is slow on long context matrices
@@ -11363,6 +11984,24 @@ async def run_benchmark(args):
     max_ctx = max(all_ctx_sizes) if all_ctx_sizes else 0
     context_cache = {}
     context_actual_tokens = {}
+    # Distinct-prefixes mode: per-size char length + fixed-width per-lane marker.
+    # Defined here so the Phase-2 loop (same function scope) can build lane payloads.
+    distinct_char_len = {}     # ctx -> char length to slice each lane's text to
+    distinct_marker = None     # callable(conc, lane) -> unique, size-independent marker
+
+    def lane_text(conc: int, lane: int, ctx: int) -> str:
+        """Distinct, cross-size-reusable context for one (conc-keyed) lane at size ctx.
+
+        Every size slices the SAME ``marker(conc,lane) + base_text`` string, so a
+        lane's smaller-size text is a literal prefix of its larger-size text (the
+        server re-hits the cached prefix). Different lanes diverge at token 0
+        (unique marker) so each occupies its own distinct prefix KV.
+        """
+        clen = distinct_char_len.get(ctx, 0)
+        if ctx <= 0 or clen <= 0 or distinct_marker is None:
+            return ""
+        return (distinct_marker(conc, lane) + base_text)[:clen]
+
     run_id = ''.join(random.choices(string.ascii_lowercase, k=12))
     if max_ctx > 0:
         console.print(f"[bold]Calibrating padding text (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
@@ -11553,6 +12192,31 @@ async def run_benchmark(args):
                 est_tokens = int(len(text) / calibrated_cpt)
                 console.print(f"  {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
                 remember_startup(f"context {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
+
+        if args.distinct_prefixes:
+            # Reuse the (already token-targeted) shared text lengths so distinct mode
+            # adds no extra /tokenize calls. Fixed-width markers (padded to the widest
+            # concurrency) keep every lane the same length, so per-lane token counts
+            # match and cross-size slicing stays a clean literal prefix.
+            max_conc = max(concurrency_levels) if concurrency_levels else 1
+            _cw = max(4, len(str(max_conc)))
+
+            def distinct_marker(conc: int, lane: int) -> str:
+                return f"[BENCH_{run_id}_C{conc:0{_cw}d}_L{lane:0{_cw}d}] "
+
+            for ctx in all_ctx_sizes:
+                distinct_char_len[ctx] = len(context_cache.get(ctx, ""))
+            max_char_len = max(distinct_char_len.values()) if distinct_char_len else 0
+            if max_char_len > 0:
+                ensure_base_chars(max_char_len)
+            sample = distinct_marker(0, 0)
+            console.print(
+                f"  Distinct prefixes: up to {max_conc} lanes, "
+                f"marker '{sample}' ({len(sample)} chars, column-by-column)"
+            )
+            remember_startup(
+                f"distinct prefixes: up to {max_conc} lanes, marker_len={len(sample)}"
+            )
     context_cache[0] = ""
     console.print("[green]Done.[/green]\n")
     remember_startup("startup preparation done")
@@ -11587,6 +12251,14 @@ async def run_benchmark(args):
         state.max_running_requests = int(max_running)
     state.max_tokens = args.max_tokens
     state.prefill_contexts = prefill_contexts
+    state.distinct_prefixes = args.distinct_prefixes
+    if args.distinct_prefixes:
+        # In distinct mode underfilling the requested concurrency is expected (C
+        # distinct prefixes intentionally exceed KV at high ctx/conc) and IS the
+        # signal. Show the measured tok/s with the (X/Y)* marker instead of hiding
+        # it behind the capacity-limited placeholder.
+        args.show_capacity_limited_values = True
+        state.show_capacity_limited_values = True
     state.benchmark_mode = "request-count" if args.request_count > 0 else "duration"
     state.request_count_target = args.request_count
     state.hw_gpu_limit = args.hw_gpu_limit
@@ -12192,8 +12864,10 @@ async def run_benchmark(args):
             first_conc = concurrency_levels[0]
             first_ctx = context_lengths[0]
 
-            # Hidden decode warmup. Duration 0 disables it explicitly.
-            if args.decode_warmup_seconds > 0:
+            # Hidden decode warmup. Duration 0 disables it explicitly. Skipped in
+            # distinct mode: it picks the largest context, which would pre-warm a
+            # prefix and defeat the cold→warm cross-size reuse progression.
+            if args.decode_warmup_seconds > 0 and not args.distinct_prefixes:
                 warmup_ctx = _select_decode_warmup_context()
                 warmup_conc = 1
                 setattr(args, "decode_warmup_context", warmup_ctx)
@@ -12234,19 +12908,55 @@ async def run_benchmark(args):
                 live.update(build_display(state))
                 await asyncio.sleep(2.0)
 
-            test_order = []
-            # 1) First column: C=first, all contexts
-            for ctx in context_lengths:
-                test_order.append((ctx, first_conc))
-            # 2) First row: ctx=first, remaining C
-            for conc in concurrency_levels[1:]:
-                test_order.append((first_ctx, conc))
-            # 3) Rest: row by row, skip already added
-            done_set = set(test_order)
-            for ctx in context_lengths[1:]:
+            if args.distinct_prefixes:
+                # Column-by-column: for each concurrency level, sweep the contexts
+                # ASCENDING. A lane then runs at 8k -> 32k -> 128k consecutively, so
+                # each size literally re-hits the smaller-size prefix the previous
+                # cell just cached — nothing in between evicts it (which is what the
+                # old size-major/row-by-row order let happen).
+                ctx_sorted = sorted(set(context_lengths))
+                conc_sorted = sorted(set(concurrency_levels))
+                test_order = [(ctx, conc) for conc in conc_sorted for ctx in ctx_sorted]
+            else:
+                test_order = []
+                # 1) First column: C=first, all contexts
+                for ctx in context_lengths:
+                    test_order.append((ctx, first_conc))
+                # 2) First row: ctx=first, remaining C
                 for conc in concurrency_levels[1:]:
-                    if (ctx, conc) not in done_set:
-                        test_order.append((ctx, conc))
+                    test_order.append((first_ctx, conc))
+                # 3) Rest: row by row, skip already added
+                done_set = set(test_order)
+                for ctx in context_lengths[1:]:
+                    for conc in concurrency_levels[1:]:
+                        if (ctx, conc) not in done_set:
+                            test_order.append((ctx, conc))
+
+            ig_eos = not args.respect_eos
+
+            def build_lane_decode_payload(ctx, conc, lane):
+                p = {
+                    "model": args.model,
+                    "messages": build_messages(ctx, lane_text(conc, lane, ctx)),
+                    "stream": True,
+                    "max_tokens": args.max_tokens,
+                    "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+                }
+                if ig_eos:
+                    p["ignore_eos"] = True
+                return p
+
+            def build_lane_scout_payload(ctx, conc, lane):
+                p = {
+                    "model": args.model,
+                    "messages": build_messages(ctx, lane_text(conc, lane, ctx)),
+                    "stream": True,
+                    "max_tokens": 1,
+                    "stream_options": {"include_usage": True},
+                }
+                if ig_eos:
+                    p["ignore_eos"] = True
+                return p
 
             for ctx, conc in test_order:
                     # Skip cells that exceed token budget
@@ -12270,6 +12980,13 @@ async def run_benchmark(args):
 
                     cell_start = time.monotonic()
 
+                    if args.distinct_prefixes and ctx > 0:
+                        distinct_payloads = [build_lane_decode_payload(ctx, conc, i) for i in range(conc)]
+                        distinct_scout_payloads = [build_lane_scout_payload(ctx, conc, i) for i in range(conc)]
+                    else:
+                        distinct_payloads = None
+                        distinct_scout_payloads = None
+
                     try:
                         result = await run_one_cell(
                             client=client,
@@ -12288,6 +13005,8 @@ async def run_benchmark(args):
                             request_count=args.request_count,
                             warmup_request_count=args.warmup_request_count,
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
+                            distinct_payloads=distinct_payloads,
+                            distinct_scout_payloads=distinct_scout_payloads,
                         )
                         if result.aggregate_tps == -2:
                             state.results[(ctx, conc)] = -2
@@ -12390,6 +13109,27 @@ async def run_benchmark(args):
 # ---------------------------------------------------------------------------
 # Results output
 # ---------------------------------------------------------------------------
+
+def print_ctx_conc_matrix(console: Console, title: str, context_lengths: list,
+                          concurrency_levels: list, result_map: dict, cell_fn) -> None:
+    """Print a ctx x conc matrix; ``cell_fn(CellResult|None)`` formats each cell."""
+    matrix = Table(
+        title=render_title(title),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    matrix.add_column("ctx \\ conc", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    for conc in concurrency_levels:
+        matrix.add_column(str(conc), justify="right", no_wrap=True)
+    for ctx in context_lengths:
+        row = [format_context(ctx)]
+        for conc in concurrency_levels:
+            row.append(cell_fn(result_map.get((ctx, conc))))
+        matrix.add_row(*row)
+    console.print(matrix)
+
 
 def print_final_results(results: list, concurrency_levels: list, context_lengths: list,
                         console: Console, prefill_results: dict = None,
@@ -12537,6 +13277,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 if needs_effective_note(r, conc):
                     mark = "*" if r.capacity_limited else ""
                     val += f" ({r.avg_running_reqs:.0f}/{conc}){mark}"
+                if getattr(r, "decode_cached_available", False):
+                    val += f" c{r.decode_cached_fraction*100:.0f}%"
                 detail = compact_client_cell_detail(compact_client_info_from_cell(r))
                 if inline_client_stats and detail:
                     if inline_final_client_stats:
@@ -12570,6 +13312,59 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         console.print(f"[dim]{CAPACITY_LIMIT_MARK} = skipped/hidden because the cell does not fit in KV cache; exact deficit is kept in JSON timeout_reason[/dim]")
     if any_limited:
         console.print("[dim](X/Y) = avg running / requested concurrency from Prometheus; * = capacity-limited or warmup timed out[/dim]")
+
+    # Distinct-prefixes prefill grid: prefill throughput on the same ctx x conc axes
+    # as the decode grid above. Cache reuse is reported by the server prefix-cache
+    # hit % grid below (single consistent signal); the raw cached_tokens are kept in JSON.
+    distinct_mode = any(getattr(r, "prefill_measured", False) for r in results)
+    if distinct_mode:
+        console.print()
+        print_ctx_conc_matrix(
+            console,
+            "Prefill Speed tok/s (distinct lanes: sum prompt_tokens / concurrent C-scout wall)",
+            context_lengths, concurrency_levels, result_map,
+            lambda r: (f"{r.prefill_tps:,.0f}" if (r and r.prefill_measured) else "-"),
+        )
+        console.print(
+            "[dim]Prefill grid: each cell warms C distinct lane prefixes concurrently; "
+            "tok/s = sum(prompt_tokens)/wall. The whole-cell reuse is the prefix-cache hit % "
+            "grid below; a cross-size reuse % grid also appears when the server reports "
+            "cached_tokens (vLLM --enable-prompt-tokens-details).[/dim]"
+        )
+        # Separate measurement: actual cached_tokens reported by the decode requests —
+        # only when the server reports it (vLLM --enable-prompt-tokens-details).
+        if any(getattr(r, "decode_cached_available", False) for r in results):
+            print_ctx_conc_matrix(
+                console,
+                "Decode cached_tokens % (actual usage cached_tokens / prompt_tokens)",
+                context_lengths, concurrency_levels, result_map,
+                lambda r: (
+                    f"{r.decode_cached_fraction:.0%}"
+                    if (r and getattr(r, "decode_cached_available", False))
+                    else "-"
+                ),
+            )
+
+    # Server prefix-cache hit-rate grid (Prometheus counter delta per cell). Works
+    # in both shared and distinct mode whenever the engine exposes the counters.
+    if any(getattr(r, "prefix_cache_hit_rate", -1) >= 0 for r in results):
+        console.print()
+        print_ctx_conc_matrix(
+            console,
+            "Server prefix-cache hit % (engine prefix-cache counter delta, per cell)",
+            context_lengths, concurrency_levels, result_map,
+            lambda r: (
+                f"{r.prefix_cache_hit_rate:.0%}"
+                if (r and getattr(r, "prefix_cache_hit_rate", -1) >= 0)
+                else "-"
+            ),
+        )
+        console.print(
+            "[dim]Prefix-cache hit % = hits/queries over the decode phase (after the one-time scout "
+            "warm-up), from the engine's own prefix-cache counters. High when each lane re-hits its "
+            "own warmed prefix; drops when many "
+            "distinct lanes exceed KV capacity and force eviction.[/dim]"
+        )
 
     # Per-request avg tok/s table
     table2 = Table(
@@ -12885,12 +13680,52 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                     if needs_effective_note(r, conc):
                         mark = "*" if r.capacity_limited else ""
                         val += f" ({r.avg_running_reqs:.0f}/{conc}){mark}"
+                    if getattr(r, "decode_cached_available", False):
+                        val += f" [{PHOSPHOR_SOFT}]c{r.decode_cached_fraction*100:.0f}%[/{PHOSPHOR_SOFT}]"
                     row.append(val)
                 else:
                     row.append("-")
             summary_decode.add_row(*row)
 
-    if summary_prefill and summary_decode:
+    # Distinct mode: mirror the live TUI by repeating the decode grid and a
+    # prefill+hit% grid side-by-side (decode left, prefill right) as the summary.
+    distinct = bool(results) and any(getattr(r, "prefill_measured", False) for r in results)
+    if distinct and summary_decode is not None:
+        prefill_grid_tbl = Table(
+            title=render_title("Prefill tok/s + cache hit%"),
+            title_justify="left",
+            box=REPORT_BOX,
+            border_style=SUBTLE_BORDER,
+            header_style=f"bold {PHOSPHOR_DIM}",
+        )
+        prefill_grid_tbl.add_column("ctx \\ conc", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+        for conc in concurrency_levels:
+            prefill_grid_tbl.add_column(str(conc), justify="right", no_wrap=True)
+        for ctx in context_lengths:
+            row = [format_context(ctx)]
+            for conc in concurrency_levels:
+                r = result_map.get((ctx, conc))
+                if r and getattr(r, "prefill_measured", False):
+                    cell = f"{r.prefill_tps:,.0f}"
+                    if getattr(r, "prefix_cache_hit_rate", -1) >= 0:
+                        hr = r.prefix_cache_hit_rate
+                        hr_color = PHOSPHOR if hr >= 0.70 else (PHOSPHOR_SOFT if hr >= 0.30 else PHOSPHOR_WARN)
+                        cell += f" [{hr_color}]{hr*100:.0f}%[/{hr_color}]"
+                    row.append(cell)
+                else:
+                    row.append("-")
+            prefill_grid_tbl.add_row(*row)
+        grid_w = 14 + len(concurrency_levels) * 12
+        if console.width >= 2 * grid_w + 4:
+            side_by_side = Table.grid(expand=False, padding=(0, 2))
+            side_by_side.add_column()
+            side_by_side.add_column()
+            side_by_side.add_row(summary_decode, prefill_grid_tbl)
+            console.print(side_by_side)
+        else:
+            console.print(summary_decode)
+            console.print(prefill_grid_tbl)
+    elif summary_prefill and summary_decode:
         # Screenshot-friendly final block: keep the two headline matrices on
         # one screen when the terminal is wide enough, otherwise preserve the
         # readable stacked layout.
@@ -12956,6 +13791,36 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
                 "hardware_summary": pr.get("hardware_summary", {}),
             }
 
+    # Distinct-prefixes prefill grid: per-(ctx,conc) prefill throughput + cross-size
+    # reuse, shaped like summary_table (ctx -> conc -> value-object). Per-lane raw
+    # detail rides along on each cell in `results` via prefill_per_lane.
+    distinct = getattr(args, "distinct_prefixes", False)
+    prefill_grid = {}
+    if distinct:
+        for r in results:
+            if not getattr(r, "prefill_measured", False):
+                continue
+            ck, cc = str(r.context_tokens), str(r.concurrency)
+            prefill_grid.setdefault(ck, {})[cc] = {
+                "prefill_tps": round(r.prefill_tps, 1),
+                "prompt_tokens": r.prefill_prompt_tokens,
+                "wall_seconds": round(r.prefill_wall, 4),
+                "ttft_p50": round(r.prefill_ttft_p50, 4),
+                "ttft_p90": round(r.prefill_ttft_p90, 4),
+                "lanes": r.prefill_lanes,
+                "lanes_ok": r.prefill_lanes_ok,
+                "cached_tokens": r.prefill_cached_tokens,
+                "cached_tokens_available": r.prefill_cached_tokens_available,
+                "reused_fraction": round(r.prefill_reused_fraction, 4),
+                "prefix_cache_hit_rate": round(r.prefix_cache_hit_rate, 4),
+                "prefix_cache_queries": r.prefix_cache_queries,
+                "prefix_cache_hits": r.prefix_cache_hits,
+                "decode_cached_tokens": r.decode_cached_tokens,
+                "decode_input_tokens": r.decode_input_tokens,
+                "decode_cached_fraction": round(r.decode_cached_fraction, 4),
+                "decode_cached_available": r.decode_cached_available,
+            }
+
     output = {
         "metadata": {
             "version": VERSION,
@@ -12963,7 +13828,11 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "model": args.model,
             "server": args.host if args.host.startswith("http") else f"{args.host}:{args.port or 5000}",
             "timestamp": datetime.now().isoformat(),
-            "decode_mode": "request-count" if getattr(args, "request_count", 0) > 0 else "duration",
+            "decode_mode": (
+                "fixed-token" if getattr(args, "distinct_prefixes", False)
+                else "request-count" if getattr(args, "request_count", 0) > 0
+                else "duration"
+            ),
             "primary_decode_layer": (
                 "burst_e2e_decode"
                 if getattr(args, "request_count", 0) > 0
@@ -13003,6 +13872,9 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "metrics_warning": getattr(args, "metrics_warning", ""),
             "concurrency_levels": concurrency_levels,
             "context_lengths": context_lengths,
+            "prefix_mode": "distinct" if distinct else "shared",
+            "matrix_traversal": "concurrency_major_ctx_ascending" if distinct else "l_shaped",
+            "distinct_prefixes": distinct,
             "startup_diagnostics_available": bool(getattr(args, "startup_diagnostics", {})),
             "nvidia_p2p_override_effective": bool(
                 getattr(args, "nvidia_p2p_override", {}).get("effective", False)
@@ -13017,6 +13889,7 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
         "hardware_run_summary": getattr(args, "hardware_run_summary", {}),
         "event_log": getattr(args, "event_log", []),
         "prefill": prefill_summary,
+        "prefill_grid": prefill_grid,
         "results": [asdict(r) for r in actual_results],
         "summary_table": summary,
         "burst_results": [asdict(r) for r in actual_burst_results],
@@ -13316,7 +14189,7 @@ def parse_args():
     )
     parser.add_argument(
         "--duration", type=float, default=30.0,
-        help="Duration per test cell in seconds (default: 30)"
+        help="Duration per test cell in seconds (default: 30; 6 with --distinct-prefixes)"
     )
     parser.add_argument(
         "--request-count", type=int, default=0,
@@ -13351,7 +14224,7 @@ def parse_args():
     )
     parser.add_argument(
         "--max-tokens", type=int, default=2048,
-        help="Max tokens to generate per request. In --completion-stats/--profile mode, 0 omits max_tokens from the OpenAI request. (default: 2048)"
+        help="Max tokens to generate per request. In --completion-stats/--profile mode, 0 omits max_tokens from the OpenAI request. (default: 2048; with --distinct-prefixes, 512 fixed tokens per lane that the cell waits to complete)"
     )
     parser.add_argument(
         "--decode-warmup-seconds", type=float, default=3.0,
@@ -13585,11 +14458,49 @@ def parse_args():
         help="Run standalone cold prefill profiling and exit before sustained decode. "
              "Useful for prefill/PCIe communication sweeps. Implies --standalone-prefill."
     )
+    parser.add_argument(
+        "--distinct-prefixes", action="store_true",
+        help="Give each concurrent request a DISTINCT, cross-size-reusable KV prefix instead of "
+             "one shared prompt. Traverses column-by-column (each concurrency level swept through "
+             "contexts ascending) so a lane runs 8k->32k->128k consecutively and re-hits the prefix "
+             "it just cached. Each lane sends one fixed-token request the cell waits to complete. "
+             "Adds a per-(ctx,conc) prefill-speed grid measured by C concurrent scouts, where "
+             "cross-size KV reuse becomes visible. Mutually exclusive "
+             "with --completion-stats/--test-profile, --request-count/--run-burst, and "
+             "--standalone-prefill/--prefill-only/--skip-prefill."
+    )
     args = parser.parse_args()
     if args.prefill_only:
         if args.skip_prefill:
             parser.error("--prefill-only cannot be combined with --skip-prefill")
         args.standalone_prefill = True
+    if args.distinct_prefixes:
+        if args.completion_stats or args.test_profile:
+            parser.error("--distinct-prefixes cannot be combined with --completion-stats/--test-profile")
+        if args.request_count > 0 or args.warmup_request_count > 0:
+            parser.error("--distinct-prefixes is Sustained Decode only; not compatible with --request-count")
+        if args.run_burst:
+            parser.error("--distinct-prefixes cannot be combined with --run-burst (v1: duration only)")
+        if args.standalone_prefill or args.prefill_only:
+            parser.error("--distinct-prefixes builds its own prefill grid; not compatible with "
+                         "--standalone-prefill/--prefill-only")
+        if args.skip_prefill:
+            parser.error("--distinct-prefixes measures prefill as a grid; not compatible with --skip-prefill")
+        # Distinct-mode defaults (overridable): a short decode window, and a short
+        # readiness-warmup cap. Underfilling the requested concurrency is expected
+        # here, so a capacity-limited cell would otherwise sit in warmup for the
+        # full scaled timeout (up to 180s at 128k) before measuring — the main
+        # reason failing cells take so long.
+        if not cli_option_present("--duration"):
+            args.duration = 6.0
+        if not cli_option_present("--cell-warmup-timeout-seconds"):
+            args.cell_warmup_timeout_seconds = 10.0
+        if not cli_option_present("--max-tokens"):
+            # Fixed decode work per lane: each lane sends ONE request of this many
+            # tokens and the cell waits for completion (no fixed-time window). 512 is
+            # enough decode to be representative and completes so the server returns
+            # usage.prompt_tokens_details.cached_tokens.
+            args.max_tokens = 512
     if args.p2pmark_only:
         args.p2pmark = True
     if args.amd_fabric_only:

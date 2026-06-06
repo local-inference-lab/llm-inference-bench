@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.25 - 2026-06-06
+
+### Distinct-prefix KV mode
+
+- New `--distinct-prefixes` flag: each of the `C` concurrent requests in a cell gets its
+  own distinct KV prefix instead of the shared prompt the default matrix uses, to find
+  where the KV cache runs out. Traverses column-by-column (each concurrency swept through
+  contexts ascending) so a lane runs 8k->32k->128k consecutively and reuses its smaller-size
+  prefix; fixed-token decode per lane (waits for completion).
+- Per-`(ctx, conc)` prefill-speed grid (`C` `max_tokens=1` scouts, `sum(prompt_tokens)/wall`)
+  replaces the single-column prefill view in this mode.
+- Engine prefix-cache **hit %** (vLLM `prefix_cache_hits`/`_queries_total`, SGLang
+  `cache_hit_rate`) shown live in the SERVER panel with a sparkline, inside each prefill
+  cell, and as a report grid; measured as a per-cell counter delta.
+- Decode and prefill grids render side-by-side (live and in the final summary);
+  capacity-limited cells show measured tok/s with a `*` marker instead of `∅`.
+- JSON: top-level `prefill_grid`, per-cell `prefill_*`/`prefix_cache_*` fields, metadata
+  `prefix_mode` / `matrix_traversal` / `distinct_prefixes`.
+- Mutually exclusive with `--completion-stats`/`--test-profile`, `--request-count`/
+  `--run-burst`, and `--standalone-prefill`/`--prefill-only`/`--skip-prefill`. For
+  per-request `cached_tokens` in `usage`, start vLLM with `--enable-prompt-tokens-details`
+  (the cross-size reuse % is then shown next to the hit %).
+- Decode is **fixed-work, not fixed-time**: each lane sends ONE request of `--max-tokens`
+  (default 512) and the cell waits for completion, rather than measuring a fixed `--duration`
+  window. This is deterministic (no re-prefill-gap artifacts), and because requests complete
+  the server returns `usage.prompt_tokens_details.cached_tokens`. Aggregate tok/s = total
+  output tokens / the decode window (first token → last completion).
+- Prefill speed counts only **newly-computed** tokens (`prompt_tokens - cached_tokens`), so
+  a larger context that reuses its cached smaller prefix doesn't inflate the rate.
+- Two reuse signals shown by their source: the server-side prefix-cache **hit %** (vLLM
+  `/metrics` counter delta, baselined after the scout so it measures decode reuse) sits in
+  the **prefill grid**; the client-side **c%** (`usage.prompt_tokens_details.cached_tokens`
+  reported in the decode response, needs `--enable-prompt-tokens-details`) sits in the
+  **decode grid**. Both in JSON.
+
 ## 0.4.18 - 2026-05-15
 
 ### Decode warmup
