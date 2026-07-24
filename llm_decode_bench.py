@@ -5096,15 +5096,17 @@ def _diag_command(cmd: list[str], timeout: float = 5.0) -> dict:
 
 P2P_OVERRIDE_EXPECTED = {
     "ForceP2P": "0x11",
-    "RMForceP2PType": "1",
-    "RMPcieP2PType": "2",
     "GrdmaPciTopoCheckOverride": "1",
     "EnableResizableBar": "1",
 }
+P2P_OVERRIDE_UNSAFE_SELECTORS = {
+    "RMForceP2PType": "1",
+    "RMPcieP2PType": "2",
+}
 P2P_OVERRIDE_MODPROBE = (
     'options nvidia NVreg_RegistryDwords="'
-    "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;"
-    'GrdmaPciTopoCheckOverride=1;EnableResizableBar=1"'
+    "ForceP2P=0x11;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1"
+    '"'
 )
 
 P2PMARK_EMBEDDED_SHA256 = "21b81e59735cc1be9fa341c0356ae6c12b6b7284db6f989cc18e7b717ced046a"
@@ -5772,7 +5774,11 @@ def _parse_registry_dwords(value: str) -> dict:
 
 
 def detect_nvidia_p2p_override() -> dict:
-    """Detect whether NVIDIA P2P override is configured and effectively loaded."""
+    """Detect whether the safe NVIDIA P2P registry override is loaded.
+
+    This is a configuration check, not a peer data-path test. Use P2PMark to
+    verify that real CUDA peer copies and NCCL collectives work.
+    """
     params_path = "/proc/driver/nvidia/params"
     modprobe_path = "/etc/modprobe.d/nvidia-p2p-override.conf"
     params_text = _read_text_file(params_path)
@@ -5781,7 +5787,7 @@ def detect_nvidia_p2p_override() -> dict:
     registry = _parse_registry_dwords(params.get("RegistryDwords", ""))
     expected = dict(P2P_OVERRIDE_EXPECTED)
     runtime = {}
-    for key in expected:
+    for key in (*expected, *P2P_OVERRIDE_UNSAFE_SELECTORS):
         runtime[key] = registry.get(key, params.get(key, ""))
     runtime["DmaRemapPeerMmio"] = params.get("DmaRemapPeerMmio", "")
     missing = []
@@ -5792,10 +5798,31 @@ def detect_nvidia_p2p_override() -> dict:
             missing.append(key)
         elif str(actual) != str(expected_value):
             mismatched[key] = {"expected": expected_value, "actual": actual}
-    effective = bool(params_text) and not missing and not mismatched
-    configured = all(f"{k}={v}" in modprobe_text for k, v in expected.items())
+    unsafe_runtime = {
+        key: runtime[key]
+        for key in P2P_OVERRIDE_UNSAFE_SELECTORS
+        if runtime.get(key, "") != ""
+    }
+    unsafe_configured = [
+        key
+        for key in P2P_OVERRIDE_UNSAFE_SELECTORS
+        if f"{key}=" in modprobe_text
+    ]
+    registry_ready = (
+        bool(params_text)
+        and not missing
+        and not mismatched
+        and not unsafe_runtime
+    )
+    configured = (
+        all(f"{k}={v}" in modprobe_text for k, v in expected.items())
+        and not unsafe_configured
+    )
     return {
-        "effective": effective,
+        # Keep "effective" as a compatibility alias for existing report
+        # consumers. It means registry-ready; only P2PMark verifies data flow.
+        "effective": registry_ready,
+        "registry_ready": registry_ready,
         "configured": configured,
         "params_path": params_path,
         "params_available": bool(params_text),
@@ -5805,6 +5832,10 @@ def detect_nvidia_p2p_override() -> dict:
         "expected": expected,
         "missing": missing,
         "mismatched": mismatched,
+        "unsafe_runtime": unsafe_runtime,
+        "unsafe_configured": unsafe_configured,
+        "data_path_verified": False,
+        "data_path_status": "not_run",
         "registry_dwords": params.get("RegistryDwords", ""),
         "suggested_modprobe_line": P2P_OVERRIDE_MODPROBE,
         "suggested_reload": (
@@ -5817,18 +5848,37 @@ def detect_nvidia_p2p_override() -> dict:
 def p2p_override_summary(status: dict) -> str:
     if not status.get("params_available"):
         return "unknown: /proc/driver/nvidia/params is not readable"
-    if status.get("effective"):
-        return "enabled: runtime NVIDIA P2P override matches expected RegistryDwords"
+    unsafe = sorted(status.get("unsafe_runtime", {}))
+    if unsafe:
+        return (
+            "unsafe legacy selectors loaded: "
+            + ",".join(unsafe)
+            + "; remove them and reload the NVIDIA module"
+        )
+    if status.get("registry_ready", status.get("effective")):
+        return "registry ready: run P2PMark to verify the CUDA/NCCL data path"
     missing = ",".join(status.get("missing", [])) or "none"
     mismatched = ",".join(status.get("mismatched", {}).keys()) or "none"
-    return f"not effective: missing={missing}; mismatched={mismatched}"
+    return f"registry not ready: missing={missing}; mismatched={mismatched}"
+
+
+def record_p2pmark_verification(status: dict, p2pmark_result: dict) -> None:
+    """Attach the selected P2PMark result to the registry configuration report."""
+    result_status = p2pmark_result.get("status", "not_run")
+    status["data_path_verified"] = result_status == "ok"
+    status["data_path_status"] = (
+        "verified" if result_status == "ok" else result_status
+    )
+    status["data_path_mode"] = p2pmark_result.get("mode", "")
 
 
 def print_p2p_override_status(console: Console, status: dict) -> None:
     runtime = status.get("runtime", {})
+    registry_ready = status.get("registry_ready", status.get("effective"))
     rows = [
-        f"Effective: {'yes' if status.get('effective') else 'no'}",
+        f"Registry ready: {'yes' if registry_ready else 'no'}",
         f"Configured file: {'yes' if status.get('configured') else 'no'} ({status.get('modprobe_path')})",
+        "Peer data path: not verified (run --p2pmark)",
         "Runtime: " + "; ".join(
             f"{k}={runtime.get(k, '-')}" for k in (
                 "ForceP2P",
@@ -5840,11 +5890,18 @@ def print_p2p_override_status(console: Console, status: dict) -> None:
             )
         ),
     ]
-    if not status.get("effective"):
+    unsafe = sorted(status.get("unsafe_runtime", {}))
+    if unsafe:
+        rows.append(
+            "Unsafe legacy selectors loaded: "
+            + ", ".join(unsafe)
+            + " (can advertise peer access while real copies fail)"
+        )
+    if not registry_ready:
         rows.append("Suggested modprobe line:")
         rows.append(status.get("suggested_modprobe_line", P2P_OVERRIDE_MODPROBE))
         rows.append("Apply requires NVIDIA module reload or reboot after stopping GPU workloads.")
-    style = PHOSPHOR if status.get("effective") else PHOSPHOR_WARN
+    style = PHOSPHOR if registry_ready else PHOSPHOR_WARN
     console.print(Panel(
         "\n".join(rows),
         title=render_title("NVIDIA P2P Override"),
@@ -15280,6 +15337,10 @@ def main():
         args.p2pmark_result = run_p2pmark_diagnostic(args, console)
     else:
         args.p2pmark_result = {"status": "not_run"}
+    record_p2pmark_verification(
+        args.nvidia_p2p_override,
+        args.p2pmark_result,
+    )
     if args.amd_fabric:
         args.amd_fabric_result = run_amd_fabric_diagnostic(args, console)
     else:

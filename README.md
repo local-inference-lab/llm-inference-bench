@@ -488,11 +488,16 @@ hardware summary in JSON and in the final report. Startup diagnostics are saved
 to JSON as well: benchmark arguments, relevant `NCCL_`/`VLLM_`/`SGLANG_`/`CUDA_`
 environment variables, `uname`, GPU query output, and `nvidia-smi topo -m`.
 
-The benchmark also checks the NVIDIA runtime P2P override at startup by reading
-`/proc/driver/nvidia/params`, not just the modprobe file. A green startup panel
-means the expected `ForceP2P=0x11`, `RMForceP2PType=1`, `RMPcieP2PType=2`,
-`GrdmaPciTopoCheckOverride=1`, and `EnableResizableBar=1` values are actually
-loaded. If they are missing, the panel prints the suggested
+The benchmark also checks the NVIDIA runtime P2P registry configuration at
+startup by reading `/proc/driver/nvidia/params`, not just the modprobe file. A
+green startup panel means the safe `ForceP2P=0x11`,
+`GrdmaPciTopoCheckOverride=1`, and `EnableResizableBar=1` values are loaded. It
+does not claim that the peer data path works; run P2PMark for that verification.
+
+Do not add the legacy `RMForceP2PType` or `RMPcieP2PType` selectors. On modern
+NCCL/cuMem IPC stacks they can make CUDA advertise peer access while real
+cross-GPU copies fail. If required keys are missing, or either unsafe selector
+is present, the panel prints the safe
 `/etc/modprobe.d/nvidia-p2p-override.conf` line and reminds that the NVIDIA
 module must be reloaded or the host rebooted before the file takes effect.
 
