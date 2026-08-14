@@ -12940,13 +12940,21 @@ async def run_benchmark(args):
                     data = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                if data.get("error"):
+                    raise RuntimeError(f"prefill stream failed: {data['error']}")
                 # Capture usage (comes in final chunk)
                 usage = data.get("usage")
                 if usage and "prompt_tokens" in usage:
                     prompt_tokens = usage["prompt_tokens"]
                 if ttft is None and "choices" in data and len(data["choices"]) > 0:
-                    delta = data["choices"][0].get("delta", {})
-                    if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
+                    choice = data["choices"][0]
+                    delta = choice.get("delta", {})
+                    if (
+                        delta.get("content")
+                        or delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or choice.get("finish_reason") is not None
+                    ):
                         ttft = time.monotonic() - t0
         if ttft is None:
             raise RuntimeError("prefill response ended before the first output token")
