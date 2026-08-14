@@ -39,7 +39,7 @@ import time
 import tty
 import zipfile
 import zlib
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median, pstdev
@@ -4522,6 +4522,18 @@ class CellResult:
     server_utilization: float = 0.0
     server_spec_accept_rate: float = 0.0
     server_spec_accept_length: float = 0.0
+    # Acceptance-normalized decode speed (MTP / speculative decoding).
+    # aggregate_tps = server_steps_per_s * server_accept_len_effective, so
+    # steps/s is the run-comparable engine speed with acceptance divided out.
+    server_spec_drafts: int = 0
+    server_spec_draft_tokens: int = 0
+    server_spec_accepted_tokens: int = 0
+    server_spec_pos_accept: list = field(default_factory=list)
+    server_engine_steps: float = 0.0
+    server_steps_per_s: float = 0.0
+    server_accept_len_effective: float = 0.0
+    accept_norm_tps: float = 0.0
+    accept_norm_ref_len: float = 0.0
     # Queue / effective concurrency tracking
     avg_running_reqs: float = 0.0
     max_running_reqs: int = 0
@@ -8029,10 +8041,13 @@ def render_live_stats_panel(state: TUIState) -> Panel:
         f"kv={state.srv_utilization:.2%}"
     )
     if state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0:
-        rows.append(
+        spec_row = (
             f"[dim]spec[/dim] accept={state.srv_spec_accept_rate:.1%} "
             f"len={state.srv_spec_accept_length:.2f}"
         )
+        if state.srv_spec_accept_length > 1.0 and state.cell_live_tps > 0:
+            spec_row += f" norm={state.cell_live_tps / state.srv_spec_accept_length:.1f} step/s"
+        rows.append(spec_row)
     if state.cell_tps_history:
         rows.append(render_speed_trace(state.cell_tps_history, width=16))
     return Panel(
@@ -8374,6 +8389,104 @@ def metric_name(engine: str, key: str) -> str:
         ENGINE_OPENAI_PROXY: {},
     }
     return names.get(engine, {}).get(key, "")
+
+
+SPEC_POS_METRIC = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+
+
+def snapshot_spec_counters(metrics: dict, engine: str) -> dict:
+    """Snapshot cumulative speculative-decoding counters at a window edge."""
+    if engine != ENGINE_VLLM or not metrics:
+        return {}
+    if not has_metric(metrics, metric_name(engine, "spec_drafts_total")):
+        return {}
+    snap = {
+        "drafts": extract_metric(metrics, metric_name(engine, "spec_drafts_total")),
+        "draft_tokens": extract_metric(metrics, metric_name(engine, "spec_draft_tokens_total")),
+        "accepted_tokens": extract_metric(metrics, metric_name(engine, "spec_accepted_tokens_total")),
+        "pos": [],
+    }
+    pos = 0
+    while pos < 64 and has_metric(metrics, SPEC_POS_METRIC, f'position="{pos}"'):
+        snap["pos"].append(extract_metric(metrics, SPEC_POS_METRIC, f'position="{pos}"'))
+        pos += 1
+    return snap
+
+
+def compute_spec_normalization(
+    spec_start: dict,
+    spec_end: dict,
+    output_tokens: float,
+    aggregate_tps: float,
+) -> dict:
+    """Acceptance-normalized decode speed from spec counter deltas.
+
+    With MTP/speculative decoding tok/s = engine_steps/s * accept_len, so two
+    runs are only comparable after dividing acceptance back out. Every drafted
+    step emits accepted+1 tokens (accepted prefix plus one target-sampled
+    token); any remaining output tokens came from non-drafted steps at
+    1 token/step:
+        engine_steps    = d_drafts + max(0, out - (d_accepted + d_drafts))
+        accept_len_eff  = out / engine_steps          (tokens per engine step)
+        steps_per_s     = aggregate_tps / accept_len_eff
+    output_tokens must be the server-side generation delta over the same
+    window as the counter deltas so both sides describe identical work.
+    """
+    if not spec_start or not spec_end:
+        return {}
+    d_drafts = spec_end.get("drafts", 0.0) - spec_start.get("drafts", 0.0)
+    d_draft_tokens = spec_end.get("draft_tokens", 0.0) - spec_start.get("draft_tokens", 0.0)
+    d_accepted = spec_end.get("accepted_tokens", 0.0) - spec_start.get("accepted_tokens", 0.0)
+    if d_drafts <= 0 or d_draft_tokens <= 0 or output_tokens <= 0:
+        return {}
+    spec_emitted = d_accepted + d_drafts
+    nonspec_steps = max(0.0, output_tokens - spec_emitted)
+    engine_steps = d_drafts + nonspec_steps
+    accept_len_eff = output_tokens / engine_steps if engine_steps > 0 else 0.0
+    pos_start = spec_start.get("pos", [])
+    pos_end = spec_end.get("pos", [])
+    pos_accept = [
+        round(max(0.0, pos_end[i] - pos_start[i]) / d_drafts, 4)
+        for i in range(min(len(pos_start), len(pos_end)))
+    ]
+    return {
+        "drafts": int(round(d_drafts)),
+        "draft_tokens": int(round(d_draft_tokens)),
+        "accepted_tokens": int(round(d_accepted)),
+        "accept_rate": d_accepted / d_draft_tokens,
+        "accept_len_spec": 1.0 + d_accepted / d_drafts,
+        "accept_len_effective": accept_len_eff,
+        "engine_steps": engine_steps,
+        "steps_per_s": (aggregate_tps / accept_len_eff) if accept_len_eff > 0 else 0.0,
+        "pos_accept": pos_accept,
+    }
+
+
+_accept_len_ref = 0.0  # --accept-len-ref; reference accept len for normalized tok/s
+
+
+def apply_spec_normalization(cell: CellResult, norm: dict, engine: str, gauge_accept_len: float) -> None:
+    """Fill acceptance-normalized fields on a finished cell.
+
+    vLLM: exact window deltas. SGLang exports only lifetime-average gauges, so
+    fall back to steps/s derived from the accept-length gauge.
+    """
+    if norm:
+        cell.server_spec_drafts = norm["drafts"]
+        cell.server_spec_draft_tokens = norm["draft_tokens"]
+        cell.server_spec_accepted_tokens = norm["accepted_tokens"]
+        cell.server_spec_pos_accept = norm["pos_accept"]
+        cell.server_spec_accept_rate = norm["accept_rate"]
+        cell.server_spec_accept_length = norm["accept_len_spec"]
+        cell.server_accept_len_effective = norm["accept_len_effective"]
+        cell.server_engine_steps = norm["engine_steps"]
+        cell.server_steps_per_s = norm["steps_per_s"]
+    elif engine == ENGINE_SGLANG and gauge_accept_len > 1.0 and cell.aggregate_tps > 0:
+        cell.server_accept_len_effective = gauge_accept_len
+        cell.server_steps_per_s = cell.aggregate_tps / gauge_accept_len
+    if _accept_len_ref > 0 and cell.server_steps_per_s > 0:
+        cell.accept_norm_tps = cell.server_steps_per_s * _accept_len_ref
+        cell.accept_norm_ref_len = _accept_len_ref
 
 
 def prefill_counter_snapshot(metrics: dict, engine: str) -> dict:
@@ -9268,6 +9381,7 @@ async def run_one_cell(
             extract_metric(start_metrics, metric_name(engine, "gen_tokens_total"))
             if engine == ENGINE_VLLM else None
         )
+        measurement_spec_start = snapshot_spec_counters(start_metrics, engine)
         measurement_start = time.monotonic()
         state.cell_measurement_start = measurement_start
         state.cell_start = measurement_start
@@ -9354,7 +9468,7 @@ async def run_one_cell(
                         if dd > 0:
                             state.srv_spec_accept_rate = max(0.0, min(1.0, da / dd))
                         if dn > 0:
-                            state.srv_spec_accept_length = max(0.0, da / dn)
+                            state.srv_spec_accept_length = max(0.0, 1.0 + da / dn)
                     prev_spec_drafts = drafts_total
                     prev_spec_draft_tokens = draft_tokens_total
                     prev_spec_accepted_tokens = accepted_tokens_total
@@ -9421,6 +9535,12 @@ async def run_one_cell(
             exact_server_tokens / measurement_seconds
             if measurement_seconds > 0 and exact_server_tokens > 0
             else (median(gen_throughput_samples) if gen_throughput_samples else 0.0)
+        )
+        spec_norm = compute_spec_normalization(
+            measurement_spec_start,
+            snapshot_spec_counters(metrics, engine),
+            exact_server_tokens if exact_server_tokens > 0 else client_output_tokens,
+            aggregate_tps,
         )
 
         request_summary = summarize_request_samples(request_samples)
@@ -9513,6 +9633,7 @@ async def run_one_cell(
             capacity_limited=capacity_limited,
             hardware_summary=summarize_hardware_history(state.hw_history[hw_measurement_start_idx:]),
         )
+        apply_spec_normalization(cell, spec_norm, engine, state.srv_spec_accept_length)
 
         state.cell_running = False
         state.results[(context_tokens, concurrency)] = cell.aggregate_tps
@@ -9523,7 +9644,10 @@ async def run_one_cell(
             cell.capacity_limited,
         )
         state.client_info[(context_tokens, concurrency)] = compact_client_info_from_cell(cell)
-        add_event(state, f"cell done C={concurrency} ctx={format_context(context_tokens)} {cell.aggregate_tps:.1f} tok/s")
+        cell_done_msg = f"cell done C={concurrency} ctx={format_context(context_tokens)} {cell.aggregate_tps:.1f} tok/s"
+        if cell.server_steps_per_s > 0:
+            cell_done_msg += f" | norm {cell.server_steps_per_s:.1f} step/s len={cell.server_accept_len_effective:.2f}"
+        add_event(state, cell_done_msg)
         await cell_client.aclose()
         return cell
 
@@ -9575,6 +9699,8 @@ async def run_one_cell(
     measurement_gen_tokens_end = None
     measurement_gen_end_time = None
     measurement_wall_end = None
+    measurement_spec_start = {}  # spec-decode counters at measurement window edges
+    measurement_spec_end = {}
 
     while True:
         sleep_for = 0.5
@@ -9629,7 +9755,7 @@ async def run_one_cell(
                     if dd > 0:
                         state.srv_spec_accept_rate = max(0.0, min(1.0, da / dd))
                     if dn > 0:
-                        state.srv_spec_accept_length = max(0.0, da / dn)
+                        state.srv_spec_accept_length = max(0.0, 1.0 + da / dn)
                 prev_spec_drafts = drafts_total
                 prev_spec_draft_tokens = draft_tokens_total
                 prev_spec_accepted_tokens = accepted_tokens_total
@@ -9702,6 +9828,7 @@ async def run_one_cell(
                                 measurement_gen_tokens_start = extract_metric(
                                     metrics, metric_name(engine, "gen_tokens_total")
                                 )
+                                measurement_spec_start = snapshot_spec_counters(metrics, engine)
                     else:
                         warmup_stable_since = None
                     # Give up after max_warmup — queue never drained (real capacity issue)
@@ -9737,6 +9864,7 @@ async def run_one_cell(
                             measurement_gen_tokens_start = extract_metric(
                                 metrics, metric_name(engine, "gen_tokens_total")
                             )
+                            measurement_spec_start = snapshot_spec_counters(metrics, engine)
 
             # Collect samples only after warmup is done
             if warmup_done:
@@ -9795,6 +9923,7 @@ async def run_one_cell(
                     end_metrics, metric_name(engine, "gen_tokens_total")
                 )
                 measurement_gen_end_time = time.monotonic()
+                measurement_spec_end = snapshot_spec_counters(end_metrics, engine)
             break
 
         # Check skip key
@@ -9835,6 +9964,8 @@ async def run_one_cell(
 
     # Final metrics scrape
     metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
+    if not measurement_spec_end:
+        measurement_spec_end = snapshot_spec_counters(metrics, engine)
     if engine == ENGINE_SGLANG:
         final_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
     else:
@@ -9909,6 +10040,13 @@ async def run_one_cell(
         measure_duration = measurement_wall_duration
         avg_gen_throughput = server_gen_throughput
         aggregate_source = "prometheus_fallback" if server_gen_throughput > 0 else "none"
+
+    spec_norm = compute_spec_normalization(
+        measurement_spec_start,
+        measurement_spec_end,
+        exact_server_tokens if exact_server_tokens > 0 else measurement_usage_tokens,
+        avg_gen_throughput,
+    )
 
     # Client-side stats
     successful = [r for r in stream_results if r.error is None]
@@ -10010,6 +10148,7 @@ async def run_one_cell(
         server_gen_throughput=server_gen_throughput,
         server_utilization=extract_metric(metrics, metric_name(engine, "utilization")),
         server_spec_accept_rate=state.srv_spec_accept_rate,
+        server_spec_accept_length=state.srv_spec_accept_length,
         avg_running_reqs=round(avg_running, 1),
         max_running_reqs=max_running,
         effective_concurrency=round(avg_running, 1),
@@ -10024,6 +10163,7 @@ async def run_one_cell(
         capacity_limited=capacity_limited,
         hardware_summary=summarize_hardware_history(state.hw_history[hw_measurement_start_idx:]),
     )
+    apply_spec_normalization(cell, spec_norm, engine, state.srv_spec_accept_length)
 
     state.cell_running = False
     state.results[(context_tokens, concurrency)] = cell.aggregate_tps
@@ -10034,7 +10174,10 @@ async def run_one_cell(
         cell.capacity_limited,
     )
     state.client_info[(context_tokens, concurrency)] = compact_client_info_from_cell(cell)
-    add_event(state, f"cell done C={concurrency} ctx={format_context(context_tokens)} {cell.aggregate_tps:.1f} tok/s")
+    cell_done_msg = f"cell done C={concurrency} ctx={format_context(context_tokens)} {cell.aggregate_tps:.1f} tok/s"
+    if cell.server_steps_per_s > 0:
+        cell_done_msg += f" | norm {cell.server_steps_per_s:.1f} step/s len={cell.server_accept_len_effective:.2f}"
+    add_event(state, cell_done_msg)
 
     await cell_client.aclose()
     return cell
@@ -10251,7 +10394,12 @@ def build_display(state: TUIState) -> Layout:
         srv_table.add_row("utilization", f"[{PHOSPHOR_DIM}]{state.srv_utilization:.2%}[/{PHOSPHOR_DIM}]")
     if state.metrics_available and (state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0):
         srv_table.add_row("spec_accept_rate", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_rate:.2%}[/{PHOSPHOR_SOFT}]")
-        srv_table.add_row("spec_accept_len", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_length:.1f}[/{PHOSPHOR_SOFT}]")
+        srv_table.add_row("spec_accept_len", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_length:.2f}[/{PHOSPHOR_SOFT}]")
+        if state.srv_spec_accept_length > 1.0 and state.cell_live_tps > 0:
+            srv_table.add_row(
+                "norm_steps/s",
+                f"[{PHOSPHOR_SOFT}]{state.cell_live_tps / state.srv_spec_accept_length:.1f}[/{PHOSPHOR_SOFT}]",
+            )
     layout["server_metrics"].update(
         Panel(
             srv_table,
@@ -12903,6 +13051,53 @@ async def run_benchmark(args):
     global _partial_results, _prefill_results
     all_results = []
     burst_results = []
+
+    # Restore completed cells from an accepted unfinished-run checkpoint.
+    resume_data = getattr(args, "resume_data", None) or {}
+    resumed_cells = set()
+    resumed_burst_cells = set()
+    if resume_data:
+        for rd in resume_data.get("results", []):
+            cell = cell_from_dict(rd)
+            key = (cell.context_tokens, cell.concurrency)
+            if key in resumed_cells:
+                continue
+            resumed_cells.add(key)
+            all_results.append(cell)
+            state.results[key] = cell.aggregate_tps
+            state.errors[key] = cell.num_errors
+            state.queue_info[key] = (
+                cell.avg_running_reqs,
+                cell.avg_queue_reqs,
+                cell.capacity_limited,
+            )
+            state.client_info[key] = compact_client_info_from_cell(cell)
+            state.completed_tests += 1
+        for rd in resume_data.get("burst_results", []):
+            cell = cell_from_dict(rd)
+            key = (cell.context_tokens, cell.concurrency)
+            if key in resumed_burst_cells:
+                continue
+            resumed_burst_cells.add(key)
+            burst_results.append(cell)
+            state.completed_tests += 1
+        for ctx_str, pr in (resume_data.get("prefill_results") or {}).items():
+            try:
+                ctx_key = int(ctx_str)
+            except (TypeError, ValueError):
+                continue
+            state.prefill_results[ctx_key] = pr
+            if args.standalone_prefill and not args.skip_prefill and ctx_key in standalone_prefill_contexts:
+                state.completed_tests += 1
+            elif not args.standalone_prefill and not args.skip_prefill and ctx_key in prefill_scout_only_contexts:
+                state.completed_tests += 1
+        _partial_results = all_results
+        _prefill_results = state.prefill_results
+        add_event(
+            state,
+            f"resumed checkpoint: {len(resumed_cells)} decode + {len(resumed_burst_cells)} burst cells, "
+            f"{len(state.prefill_results)} prefill contexts",
+        )
     max_conc = max(concurrency_levels)
     limits = httpx.Limits(max_connections=max_conc + 20, max_keepalive_connections=max_conc + 10)
 
@@ -13273,6 +13468,8 @@ async def run_benchmark(args):
                 PREFILL_DURATION = args.prefill_duration  # seconds per context size
 
                 for ctx in standalone_prefill_contexts:
+                    if ctx in state.prefill_results:
+                        continue  # restored from resumed checkpoint
                     add_event(state, f"prefill start ctx={format_context(ctx)}")
                     state.current_concurrency = 1
                     state.current_context = ctx
@@ -13375,6 +13572,7 @@ async def run_benchmark(args):
                         add_event(state, f"prefill skipped ctx={format_context(ctx)}")
                     else:
                         add_event(state, f"prefill done ctx={format_context(ctx)} {tok_per_sec:,.0f} tok/s")
+                    write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                     state.completed_tests += 1
                     cell_time = time.monotonic() - state.cell_start
                     state.cell_times.append(cell_time)
@@ -13465,10 +13663,13 @@ async def run_benchmark(args):
 
             if prefill_scout_only_contexts and not args.skip_prefill and not args.standalone_prefill:
                 for ctx in prefill_scout_only_contexts:
+                    if ctx in state.prefill_results:
+                        continue  # restored from resumed checkpoint
                     if _skip_event.is_set():
                         _skip_event.clear()
                         break
                     await measure_prefill_scout_only(client, ctx, live)
+                    write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
 
             # === Phase 2: Decode benchmark (cached prefill, pure decode speed) ===
             # Cache warming per context is handled by scout request in run_one_cell.
@@ -13541,6 +13742,9 @@ async def run_benchmark(args):
                         test_order.append((ctx, conc))
 
             for ctx, conc in test_order:
+                    # Already measured by a resumed checkpoint
+                    if (ctx, conc) in resumed_cells:
+                        continue
                     # Skip cells that exceed token budget
                     if args.max_total_tokens > 0 and _should_skip(ctx, conc):
                         needed = conc * (ctx + args.max_tokens)
@@ -13556,6 +13760,7 @@ async def run_benchmark(args):
                         )
                         all_results.append(cell)
                         _partial_results = all_results
+                        write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                         state.completed_tests += 1
                         live.update(build_display(state))
                         continue
@@ -13586,11 +13791,13 @@ async def run_benchmark(args):
                             state.results[(ctx, conc)] = -2
                         all_results.append(result)
                         _partial_results = all_results
+                        write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                     except Exception as e:
                         console.print(f"[red]Cell C={conc} ctx={format_context(ctx)} failed: {e}[/red]")
                         cell = CellResult(concurrency=conc, context_tokens=ctx)
                         all_results.append(cell)
                         _partial_results = all_results
+                        write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                         state.results[(ctx, conc)] = 0.0
                         state.errors[(ctx, conc)] = conc
 
@@ -13606,6 +13813,8 @@ async def run_benchmark(args):
                 console.print("[cyan]Phase 3: Burst / E2E decode request burst[/cyan]")
                 state.benchmark_mode = "request-count"
                 for ctx, conc in test_order:
+                    if (ctx, conc) in resumed_burst_cells:
+                        continue
                     if args.max_total_tokens > 0 and _should_skip(ctx, conc):
                         needed = conc * (ctx + args.max_tokens)
                         missing = max(0, needed - args.max_total_tokens)
@@ -13620,6 +13829,7 @@ async def run_benchmark(args):
                             timeout_reason=format_token_budget(missing),
                         )
                         burst_results.append(cell)
+                        write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                         state.completed_tests += 1
                         live.update(build_display(state))
                         continue
@@ -13659,6 +13869,7 @@ async def run_benchmark(args):
                         if result.aggregate_tps == -2:
                             state.results[(ctx, conc)] = -2
                         burst_results.append(result)
+                        write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                     except Exception as e:
                         console.print(f"[red]Burst cell C={conc} ctx={format_context(ctx)} failed: {e}[/red]")
                         cell = CellResult(
@@ -13667,6 +13878,7 @@ async def run_benchmark(args):
                             benchmark_mode="burst-e2e",
                         )
                         burst_results.append(cell)
+                        write_resume_checkpoint(args, all_results, burst_results, state.prefill_results)
                         state.results[(ctx, conc)] = 0.0
                         state.errors[(ctx, conc)] = conc
 
@@ -14205,6 +14417,46 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
     elif summary_decode:
         console.print(summary_decode)
 
+    # MTP / speculative decoding: acceptance-normalized speed matrix. tok/s
+    # alone cannot separate engine speed from acceptance luck between runs.
+    norm_cells = [
+        r for r in results
+        if r.aggregate_tps >= 0 and getattr(r, "server_steps_per_s", 0) > 0
+    ]
+    if norm_cells:
+        norm_table = Table(
+            title=render_title("MTP-normalized decode", "steps/s (accept len)"),
+            title_justify="left",
+            box=REPORT_BOX,
+            border_style=SUBTLE_BORDER,
+            header_style=f"bold {PHOSPHOR_DIM}",
+        )
+        norm_table.add_column("ctx \\ conc", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+        for conc in concurrency_levels:
+            norm_table.add_column(str(conc), justify="right", no_wrap=True)
+        for ctx in context_lengths:
+            row = [format_context(ctx)]
+            for conc in concurrency_levels:
+                r = result_map.get((ctx, conc))
+                if r and r.aggregate_tps >= 0 and getattr(r, "server_steps_per_s", 0) > 0:
+                    val = f"{r.server_steps_per_s:.1f} ({r.server_accept_len_effective:.2f})"
+                    if getattr(r, "accept_norm_tps", 0) > 0:
+                        val += f" →{r.accept_norm_tps:.0f}"
+                    row.append(val)
+                else:
+                    row.append("-")
+            norm_table.add_row(*row)
+        console.print(norm_table)
+        ref_note = ""
+        ref_len = next((r.accept_norm_ref_len for r in norm_cells if getattr(r, "accept_norm_ref_len", 0) > 0), 0)
+        if ref_len > 0:
+            ref_note = f" →N = projected tok/s at reference accept len {ref_len:g}."
+        console.print(
+            "[dim]steps/s = tok/s ÷ accept_len: engine forward passes per second, "
+            "independent of MTP acceptance, so runs with different acceptance are "
+            f"directly comparable. (accept len) = tokens emitted per engine step.{ref_note}[/dim]"
+        )
+
 
 def save_results(results: list, args, filepath: str, prefill_results: dict = None,
                  engine: str = "", burst_results: list = None):
@@ -14365,11 +14617,120 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
                     "It includes request admission, scheduling, prefill/cache behavior, and completion."
                 ),
             },
+            "acceptance_normalization": {
+                "name": "Acceptance-normalized decode (MTP / speculative)",
+                "present": any(getattr(r, "server_steps_per_s", 0) > 0 for r in actual_results),
+                "formula": (
+                    "engine_steps = spec_drafts + max(0, output_tokens - (accepted_tokens + spec_drafts)); "
+                    "accept_len_effective = output_tokens / engine_steps; "
+                    "steps_per_s = aggregate_tps / accept_len_effective"
+                ),
+                "notes": (
+                    "With speculative decoding tok/s = steps_per_s * accept_len, so raw tok/s "
+                    "mixes engine speed with data-dependent acceptance. steps_per_s (target-model "
+                    "forward passes per second) is the acceptance-independent speed used to compare "
+                    "runs; server_spec_pos_accept holds per-draft-position acceptance probabilities. "
+                    "Counters are vLLM window deltas; SGLang falls back to its lifetime accept-length gauge."
+                ),
+            },
         },
     }
 
     with open(filepath, "w") as f:
         json.dump(output, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Interrupted-run checkpoint / resume
+# ---------------------------------------------------------------------------
+
+RESUME_CHECKPOINT_SUFFIX = ".resume.json"
+
+
+def resume_checkpoint_path(args) -> str:
+    return args.output + RESUME_CHECKPOINT_SUFFIX
+
+
+def resume_config_signature(args) -> dict:
+    """Args that define the test matrix; a checkpoint only resumes an identical run."""
+    return {
+        "version": VERSION,
+        "host": args.host,
+        "port": args.port,
+        "model": args.model,
+        "concurrency": args.concurrency,
+        "contexts": args.contexts,
+        "duration": args.duration,
+        "max_tokens": args.max_tokens,
+        "request_count": getattr(args, "request_count", 0),
+        "warmup_request_count": getattr(args, "warmup_request_count", 0),
+        "run_burst": getattr(args, "run_burst", False),
+        "respect_eos": getattr(args, "respect_eos", False),
+        "temperature": getattr(args, "temperature", None),
+        "max_total_tokens": args.max_total_tokens,
+        "skip_prefill": getattr(args, "skip_prefill", False),
+        "standalone_prefill": getattr(args, "standalone_prefill", False),
+        "prefill_only": getattr(args, "prefill_only", False),
+    }
+
+
+def write_resume_checkpoint(args, results: list, burst_results: list, prefill_results: dict) -> None:
+    """Persist per-cell progress so an interrupted matrix can be resumed."""
+    path = resume_checkpoint_path(args)
+    tmp = path + ".tmp"
+    try:
+        payload = {
+            # run_benchmark mutates args (e.g. autodetected model), so use the
+            # signature frozen at startup — the same view the loader compares.
+            "signature": getattr(args, "resume_signature", None) or resume_config_signature(args),
+            "timestamp": datetime.now().isoformat(),
+            "results": [asdict(r) for r in results],
+            "burst_results": [asdict(r) for r in burst_results],
+            "prefill_results": {str(k): v for k, v in (prefill_results or {}).items()},
+        }
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        # Checkpointing must never break a running benchmark.
+        if os.environ.get("BENCH_RESUME_DEBUG"):
+            import traceback
+            with open(path + ".err", "a") as f:
+                traceback.print_exc(file=f)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def clear_resume_checkpoint(args) -> None:
+    for path in (resume_checkpoint_path(args), resume_checkpoint_path(args) + ".tmp"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def load_resume_checkpoint(args) -> Optional[dict]:
+    path = resume_checkpoint_path(args)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    expected = getattr(args, "resume_signature", None) or resume_config_signature(args)
+    if data.get("signature") != expected:
+        return None
+    if not data.get("results") and not data.get("burst_results") and not data.get("prefill_results"):
+        return None
+    return data
+
+
+def cell_from_dict(data: dict) -> CellResult:
+    known = {f.name for f in dataclass_fields(CellResult)}
+    return CellResult(**{k: v for k, v in data.items() if k in known})
 
 
 def count_cjk_han(text: str) -> int:
@@ -14842,6 +15203,20 @@ def parse_args():
         help="Optional decode request temperature override. Use 0 for deterministic greedy decode. Default leaves the server/model default unchanged."
     )
     parser.add_argument(
+        "--accept-len-ref", type=float, default=0.0,
+        help="MTP/speculative decoding: also report projected tok/s at this fixed "
+             "reference accept length (steps/s x ref). steps/s itself is always "
+             "reported when the engine exports speculative counters. (default: 0 = off)"
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume an interrupted benchmark run from its checkpoint without asking."
+    )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Discard any unfinished-run checkpoint and start fresh without asking."
+    )
+    parser.add_argument(
         "--coding-peak", action="store_true",
         help="After the main benchmark, run a sequential cc1 coding prompt peak test "
              "matching /mnt/test.py throughput semantics and store it under coding_peak."
@@ -15245,10 +15620,11 @@ _prefill_results: dict = {}
 
 
 def main():
-    global _partial_results, _prefill_results
+    global _partial_results, _prefill_results, _accept_len_ref
     console = Console()
     check_for_update(console)
     args = parse_args()
+    _accept_len_ref = max(0.0, args.accept_len_ref)
     if args.compare_candidate:
         try:
             with open(args.compare_baseline, "r", encoding="utf-8") as fh:
@@ -15412,6 +15788,57 @@ def main():
         console.print(f"\n[green]Results saved to {args.output}[/green]")
         return
 
+    # Offer to resume an interrupted run with identical configuration. Must run
+    # before the keyboard listener switches the terminal out of canonical mode,
+    # otherwise input() would fight the key-listener thread for stdin.
+    args.resume_data = None
+    args.resume_signature = resume_config_signature(args)
+    if args.no_resume:
+        clear_resume_checkpoint(args)
+    checkpoint = None if args.no_resume else load_resume_checkpoint(args)
+    if checkpoint:
+        done_decode = len(checkpoint.get("results", []))
+        done_burst = len(checkpoint.get("burst_results", []))
+        done_prefill = len(checkpoint.get("prefill_results", {}))
+        total_cells = (
+            0 if args.prefill_only
+            else len(args.concurrency.split(",")) * len(args.contexts.split(","))
+        )
+        accept = False
+        if args.resume:
+            accept = True
+        elif sys.stdin.isatty():
+            console.print(Panel(
+                f"Found an unfinished run from [bold]{checkpoint.get('timestamp', '?')}[/bold] "
+                f"with identical configuration:\n"
+                f"completed {done_decode}/{total_cells} decode cells"
+                + (f" + {done_burst} burst cells" if done_burst else "")
+                + (f", {done_prefill} prefill contexts" if done_prefill else "")
+                + f"\nCheckpoint: {resume_checkpoint_path(args)}",
+                title=render_title("Unfinished run found"),
+                box=PANEL_BOX,
+                border_style=FRAME_BORDER,
+            ))
+            try:
+                answer = input("Resume the unfinished run? [Y/n] ").strip().lower()
+            except EOFError:
+                answer = "n"
+            accept = answer in ("", "y", "yes", "a", "ano")
+            if not accept:
+                clear_resume_checkpoint(args)
+                console.print("[yellow]Starting fresh; previous checkpoint discarded.[/yellow]")
+        else:
+            console.print(
+                "[yellow]Unfinished-run checkpoint found but stdin is not interactive; "
+                "starting fresh. Pass --resume to continue it or --no-resume to discard.[/yellow]"
+            )
+        if accept:
+            args.resume_data = checkpoint
+            console.print(
+                f"[green]Resuming: reusing {done_decode + done_burst} completed cells "
+                f"from the previous run.[/green]"
+            )
+
     # Start keyboard listener (background daemon thread)
     start_keyboard_listener(soft_quit=False)
 
@@ -15456,11 +15883,17 @@ def main():
 
     engine = ""
     burst_results = []
+    run_completed = False
     try:
         results, burst_results, prefill_results, engine = asyncio.run(run_benchmark(args))
         _prefill_results = prefill_results
+        run_completed = True
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user. Saving partial results...[/yellow]")
+        console.print(
+            "\n[yellow]Interrupted by user. Saving partial results...[/yellow]\n"
+            f"[yellow]Checkpoint kept at {resume_checkpoint_path(args)} — "
+            "the next run with this configuration can resume it.[/yellow]"
+        )
         results = _partial_results
         prefill_results = _prefill_results
 
@@ -15476,6 +15909,8 @@ def main():
             hardware_run_summary=getattr(args, "hardware_run_summary", {}),
         )
         save_results(results, args, args.output, prefill_results, engine=engine, burst_results=burst_results)
+        if run_completed:
+            clear_resume_checkpoint(args)
         if args.coding_peak:
             console.print("\n[bold cyan]Running coding peak cc1 probe...[/bold cyan]")
             coding_peak = asyncio.run(run_coding_peak(args))
