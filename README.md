@@ -187,6 +187,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--output` | `benchmark_results.json` | Output file path |
 | `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
 | `--skip-prefill` | | Skip prefill reporting entirely |
+| `--serial-server` | | Single-flight servers (mlx-lm style): readiness = tokens flowing on ≥1 stream, auto warmup timeout scales with concurrency; at C>1 aggregate tok/s measures the serial queue, not the model |
 
 ## Measurement Methodology
 
