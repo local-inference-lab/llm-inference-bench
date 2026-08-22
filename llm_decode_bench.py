@@ -10539,6 +10539,7 @@ async def run_one_cell(
     request_count: int = 0,
     warmup_request_count: int = 0,
     cell_warmup_timeout_seconds: Optional[float] = None,
+    serial_server_mode: bool = False,
     temperature: Optional[float] = None,
     forced_token_id: Optional[int] = None,
     loop_detection: bool = True,
@@ -11382,6 +11383,11 @@ async def run_one_cell(
         if cell_warmup_timeout_seconds and cell_warmup_timeout_seconds > 0
         else default_cell_warmup_timeout_seconds(context_tokens)
     )
+    if serial_server_mode:
+        # A single-flight server drains the C queued warmup generations one at
+        # a time, so readiness (first token on the last stream) is naturally
+        # serialized: scale the auto timeout by concurrency.
+        max_warmup_seconds *= concurrency
     last_metrics_time = 0.0
     gen_throughput_samples = []
     sglang_step_rate_samples = []
@@ -11505,7 +11511,15 @@ async def run_one_cell(
                     if engine not in (ENGINE_SGLANG, ENGINE_VLLM, ENGINE_FLARE):
                         full_concurrency_running = all_streams_active
                     all_streams_have_tokens = shared_active_streams[0] >= concurrency
-                    if not state.metrics_available:
+                    # Serial/single-flight servers (e.g. mlx-lm style) process
+                    # exactly one request at a time, so concurrency streams can
+                    # never be simultaneously active. With --serial-server,
+                    # readiness is "tokens flowing on at least one stream":
+                    # per-request metrics stay valid; aggregate tok/s across
+                    # concurrent streams is not meaningful on such servers.
+                    if serial_server_mode:
+                        server_ready = generating and shared_active_streams[0] >= 1
+                    elif not state.metrics_available:
                         full_concurrency_running = all_streams_active
                         server_ready = generating and full_concurrency_running
                     else:
@@ -11535,6 +11549,11 @@ async def run_one_cell(
                                     f"metrics_unavailable, active_streams={shared_active_streams[0]}/{concurrency}, "
                                     f"stable={ready_stable_seconds:.1f}s"
                                 )
+                            if serial_server_mode:
+                                ready_reason = (
+                                    f"serial_server, active_streams={shared_active_streams[0]}/{concurrency}, "
+                                    f"stable={ready_stable_seconds:.1f}s"
+                                )
                             measurement_start = now
                             measurement_end = None
                             state.cell_measurement_start = now
@@ -11561,7 +11580,23 @@ async def run_one_cell(
                         warmup_duration = now - state.cell_start
                         ready_reason = "warmup_timeout"
                         if not state.metrics_available:
-                            timeout_reason = "metrics_unavailable"
+                            # Without Prometheus, report the same client-side
+                            # diagnostic ladder instead of a blanket label, so
+                            # OpenAI-compatible servers without /metrics still
+                            # get an actionable timeout_reason.
+                            if shared_active_streams[0] < 1 or not generating:
+                                timeout_reason = "no_generation"
+                            elif shared_active_streams[0] < concurrency:
+                                timeout_reason = (
+                                    f"active_streams={shared_active_streams[0]}/{concurrency} "
+                                    "(metrics unavailable: readiness needs all streams active; "
+                                    "single-flight servers may need --serial-server)"
+                                )
+                            else:
+                                timeout_reason = (
+                                    f"active_streams={shared_active_streams[0]}/{concurrency}, "
+                                    "not_stable (metrics unavailable)"
+                                )
                         elif state.srv_running_reqs < concurrency:
                             timeout_reason = f"running_reqs={state.srv_running_reqs}/{concurrency}"
                         elif state.srv_queue_reqs > 0:
@@ -16808,6 +16843,7 @@ async def run_benchmark(args):
                         request_count=0,
                         warmup_request_count=0,
                         cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
+                        serial_server_mode=args.serial_server,
                         temperature=args.temperature,
                         forced_token_id=args.forced_token_id,
                         loop_detection=args.loop_detection,
@@ -16886,6 +16922,7 @@ async def run_benchmark(args):
                             request_count=args.request_count,
                             warmup_request_count=args.warmup_request_count,
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
+                            serial_server_mode=args.serial_server,
                             temperature=args.temperature,
                             forced_token_id=args.forced_token_id,
                             loop_detection=args.loop_detection,
@@ -16968,6 +17005,7 @@ async def run_benchmark(args):
                             request_count=measured_requests,
                             warmup_request_count=warmup_requests,
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
+                            serial_server_mode=args.serial_server,
                             temperature=args.temperature,
                             forced_token_id=args.forced_token_id,
                             loop_detection=args.loop_detection,
@@ -22332,6 +22370,14 @@ def parse_args():
              "(<=32k: 60s, 64k: 120s, >=128k: 180s)."
     )
     parser.add_argument(
+        "--serial-server", action="store_true",
+        help="Single-flight servers (mlx-lm style, one request at a time) can "
+             "never show concurrent active streams. Readiness becomes 'tokens "
+             "flowing on at least one stream', auto warmup timeouts scale with "
+             "concurrency, and aggregate tok/s at C>1 measures the serial queue, "
+             "not the model."
+    )
+    parser.add_argument(
         "--prefill-duration", type=float, default=10.0,
         help="Duration per standalone prefill context in seconds. Only used with "
              "--standalone-prefill. (default: 10)"
@@ -23220,7 +23266,10 @@ def main():
         f"Output preview: {'unavailable in plain mode' if args.display_mode == 'plain' else 'press o'}"
     )
     if not args.mixed_only:
-        config_lines.append(f"{prefill_label} | Sustained decode: {decode_count} cells{phase3}")
+        config_lines.append(
+            f"{prefill_label} | Sustained decode: {decode_count} cells{phase3}"
+            + (" | Serial-server mode" if args.serial_server else "")
+        )
     else:
         config_lines.append(f"{decode_mode} | {prefill_label}")
     if args.mixed_prefill_context_list:
