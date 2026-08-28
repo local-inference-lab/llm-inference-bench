@@ -12110,6 +12110,8 @@ async def run_completion_stats_benchmark(args) -> dict:
             payload["temperature"] = args.completion_stats_temperature
         if args.completion_stats_top_p is not None:
             payload["top_p"] = args.completion_stats_top_p
+        if args.reasoning_effort is not None:
+            payload["reasoning_effort"] = args.reasoning_effort
         request_overrides = (profile or {}).get("request_overrides") or {}
         if request_overrides:
             payload.update(json.loads(json.dumps(request_overrides)))
@@ -12383,6 +12385,7 @@ async def run_completion_stats_benchmark(args) -> dict:
                 "prefill_scout": not args.completion_stats_no_prefill_scout,
                 "temperature": args.completion_stats_temperature,
                 "top_p": args.completion_stats_top_p,
+                "reasoning_effort": args.reasoning_effort,
                 "request_overrides": (profile or {}).get("request_overrides") or {},
                 "system_prompt": bool((profile or {}).get("system_prompt")),
                 "nvidia_p2p_override_effective": bool(
@@ -15203,6 +15206,15 @@ def parse_args():
     parser.add_argument(
         "--completion-stats-top-p", type=float, default=None,
         help="Optional top_p override for --completion-stats requests. Default leaves server/model default unchanged."
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default=None,
+        help=(
+            "Optional OpenAI reasoning_effort for completion-stats/test-profile "
+            "requests. Default leaves the model template default unchanged."
+        ),
     )
     parser.add_argument(
         "--compare-baseline", default="",

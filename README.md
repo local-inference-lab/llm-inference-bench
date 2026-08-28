@@ -169,6 +169,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--completion-stats-concurrency-levels` | `1,2,4,8,16,30` | Candidate concurrency levels for the adaptive probe |
 | `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness; empty disables scoring |
 | `--completion-stats-save-text` | `false` | Store full streamed output/reasoning/content text in JSON instead of only final answer/excerpts |
+| `--reasoning-effort` | | Optional reasoning effort for completion-stats/test-profile requests: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Omitted by default |
 | `--hw-monitor-interval` | `2` | Live CPU/GPU hardware sampling interval in seconds |
 | `--hw-gpu-limit` | `8` | Maximum GPUs shown in the live hardware panel |
 | `--no-hw-monitor` | `false` | Disable live hardware sampling |
