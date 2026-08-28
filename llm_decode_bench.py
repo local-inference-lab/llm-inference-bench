@@ -7260,6 +7260,65 @@ def parse_numeric_pair_from_end(text: str) -> tuple[Optional[int], Optional[floa
     return None, None
 
 
+_LAVD_COUNT_TOKEN = r"(?:\d{1,6}|\d{1,3}(?:,\d{3})+)"
+_LAVD_HOUR_TOKEN = r"\d{1,6}(?:\.\d+)?"
+_LAVD_INLINE_TOTAL_RE = re.compile(
+    rf"(?<![\d,])(?P<value>{_LAVD_COUNT_TOKEN})(?![\d,])"
+    r"[\s*_`~]{1,16}(?:matching\s+)?tickets?\b[^\n]{0,500}?"
+    rf"(?<![\d.,])(?P<hours>{_LAVD_HOUR_TOKEN})(?![\d.])"
+    r"[\s*_`~]{0,16}(?:hours?|hrs?)\b",
+    flags=re.IGNORECASE,
+)
+_LAVD_SUMMARY_BLOCK_RE = re.compile(
+    rf"\b(?:matching\s+tickets?|total\s+tickets?|ticket\s+count)\b"
+    rf"(?:\s*\([^\n)]*\))?\s*(?::|=)?\s*[*_`~]*"
+    rf"(?P<value>{_LAVD_COUNT_TOKEN})(?![\d,])[^\n]*"
+    r"(?:\n[^\n]*){0,2}?\b(?:total\s+time|hours?\s+spent|total\s+hours?)\b"
+    rf"[^\n]*?(?<![\d.,])(?P<hours>{_LAVD_HOUR_TOKEN})(?![\d.])"
+    r"[\s*_`~]{0,16}(?:hours?|hrs?)\b",
+    flags=re.IGNORECASE,
+)
+_LAVD_LABELLED_BLOCK_RE = re.compile(
+    rf"\b(?:matching\s+tickets?|total\s+tickets?|ticket\s+count|tickets?)\b"
+    rf"\s*(?::|=)?\s*[*_`~]*(?P<value>{_LAVD_COUNT_TOKEN})(?![\d,])[^\n]*"
+    r"(?:\n[^\n]*){0,2}?\b(?:total\s+hours?|hours?)\b"
+    rf"\s*(?::|=)?\s*[*_`~]*(?P<hours>{_LAVD_HOUR_TOKEN})(?![\d.])",
+    flags=re.IGNORECASE,
+)
+_LAVD_ANSWER_MARKER_RE = re.compile(r"\b(?:answer|result|totals?)\b", flags=re.IGNORECASE)
+
+
+def parse_lavd_numeric_pair(text: str) -> tuple[Optional[int], Optional[float]]:
+    """Parse LAVD totals without mistaking ticket IDs or minute conversions for them.
+
+    Models do not always obey the prompt's request for two bare numbers. Prefer an
+    explicitly labelled ``tickets ... hours`` result, including adjacent summary
+    lines, then retain the original last-numeric-pair parser for terse responses.
+    """
+    if not text:
+        return None, None
+
+    candidates = []
+    for match in _LAVD_INLINE_TOTAL_RE.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line = text[line_start : line_end if line_end >= 0 else len(text)]
+        priority = 2 if _LAVD_ANSWER_MARKER_RE.search(line) else 1
+        candidates.append((priority, match.start(), match))
+    for pattern in (_LAVD_SUMMARY_BLOCK_RE, _LAVD_LABELLED_BLOCK_RE):
+        for match in pattern.finditer(text):
+            candidates.append((2, match.start(), match))
+
+    if candidates:
+        _, _, match = max(candidates, key=lambda candidate: candidate[:2])
+        return (
+            int(match.group("value").replace(",", "")),
+            float(match.group("hours")),
+        )
+
+    return parse_numeric_pair_from_end(text)
+
+
 def parse_number_from_end(text: str) -> Optional[float]:
     if not text:
         return None
@@ -7380,7 +7439,7 @@ def score_completion_profile(
 
     if scorer == "ledger_lavd":
         target = content_text or output_text or final_answer
-        pred_count, pred_hours = parse_numeric_pair_from_end(target)
+        pred_count, pred_hours = parse_lavd_numeric_pair(target)
         expected_count = int(profile.get("expected_count") or 72)
         expected_hours = float(profile.get("expected_hours") or 46.0)
         tolerance = float(profile.get("approx_tolerance") or 4.0)
@@ -11578,7 +11637,7 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
 
     if str(metadata.get("profile_scorer") or "") == "ledger_lavd":
         console.print(
-            "[dim]Interpretation: EXACT means the parsed final numeric pair is exactly 72, 46.0. "
+            "[dim]Interpretation: EXACT means the parsed ticket/hour totals are exactly 72, 46.0. "
             "NEAR means both count and hours are within the configured tolerance; FAIL means the "
             "answer was unparseable or outside tolerance. The 10-slot quality bar is a rounded "
             "distribution: ★=EXACT, ☆=NEAR, ✕=FAIL.[/dim]"
@@ -12397,8 +12456,8 @@ async def run_completion_stats_benchmark(args) -> dict:
                     "per-category accuracy. Runs are paired per item across configurations "
                     "via --compare-baseline."
                     if (profile or {}).get("scorer") == "dataset_mc_letter" else
-                    "The final answer is parsed from the end of the response as two numbers: "
-                    "ticket count and hours. EXACT is 72, 46.0; NEAR is within tolerance; "
+                    "Explicitly labelled ticket/hour totals are preferred; otherwise the final "
+                    "numeric pair is used. EXACT is 72, 46.0; NEAR is within tolerance; "
                     "FAIL is outside tolerance or unparseable. The 10-slot quality bar is a "
                     "rounded distribution: ★=EXACT, ☆=NEAR, ✕=FAIL."
                     if (profile or {}).get("scorer") == "ledger_lavd" else
