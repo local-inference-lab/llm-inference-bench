@@ -10074,12 +10074,20 @@ async def run_one_cell(
     aggregate_source = ""
     usage_measure_end = (
         shared_usage_last_time[0]
-        if measurement_usage_tokens > 0 and shared_usage_last_time[0] > measurement_start
+        if (
+            measurement_usage_tokens > 0
+            and shared_usage_last_time[0] is not None
+            and shared_usage_last_time[0] > measurement_start
+        )
         else measurement_end
     )
     token_measure_end = (
         shared_token_last_time[0]
-        if measurement_tokens > 0 and shared_token_last_time[0] > measurement_start
+        if (
+            measurement_tokens > 0
+            and shared_token_last_time[0] is not None
+            and shared_token_last_time[0] > measurement_start
+        )
         else measurement_end
     )
     usage_measure_duration = (
