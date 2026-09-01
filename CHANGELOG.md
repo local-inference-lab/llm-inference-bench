@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.31 - 2026-09-01
+
+### Answer scoring rewrite for the consistency profiles (estonia, hotel-lights)
+
+Both scorers could report a pass without the model having answered:
+
+- `estonia` applied `\bestonia\b` to the last non-empty line, so an answer that concluded **Latvia** but mentioned Estonia in a contrast or parenthetical passed, and — because an empty visible answer fell back to the reasoning stream — a run that hit `max_tokens` inside its thinking with the word "Estonia" in the last reasoning line passed too (reproduced from a local MiMo log).
+- `hotel-lights` (`numeric_exact`) took the last number anywhere in the selected text: `Not 48` passed, `48 rooms out of 100` failed as "got 100", reasoning-only output could be scored, and a truncated stream was never labelled as such.
+
+Changes:
+
+- **Reasoning is never scored.** Only the visible `content` is used. Inline `<think>…</think>` blocks streamed inside `content` are split off (an unclosed `<think>` counts as reasoning). An empty visible answer is `truncated` / `stalled` / `timeout` / `fail (no visible answer)` depending on how the stream ended — never a pass.
+- **Anchored answer extraction.** An explicit `Final answer:` / `Answer:` line wins over the last line; markdown emphasis, bullets and trailing punctuation are stripped. Incomplete streams (`finish_reason=length`, stall, wall-clock) are only scored when they carry an explicit anchored answer or a bare-number line.
+- **New `country_exact` scorer for `estonia`, `estonia-v1`, `estonia-long`.** It extracts the country the answer *asserts*: negated mentions (`not Latvia`), parenthetical asides next to an asserted country, and superseded values (`from Latvia to Estonia`, `Latvia -> Estonia`) do not count. Results are labelled `PASS`, `DECOY` (committed to the planted country, Latvia), `NOT_STATED` (the model says the packet does not contain the answer), `AMBIG` (one conclusion line asserts two countries; scored wrong and flagged for review) or `FAIL` (other country / unparseable), with the parsed country in the report.
+- **Strict `numeric_exact`.** Accepts a bare-number line, a number anchored at the end of the line (`= 48`, `answer is 48`, `Final answer: 48`) or a line whose only number is not negated or hedged; `Not 48`, `47, not 48`, hedged statements and multi-number lines without an anchor are `unparseable`, reported as such instead of as a wrong number.
+- **Incomplete runs are reported, not hidden.** New labels `STALL` and `TIMEOUT` join `TRUNC` (glyph `⊘`). They still count as not-correct in the headline pass rate, but the selected-concurrency table adds `pass rate, finished runs only`, the score line lists every label with a count (`PASS 19 / FAIL 0 / DECOY 4 / NOT_STATED 5 / TRUNC 2`), and the Failed Final Answers table colours them apart. A client-side cancel (`q`) is `CANCEL` and not scored at all.
+- **Estonia prompt v2.** The 700k-character packet is byte-identical; only the question tail changed: it now names the *vendor (manufacturer)* — the packet links a vendor account, never a "manufacturer" — and asks for exactly one `Final answer: <country>` line. The old tail is available as `--test-profile estonia-v1` (alias `estonia-legacy`), scored with the new scorer. `estonia-long` wraps the v2 prompt. Result metadata records `profile_version`, `scorer_version` and the sha256 of the prompt actually sent; `--compare-baseline` warns when prompt or scorer versions differ.
+- **Pinned sampling for the consistency profiles.** `estonia`, `estonia-v1`, `estonia-long` and `hotel-lights` now default to `temperature 0.6`, `top_p 0.95` (profiles previously inherited whatever the server defaulted to, so pass rates were not comparable across engines). Override with `--completion-stats-temperature` / `--completion-stats-top-p`. New `--completion-stats-seed BASE` sends `seed = BASE + run_index` so the N resamples differ from each other but are identical across engines/quants. The Configuration panel prints the effective sampling and watchdog settings.
+- **Watchdogs for uncapped runs.** `--completion-stats-stall-timeout` (default 600 s; 0 disables) closes a stream that produces no token for that long and scores it `STALL`. `--completion-stats-request-timeout` (default 0 = off) is a per-request wall-clock limit for models that loop without stalling when `max_tokens` is omitted; such runs are scored `TIMEOUT`. Previously the read timeout was unlimited and a looping model could hold the endpoint forever.
+- Tests: `tests/test_answer_scoring.py` covers the fixtures above (real local final answers, the reported false positives, think-block splitting, watchdog labels, prompt v1/v2 integrity and the summary breakdown).
+
+## 0.4.30 - unreleased
+
+- `--forced-token-id`: fixed-token decode route diagnostic (logit_bias=100, temperature 0, ignore_eos) for the sustained/burst matrices.
+
 ## 0.4.29 - 2026-07-08
 
 ### Truncated vs unparseable scoring
