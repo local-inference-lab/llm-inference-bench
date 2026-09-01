@@ -284,12 +284,12 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertTrue(prompt.startswith(BENCH.ESTONIA_LONG_PROMPT_PREFIX.strip()))
         self.assertTrue(prompt.endswith(BENCH.ESTONIA_V2_QUESTION_TAIL))
 
-    def test_consistency_profiles_pin_sampling(self):
-        for name in ("estonia", "estonia-long", "hotel-lights"):
+    def test_consistency_profiles_leave_sampling_to_the_server(self):
+        for name in ("estonia", "estonia-v1", "estonia-long", "hotel-lights"):
             with self.subTest(profile=name):
                 profile = BENCH.BUILTIN_TEST_PROFILES[name]
-                self.assertIsNotNone(profile.get("default_temperature"))
-                self.assertIsNotNone(profile.get("default_top_p"))
+                self.assertIsNone(profile.get("default_temperature"))
+                self.assertIsNone(profile.get("default_top_p"))
 
 
 class SummaryFormattingTests(unittest.TestCase):

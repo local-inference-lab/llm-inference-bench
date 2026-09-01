@@ -61,7 +61,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.31"
+VERSION = "0.4.32"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -4286,13 +4286,11 @@ def extract_mc_letter(final_answer: str, content_text: str, num_options: int = 1
     return ""
 
 
-# Sampling constants pinned for the resample consistency profiles (estonia,
-# estonia-long, hotel-lights). These profiles measure a pass-rate over N
-# stochastic samples, so sampling must be stochastic but identical across
-# engines/quants; 0.6 / 0.95 is the most common thinking-model recommendation.
-# Override per run with --completion-stats-temperature / --completion-stats-top-p.
-CONSISTENCY_PROFILE_TEMPERATURE = 0.6
-CONSISTENCY_PROFILE_TOP_P = 0.95
+# The resample consistency profiles (estonia*, hotel-lights) deliberately do
+# not pin temperature/top_p: they run on the server/model default unless the
+# user passes --completion-stats-temperature / --completion-stats-top-p. The
+# effective values are recorded in result metadata and shown in the
+# Configuration panel either way.
 
 # The v1 estonia packet ended with the bare question. v2 keeps the packet
 # byte-identical and only rewrites this tail: the question names the vendor
@@ -4333,8 +4331,6 @@ BUILTIN_TEST_PROFILES = {
         "decoy_answers": ["Latvia"],
         "answer_aliases": {"Estonia": ["Estonian"], "Latvia": ["Latvian"]},
         "default_max_tokens": 40000,
-        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
-        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "default_concurrency": 30,
         "default_runs": 30,
     },
@@ -4354,8 +4350,6 @@ BUILTIN_TEST_PROFILES = {
         "decoy_answers": ["Latvia"],
         "answer_aliases": {"Estonia": ["Estonian"], "Latvia": ["Latvian"]},
         "default_max_tokens": 40000,
-        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
-        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "default_concurrency": 30,
         "default_runs": 30,
     },
@@ -4375,8 +4369,6 @@ BUILTIN_TEST_PROFILES = {
         "decoy_answers": ["Latvia"],
         "answer_aliases": {"Estonia": ["Estonian"], "Latvia": ["Latvian"]},
         "default_max_tokens": 40000,
-        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
-        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "token_limit_field": "max_completion_tokens",
         "request_overrides": {
             "thinking": {"type": "enabled"},
@@ -4404,8 +4396,6 @@ BUILTIN_TEST_PROFILES = {
         "score_source": "final_answer",
         "expected_number": 48,
         "default_max_tokens": 0,
-        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
-        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "default_concurrency": 30,
         "default_runs": 30,
     },

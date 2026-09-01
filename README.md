@@ -169,8 +169,8 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--completion-stats-concurrency-levels` | `1,2,4,8,16,30` | Candidate concurrency levels for the adaptive probe |
 | `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness for custom `--prompt`/`--prompt-file` runs; empty disables scoring. Built-in profiles use their own typed scorer instead |
 | `--completion-stats-save-text` | `false` | Store full streamed output/reasoning/content text in JSON instead of only final answer/excerpts |
-| `--completion-stats-temperature` | profile default | Sampling temperature for profile requests. `estonia*` and `hotel-lights` pin `0.6`; dataset profiles pin `0`; custom prompts leave the server default |
-| `--completion-stats-top-p` | profile default | Sampling top_p for profile requests. `estonia*` and `hotel-lights` pin `0.95` |
+| `--completion-stats-temperature` | | Sampling temperature for profile requests. Dataset profiles default to `0`; `estonia*`, `hotel-lights` and custom prompts leave the server/model default unless set. The value used is recorded in result metadata |
+| `--completion-stats-top-p` | | Sampling top_p for profile requests. Omitted unless set; recorded in result metadata |
 | `--completion-stats-seed` | | Base sampling seed; run *i* is sent with `seed = base + i`, so resamples differ from each other but are identical across engines/quants |
 | `--completion-stats-stall-timeout` | `600` | Stall watchdog (seconds without a token) for profile streams; the run is closed and scored `STALL`. `0` disables |
 | `--completion-stats-request-timeout` | `0` | Per-request wall-clock limit (seconds) for profile streams; catches models that loop without stalling when `max_tokens` is omitted. Scored `TIMEOUT`. `0` disables |
@@ -397,10 +397,13 @@ the prompt actually sent; `--compare-baseline` warns when they differ.
 
 `estonia*` and `hotel-lights` are *resample consistency* tests: the same
 prompt is sent N times and the metric is the pass rate plus the completion
-tokens needed. Sampling is therefore stochastic on purpose, but pinned so runs
-are comparable across engines and quantizations: `temperature 0.6`,
-`top_p 0.95` (override with `--completion-stats-temperature` /
-`--completion-stats-top-p`). Add `--completion-stats-seed BASE` to send
+tokens needed. Sampling is therefore stochastic on purpose. The profiles do
+not pin temperature or top_p; requests run on the server/model default (the
+model's own `generation_config.json` under vLLM) unless you pass
+`--completion-stats-temperature` / `--completion-stats-top-p`. Whatever was
+used is recorded in result metadata and printed in the Configuration panel.
+For A/B runs across engines or quantizations, set both explicitly so both
+sides sample identically, and add `--completion-stats-seed BASE` to send
 `seed = BASE + run_index`, which keeps the N samples distinct but reproducible.
 The estonia packet contains planted decoys (Mirel Industrial in Latvia,
 K-27B/V-447, AR-13, MX-86/N-2), so wrong answers are almost always the decoy

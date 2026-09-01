@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.32 - 2026-09-01
+
+### Consistency profiles no longer pin sampling
+
+- Reverted the `temperature 0.6` / `top_p 0.95` defaults that 0.4.31 added to `estonia`, `estonia-v1`, `estonia-long` and `hotel-lights`. These profiles again run on the server/model default unless `--completion-stats-temperature` / `--completion-stats-top-p` are given. The effective values (or `None`) stay recorded in result metadata and in the Configuration panel, and `--completion-stats-seed` remains available for reproducible resamples.
+
 ## 0.4.31 - 2026-09-01
 
 ### Answer scoring rewrite for the consistency profiles (estonia, hotel-lights)
@@ -17,7 +23,7 @@ Changes:
 - **Strict `numeric_exact`.** Accepts a bare-number line, a number anchored at the end of the line (`= 48`, `answer is 48`, `Final answer: 48`) or a line whose only number is not negated or hedged; `Not 48`, `47, not 48`, hedged statements and multi-number lines without an anchor are `unparseable`, reported as such instead of as a wrong number.
 - **Incomplete runs are reported, not hidden.** New labels `STALL` and `TIMEOUT` join `TRUNC` (glyph `⊘`). They still count as not-correct in the headline pass rate, but the selected-concurrency table adds `pass rate, finished runs only`, the score line lists every label with a count (`PASS 19 / FAIL 0 / DECOY 4 / NOT_STATED 5 / TRUNC 2`), and the Failed Final Answers table colours them apart. A client-side cancel (`q`) is `CANCEL` and not scored at all.
 - **Estonia prompt v2.** The 700k-character packet is byte-identical; only the question tail changed: it now names the *vendor (manufacturer)* — the packet links a vendor account, never a "manufacturer" — and asks for exactly one `Final answer: <country>` line. The old tail is available as `--test-profile estonia-v1` (alias `estonia-legacy`), scored with the new scorer. `estonia-long` wraps the v2 prompt. Result metadata records `profile_version`, `scorer_version` and the sha256 of the prompt actually sent; `--compare-baseline` warns when prompt or scorer versions differ.
-- **Pinned sampling for the consistency profiles.** `estonia`, `estonia-v1`, `estonia-long` and `hotel-lights` now default to `temperature 0.6`, `top_p 0.95` (profiles previously inherited whatever the server defaulted to, so pass rates were not comparable across engines). Override with `--completion-stats-temperature` / `--completion-stats-top-p`. New `--completion-stats-seed BASE` sends `seed = BASE + run_index` so the N resamples differ from each other but are identical across engines/quants. The Configuration panel prints the effective sampling and watchdog settings.
+- **Sampling made visible.** New `--completion-stats-seed BASE` sends `seed = BASE + run_index` so the N resamples differ from each other but are identical across engines/quants. `--completion-stats-top-p` can now also come from a profile default. The Configuration panel prints the effective sampling (or "server/model defaults (unpinned)") and watchdog settings, and result metadata records temperature, top_p and seed. (0.4.31 also pinned `temperature 0.6` / `top_p 0.95` for the consistency profiles; that was reverted in 0.4.32.)
 - **Watchdogs for uncapped runs.** `--completion-stats-stall-timeout` (default 600 s; 0 disables) closes a stream that produces no token for that long and scores it `STALL`. `--completion-stats-request-timeout` (default 0 = off) is a per-request wall-clock limit for models that loop without stalling when `max_tokens` is omitted; such runs are scored `TIMEOUT`. Previously the read timeout was unlimited and a looping model could hold the endpoint forever.
 - Tests: `tests/test_answer_scoring.py` covers the fixtures above (real local final answers, the reported false positives, think-block splitting, watchdog labels, prompt v1/v2 integrity and the summary breakdown).
 
