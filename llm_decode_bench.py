@@ -61,7 +61,12 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.29"
+VERSION = "0.4.31"
+
+# Bumped whenever the answer extraction / scoring rules change in a way that can
+# move a pass/fail verdict. Recorded in result metadata so old and new reports
+# are never silently compared.
+SCORER_VERSION = 2
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -4281,19 +4286,76 @@ def extract_mc_letter(final_answer: str, content_text: str, num_options: int = 1
     return ""
 
 
+# Sampling constants pinned for the resample consistency profiles (estonia,
+# estonia-long, hotel-lights). These profiles measure a pass-rate over N
+# stochastic samples, so sampling must be stochastic but identical across
+# engines/quants; 0.6 / 0.95 is the most common thinking-model recommendation.
+# Override per run with --completion-stats-temperature / --completion-stats-top-p.
+CONSISTENCY_PROFILE_TEMPERATURE = 0.6
+CONSISTENCY_PROFILE_TOP_P = 0.95
+
+# The v1 estonia packet ended with the bare question. v2 keeps the packet
+# byte-identical and only rewrites this tail: the question names the vendor
+# (the packet links a vendor account, not a "manufacturer") and asks for a
+# single machine-readable answer line, so the scorer can parse an asserted
+# country instead of grepping the last line.
+ESTONIA_V1_QUESTION_TAIL = (
+    "Question: In which country is the manufacturer of the material used by the "
+    "Glass Current salinity bench headquartered?\nAnswer:"
+)
+ESTONIA_V2_QUESTION_TAIL = (
+    "Question: In which country is the vendor (manufacturer) of the material used "
+    "by the Glass Current salinity bench headquartered?\n"
+    "End your visible response with exactly one line in the form "
+    "\"Final answer: <country>\".\nAnswer:"
+)
+
 BUILTIN_TEST_PROFILES = {
     "estonia": {
         "description": (
-            "Long-context GLM dense-MLA vs NSA diagnostic task. The expected final "
-            "answer is Estonia; completion-token statistics show how many decode "
-            "tokens the engine needs to reach that answer."
+            "Long-context GLM dense-MLA vs NSA diagnostic task (v2 prompt). The "
+            "expected final answer is Estonia; completion-token statistics show how "
+            "many decode tokens the engine needs to reach that answer. v2 asks for a "
+            "'Final answer: <country>' line and scores the asserted country, "
+            "separating decoy (Latvia), not-stated, truncated and wrong answers."
         ),
+        "profile_version": 2,
         "prompt_blob": ESTONIA_PROMPT_ZLIB_B64,
         "prompt_encoding": "utf-8",
         "prompt_compression": "zlib+base64",
-        "correct_regex": r"\bestonia\b",
+        "prompt_tail_replace": {
+            "old": ESTONIA_V1_QUESTION_TAIL,
+            "new": ESTONIA_V2_QUESTION_TAIL,
+        },
+        "scorer": "country_exact",
         "score_source": "final_answer",
+        "expected_answer": "Estonia",
+        "decoy_answers": ["Latvia"],
+        "answer_aliases": {"Estonia": ["Estonian"], "Latvia": ["Latvian"]},
         "default_max_tokens": 40000,
+        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
+        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
+        "default_concurrency": 30,
+        "default_runs": 30,
+    },
+    "estonia-v1": {
+        "description": (
+            "Legacy v1 estonia prompt: identical packet, bare 'Question/Answer:' "
+            "tail without an answer-format instruction. Kept for comparison with "
+            "pre-0.4.31 reports; scored with the current country scorer."
+        ),
+        "profile_version": 1,
+        "prompt_blob": ESTONIA_PROMPT_ZLIB_B64,
+        "prompt_encoding": "utf-8",
+        "prompt_compression": "zlib+base64",
+        "scorer": "country_exact",
+        "score_source": "final_answer",
+        "expected_answer": "Estonia",
+        "decoy_answers": ["Latvia"],
+        "answer_aliases": {"Estonia": ["Estonian"], "Latvia": ["Latvian"]},
+        "default_max_tokens": 40000,
+        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
+        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "default_concurrency": 30,
         "default_runs": 30,
     },
@@ -4303,12 +4365,18 @@ BUILTIN_TEST_PROFILES = {
             "This tests whether a model can avoid premature short unknown/wrong "
             "answers without receiving task-specific chain or decoy hints."
         ),
+        "profile_version": 2,
         "base_profile": "estonia",
         "system_prompt": ESTONIA_LONG_SYSTEM_PROMPT,
         "prompt_prefix": ESTONIA_LONG_PROMPT_PREFIX,
-        "correct_regex": r"\bestonia\b",
+        "scorer": "country_exact",
         "score_source": "final_answer",
+        "expected_answer": "Estonia",
+        "decoy_answers": ["Latvia"],
+        "answer_aliases": {"Estonia": ["Estonian"], "Latvia": ["Latvian"]},
         "default_max_tokens": 40000,
+        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
+        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "token_limit_field": "max_completion_tokens",
         "request_overrides": {
             "thinking": {"type": "enabled"},
@@ -4322,6 +4390,7 @@ BUILTIN_TEST_PROFILES = {
             "cycling lights, guests toggle every nth room n times, and a cat resets "
             "green lights to red after each guest. The expected final answer is 48."
         ),
+        "profile_version": 2,
         "prompt_text": (
             "A hotel has 100 rooms, each with a light that cycles through red, green, "
             "and blue. Initially, all lights are red. 100 guests arrive one by one. "
@@ -4335,6 +4404,8 @@ BUILTIN_TEST_PROFILES = {
         "score_source": "final_answer",
         "expected_number": 48,
         "default_max_tokens": 0,
+        "default_temperature": CONSISTENCY_PROFILE_TEMPERATURE,
+        "default_top_p": CONSISTENCY_PROFILE_TOP_P,
         "default_concurrency": 30,
         "default_runs": 30,
     },
@@ -4417,6 +4488,8 @@ BUILTIN_TEST_PROFILES = {
 }
 
 BUILTIN_TEST_PROFILE_ALIASES = {
+    "estonia-legacy": "estonia-v1",
+    "estonia-v2": "estonia",
     "hotel": "hotel-lights",
     "lights": "hotel-lights",
     "lavd": "lavd-test",
@@ -7228,6 +7301,408 @@ def extract_final_answer(text: str) -> str:
     return lines[-1] if lines else text.strip()
 
 
+# ---------------------------------------------------------------------------
+# Answer extraction (shared by the built-in scorers)
+# ---------------------------------------------------------------------------
+#
+# Scoring only ever looks at the model's *visible* answer. Private reasoning
+# (a separate ``reasoning`` delta, or an inline ``<think>…</think>`` block) is
+# recorded for token statistics but never scored: a truncated reasoning trace
+# that happens to mention the right value is not an answer.
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>", flags=re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think>", flags=re.IGNORECASE)
+_ANSWER_ANCHOR_RE = re.compile(
+    r"^[ \t>*#_`~]*(?:the\s+)?(?:final\s+answer|answer)[*_`~\s]*(?:is|:|=)[*_`~\s]*(?P<value>.+?)\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_MARKDOWN_LEAD_RE = re.compile(r"^(?:\s*(?:[>#*_`~]+|[-*•]\s+))+")
+_MARKDOWN_TAIL_RE = re.compile(r"[\s*_`~]+$")
+
+INCOMPLETE_FINISH_REASONS = ("length", "stalled", "timeout", "client_cancelled")
+
+
+def is_incomplete_finish(finish_reason: str) -> bool:
+    return str(finish_reason or "").lower() in INCOMPLETE_FINISH_REASONS
+
+
+def split_visible_answer_text(content_text: str) -> tuple[str, bool]:
+    """Return ``(visible_text, unclosed_think)`` for a streamed ``content`` field.
+
+    Some servers do not route reasoning through a separate delta field and stream
+    the raw ``<think>…</think>`` block inside ``content``. Closed blocks are
+    dropped. An unclosed ``<think>`` means everything after it is still private
+    reasoning, so it is dropped as well and flagged. A stray ``</think>`` with
+    no opener (templates that pre-fill the opener) keeps only the text after it.
+    """
+    if not content_text:
+        return "", False
+    text = _THINK_BLOCK_RE.sub("", content_text)
+    unclosed = False
+    open_match = _THINK_OPEN_RE.search(text)
+    if open_match:
+        text = text[: open_match.start()]
+        unclosed = True
+    last_close = None
+    for last_close in _THINK_CLOSE_RE.finditer(text):
+        pass
+    if last_close is not None:
+        text = text[last_close.end():]
+    return text, unclosed
+
+
+def clean_answer_line(line: str) -> str:
+    """Strip markdown emphasis, bullets, headings and trailing punctuation."""
+    text = (line or "").strip()
+    # Emphasis and punctuation nest ("*Estonia*." / "**48.**"), so peel until stable.
+    for _ in range(6):
+        before = text
+        text = _MARKDOWN_LEAD_RE.sub("", text)
+        text = _MARKDOWN_TAIL_RE.sub("", text)
+        text = text.strip().rstrip(".!。").strip()
+        if text == before:
+            break
+    return text
+
+
+def find_anchored_answer(text: str) -> str:
+    """Return the value of the last ``Final answer:`` / ``Answer:`` line, or ''."""
+    if not text:
+        return ""
+    matches = list(_ANSWER_ANCHOR_RE.finditer(text))
+    if not matches:
+        return ""
+    return clean_answer_line(matches[-1].group("value"))
+
+
+def extract_answer_line(text: str) -> str:
+    """Pick the line carrying the model's asserted answer.
+
+    Prefers the last explicit ``Final answer:`` / ``Answer:`` line; otherwise the
+    last non-empty line (the historical behaviour), cleaned of markdown.
+    """
+    anchored = find_anchored_answer(text)
+    if anchored:
+        return anchored
+    return clean_answer_line(extract_final_answer(text))
+
+
+# ---------------------------------------------------------------------------
+# Country answer scoring (estonia profiles)
+# ---------------------------------------------------------------------------
+
+_COUNTRY_NAMES = (
+    "Afghanistan|Albania|Algeria|Andorra|Angola|Antigua and Barbuda|Argentina|Armenia|Australia|"
+    "Austria|Azerbaijan|Bahamas|Bahrain|Bangladesh|Barbados|Belarus|Belgium|Belize|Benin|Bhutan|"
+    "Bolivia|Bosnia and Herzegovina|Bosnia|Botswana|Brazil|Brunei|Bulgaria|Burkina Faso|Burundi|"
+    "Cabo Verde|Cape Verde|Cambodia|Cameroon|Canada|Central African Republic|Chad|Chile|China|"
+    "Colombia|Comoros|Congo|Costa Rica|Croatia|Cuba|Cyprus|Czech Republic|Czechia|Denmark|Djibouti|"
+    "Dominica|Dominican Republic|Ecuador|Egypt|El Salvador|Equatorial Guinea|Eritrea|Estonia|"
+    "Eswatini|Swaziland|Ethiopia|Fiji|Finland|France|Gabon|Gambia|Georgia|Germany|Ghana|Greece|"
+    "Grenada|Guatemala|Guinea-Bissau|Guinea|Guyana|Haiti|Honduras|Hungary|Iceland|India|Indonesia|"
+    "Iran|Iraq|Ireland|Israel|Italy|Ivory Coast|Côte d'Ivoire|Jamaica|Japan|Jordan|Kazakhstan|"
+    "Kenya|Kiribati|Kosovo|Kuwait|Kyrgyzstan|Laos|Latvia|Lebanon|Lesotho|Liberia|Libya|"
+    "Liechtenstein|Lithuania|Luxembourg|Madagascar|Malawi|Malaysia|Maldives|Mali|Malta|"
+    "Marshall Islands|Mauritania|Mauritius|Mexico|Micronesia|Moldova|Monaco|Mongolia|Montenegro|"
+    "Morocco|Mozambique|Myanmar|Burma|Namibia|Nauru|Nepal|Netherlands|New Zealand|Nicaragua|"
+    "Nigeria|Niger|North Korea|North Macedonia|Macedonia|Norway|Oman|Pakistan|Palau|Palestine|"
+    "Panama|Papua New Guinea|Paraguay|Peru|Philippines|Poland|Portugal|Qatar|Romania|Russia|"
+    "Russian Federation|Rwanda|Saint Kitts and Nevis|Saint Lucia|Saint Vincent and the Grenadines|"
+    "Samoa|San Marino|Sao Tome and Principe|Saudi Arabia|Senegal|Serbia|Seychelles|Sierra Leone|"
+    "Singapore|Slovakia|Slovenia|Solomon Islands|Somalia|South Africa|South Korea|South Sudan|"
+    "Spain|Sri Lanka|Sudan|Suriname|Sweden|Switzerland|Syria|Taiwan|Tajikistan|Tanzania|Thailand|"
+    "Timor-Leste|East Timor|Togo|Tonga|Trinidad and Tobago|Tunisia|Turkey|Türkiye|Turkmenistan|"
+    "Tuvalu|Uganda|Ukraine|United Arab Emirates|UAE|United Kingdom|Great Britain|Britain|England|"
+    "Scotland|Wales|United States of America|United States|USA|Uruguay|Uzbekistan|Vanuatu|"
+    "Vatican City|Venezuela|Vietnam|Yemen|Zambia|Zimbabwe"
+)
+_COUNTRY_REGEX_CACHE: dict[tuple, re.Pattern] = {}
+_PARENTHETICAL_RE = re.compile(r"\([^()]*\)|\[[^\[\]]*\]")
+_NEGATION_PREFIX_RE = re.compile(
+    r"(?:\bnot|\bnever|\bnor|\brather\s+than|\binstead\s+of|n't|\bno\s+longer|\bexcluding|\bexcept)"
+    r"\s+(?:(?:in|from|to|of|the|a|an|headquartered|based|located|registered|be)\s+)*$",
+    flags=re.IGNORECASE,
+)
+_NOT_STATED_RE = re.compile(
+    r"(?:\bnot\s+(?:stated|specified|provided|mentioned|given|identified|identifiable|determinable|"
+    r"available|found|present|answerable|explicitly)"
+    r"|\bcannot\s+be\s+(?:determined|answered|identified|established|inferred)"
+    r"|\bcan(?:no|')t\s+(?:be\s+)?(?:determine|determined|answer|answered|identify|identified|"
+    r"establish|established|infer|inferred|tell|say)"
+    r"|\bunable\s+to\s+(?:determine|identify|answer|establish|find|locate)"
+    r"|\b(?:does|do|did)\s+not\s+(?:specify|state|provide|identify|mention|contain|say|name|"
+    r"indicate|establish|include|reveal|give|answer)"
+    r"|\b(?:doesn|don|didn)'t\s+(?:specify|state|provide|identify|mention|contain|say|name|"
+    r"indicate|establish|include|reveal|give|answer)"
+    r"|\bnever\s+(?:mentions?|states?|specifies|identifies|names?)"
+    r"|\binsufficient\s+(?:information|evidence|data)"
+    r"|\bno\s+(?:information|answer|such\s+information|explicit|definitive)"
+    r"|\binformation\s+is\s+(?:missing|unavailable|absent)"
+    r"|\b(?:unknown|indeterminate|undetermined|unanswerable|unspecified)\b"
+    r"|\bI\s+(?:do\s+not|don't)\s+have\s+(?:the\s+|any\s+|access\s+to\s+)?(?:document|report|"
+    r"packet|information|source|text|context|access)"
+    r"|\bis\s+(?:missing|absent|unavailable)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _country_regex(extra_terms: tuple) -> re.Pattern:
+    key = tuple(sorted(extra_terms))
+    pattern = _COUNTRY_REGEX_CACHE.get(key)
+    if pattern is None:
+        terms = set(_COUNTRY_NAMES.split("|")) | set(key)
+        ordered = sorted(terms, key=len, reverse=True)
+        pattern = re.compile(
+            r"(?<![A-Za-z])(" + "|".join(re.escape(term) for term in ordered) + r")(?![A-Za-z])",
+            flags=re.IGNORECASE,
+        )
+        _COUNTRY_REGEX_CACHE[key] = pattern
+    return pattern
+
+
+_ASSERTION_VERB_RE = re.compile(
+    r"\b(?:headquartered|based|located|registered|incorporated|domiciled|seated|is|are|was|"
+    r"answer(?:\s+is)?|country(?:\s+is)?|corrected\s+to|changed\s+to|updated\s+to|amended\s+to|"
+    r"revised\s+to|moved\s+to)\s+(?:in\s+|to\s+|as\s+)?(?:the\s+)?$",
+    flags=re.IGNORECASE,
+)
+
+
+def _country_mentions(line: str, pattern: re.Pattern, canonical: dict) -> list[str]:
+    """Distinct countries asserted (not negated) on one cleaned answer line."""
+    if not line:
+        return []
+    text = line
+    stripped = _PARENTHETICAL_RE.sub(" ", line)
+    # Parentheticals are dropped only when the surrounding sentence itself names
+    # a country: "…in Estonia (not Latvia…)" scores Estonia, but a bare
+    # "Mirel Instrument (Estonia)" keeps its only country.
+    if pattern.search(stripped):
+        text = stripped
+
+    def canon(raw: str) -> str:
+        return canonical.get(raw.lower()) or _COUNTRY_CANONICAL.get(raw.lower()) or raw
+
+    # "from Latvia to Estonia", "Latvia -> Estonia", "Latvia was corrected to
+    # Estonia": the first country is the superseded value, not an assertion.
+    superseded: set[str] = set()
+    transition_re = re.compile(
+        rf"(?:\bfrom\s+)?{pattern.pattern}\s*(?:→|->|=>|\bto\b|[^.;,]{{0,40}}?\b(?:corrected|changed|"
+        rf"updated|amended|revised|moved)\s+to)\s+(?:the\s+)?{pattern.pattern}",
+        flags=re.IGNORECASE,
+    )
+    for match in transition_re.finditer(text):
+        first, second = canon(match.group(1)), canon(match.group(2))
+        if first != second:
+            superseded.add(first)
+
+    found: list[str] = []
+    asserted: list[str] = []
+    for match in pattern.finditer(text):
+        prefix = text[max(0, match.start() - 48): match.start()]
+        if _NEGATION_PREFIX_RE.search(prefix):
+            continue
+        name = canon(match.group(1))
+        if name in superseded:
+            continue
+        if name not in found:
+            found.append(name)
+        if _ASSERTION_VERB_RE.search(prefix) and name not in asserted:
+            asserted.append(name)
+    if len(found) > 1 and len(asserted) == 1:
+        # Several countries mentioned, exactly one carried by an assertion
+        # verb ("is headquartered in X"): that is the conclusion.
+        return asserted
+    return found
+
+
+_COUNTRY_CANONICAL = {name.lower(): name for name in _COUNTRY_NAMES.split("|")}
+
+
+def score_country_answer(
+    *,
+    visible_text: str,
+    expected: str,
+    decoys: Optional[list] = None,
+    aliases: Optional[dict] = None,
+    finish_reason: str = "",
+) -> dict:
+    """Score a free-text answer whose expected value is a country name.
+
+    Only the visible text is considered. An explicit ``Final answer:`` line
+    wins; otherwise lines are examined from the end and the first line that
+    asserts a country (or says the answer is not stated) decides. Countries
+    mentioned as a negated contrast ("not Latvia") or inside a parenthetical
+    aside next to an asserted country do not count. A line asserting two
+    different countries is ``ambiguous`` (scored wrong, flagged for review).
+    Incomplete streams (max_tokens, stall, wall-clock) are only scored when
+    they contain an explicit ``Final answer:`` line.
+    """
+    decoys = [str(d) for d in (decoys or []) if str(d)]
+    aliases = aliases or {}
+    canonical: dict[str, str] = {}
+    for name in [expected, *decoys]:
+        canonical[name.lower()] = name
+        for alias in aliases.get(name, []) or []:
+            canonical[str(alias).lower()] = name
+    pattern = _country_regex(tuple(canonical))
+    incomplete = is_incomplete_finish(finish_reason)
+
+    def verdict(asserted: str, source: str) -> dict:
+        if asserted.lower() == expected.lower():
+            return {
+                "correct": True,
+                "score_label": "pass",
+                "score_detail": f"asserted {asserted} ({source})",
+                "parsed_answer": asserted,
+            }
+        if asserted.lower() in {d.lower() for d in decoys}:
+            return {
+                "correct": False,
+                "score_label": "decoy",
+                "score_detail": f"decoy answer: expected {expected}, got {asserted}",
+                "parsed_answer": asserted,
+            }
+        return {
+            "correct": False,
+            "score_label": "fail",
+            "score_detail": f"expected {expected}, got {asserted}",
+            "parsed_answer": asserted,
+        }
+
+    if not (visible_text or "").strip():
+        return _no_answer_result(finish_reason, detail="no visible answer")
+
+    anchored = find_anchored_answer(visible_text)
+    if anchored:
+        countries = _country_mentions(anchored, pattern, canonical)
+        if len(countries) == 1:
+            return verdict(countries[0], "final answer line")
+        if len(countries) > 1:
+            return {
+                "correct": False,
+                "score_label": "ambiguous",
+                "score_detail": "final answer line asserts several countries: " + ", ".join(countries),
+                "parsed_answer": " / ".join(countries),
+            }
+        if _NOT_STATED_RE.search(anchored):
+            return {
+                "correct": False,
+                "score_label": "not_stated",
+                "score_detail": "model says the packet does not state the answer",
+                "parsed_answer": "not stated",
+            }
+        return {
+            "correct": False,
+            "score_label": "fail",
+            "score_detail": "unparseable: final answer line names no country",
+            "parsed_answer": anchored[:60],
+        }
+
+    if incomplete:
+        return _no_answer_result(finish_reason)
+
+    lines = [clean_answer_line(line) for line in visible_text.splitlines() if line.strip()]
+    saw_not_stated = False
+    for line in reversed(lines):
+        countries = _country_mentions(line, pattern, canonical)
+        if len(countries) == 1:
+            return verdict(countries[0], "last country-bearing line")
+        if len(countries) > 1:
+            return {
+                "correct": False,
+                "score_label": "ambiguous",
+                "score_detail": "conclusion line asserts several countries: " + ", ".join(countries),
+                "parsed_answer": " / ".join(countries),
+            }
+        if _NOT_STATED_RE.search(line):
+            saw_not_stated = True
+            break
+    if saw_not_stated:
+        return {
+            "correct": False,
+            "score_label": "not_stated",
+            "score_detail": "model says the packet does not state the answer",
+            "parsed_answer": "not stated",
+        }
+    return {
+        "correct": False,
+        "score_label": "fail",
+        "score_detail": "unparseable: no country named in the visible answer",
+        "parsed_answer": "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strict final-number parsing (hotel-lights)
+# ---------------------------------------------------------------------------
+
+_NUMBER_TOKEN = r"[-+]?\d[\d,]*(?:\.\d+)?"
+_NUMBER_TOKEN_RE = re.compile(_NUMBER_TOKEN)
+_ANSWER_UNIT = r"(?:blue\s+)?(?:lights?|rooms?|bulbs?)"
+_BARE_NUMBER_LINE_RE = re.compile(
+    rf"^\s*(?P<num>{_NUMBER_TOKEN})\s*(?:{_ANSWER_UNIT})?\s*$",
+    flags=re.IGNORECASE,
+)
+_ANCHORED_NUMBER_RE = re.compile(
+    rf"(?:\banswer\b|\bresult\b|\btotal\b|\bis\b|\bare\b|\bequals\b|=|:|→|->)\s*[*_`~]*\s*"
+    rf"(?P<num>{_NUMBER_TOKEN})\s*[*_`~]*\s*(?:{_ANSWER_UNIT})?\s*$",
+    flags=re.IGNORECASE,
+)
+_NEGATED_NUMBER_RE = re.compile(
+    rf"(?:\bnot|\bnever|n't|\brather\s+than|\binstead\s+of|\bexcept)\s+(?:be\s+|exactly\s+)?{_NUMBER_TOKEN}",
+    flags=re.IGNORECASE,
+)
+_HEDGE_RE = re.compile(
+    r"\b(?:cannot|can't|unable|not\s+sure|uncertain|unclear|don't\s+know|do\s+not\s+know|"
+    r"considered|maybe|perhaps|possibly|might\s+be|could\s+be)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _number_token_to_float(token: str) -> Optional[float]:
+    try:
+        return float(token.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_final_number_strict(line: str) -> tuple[Optional[float], str]:
+    """Parse the number a single answer line asserts.
+
+    Returns ``(number, mode)`` where mode is ``bare`` (the line is just a
+    number), ``anchored`` (``… = 48`` / ``answer is 48`` at the end of the
+    line) or ``single`` (the line's only number, no negation or hedging).
+    Returns ``(None, reason)`` when the line does not assert one number:
+    negated (``Not 48``), hedged, several numbers without an anchor
+    (``48 rooms out of 100``), or no number at all.
+    """
+    text = clean_answer_line(line)
+    if not text:
+        return None, "empty"
+    bare = _BARE_NUMBER_LINE_RE.match(text)
+    if bare:
+        value = _number_token_to_float(bare.group("num"))
+        return (value, "bare") if value is not None else (None, "no number")
+    anchored = _ANCHORED_NUMBER_RE.search(text)
+    if anchored and not _NEGATION_PREFIX_RE.search(text[: anchored.start("num")][-48:]):
+        value = _number_token_to_float(anchored.group("num"))
+        if value is not None:
+            return value, "anchored"
+    tokens = _NUMBER_TOKEN_RE.findall(text)
+    if not tokens:
+        return None, "no number"
+    if _NEGATED_NUMBER_RE.search(text):
+        return None, "negated number"
+    if _HEDGE_RE.search(text):
+        return None, "hedged statement"
+    if len(tokens) == 1:
+        value = _number_token_to_float(tokens[0])
+        return (value, "single") if value is not None else (None, "no number")
+    return None, "multiple numbers without answer anchor"
+
+
 def score_completion_text(
     *,
     final_answer: str,
@@ -7336,25 +7811,50 @@ def parse_number_from_end(text: str) -> Optional[float]:
     return float(nums[-1])
 
 
-def _no_answer_result(finish_reason: str) -> dict:
-    """Result for a request that produced no parseable answer.
+def _no_answer_result(finish_reason: str, *, detail: str = "") -> dict:
+    """Result for a request that produced no parseable visible answer.
 
     Distinguishes a genuine format miss (the model answered but we could not
-    read it) from a truncation (the model hit the token limit and never
-    answered). Both are still wrong, but only the latter is a token-budget
-    artifact, so they get distinct labels so the report is not misleading.
+    read it) from an incomplete stream: ``truncated`` (max_tokens hit while
+    still reasoning), ``stalled`` (no tokens within the stall timeout) and
+    ``timeout`` (wall-clock limit). All of these count as not-correct, but
+    they are budget/runtime artifacts rather than wrong answers, so they get
+    distinct labels and the report shows them separately. A client-side cancel
+    (``q`` pressed) is not scored at all.
     """
-    if str(finish_reason or "").lower() == "length":
+    reason = str(finish_reason or "").lower()
+    if reason == "length":
         return {
             "correct": False,
             "score_label": "truncated",
             "score_detail": "no answer: hit max_tokens limit",
             "parsed_answer": "",
         }
+    if reason == "stalled":
+        return {
+            "correct": False,
+            "score_label": "stalled",
+            "score_detail": "no answer: stream stalled (no tokens within the stall timeout)",
+            "parsed_answer": "",
+        }
+    if reason == "timeout":
+        return {
+            "correct": False,
+            "score_label": "timeout",
+            "score_detail": "no answer: request wall-clock limit reached",
+            "parsed_answer": "",
+        }
+    if reason == "client_cancelled":
+        return {
+            "correct": None,
+            "score_label": "cancelled",
+            "score_detail": "cancelled by the client before the answer",
+            "parsed_answer": "",
+        }
     return {
         "correct": False,
         "score_label": "fail",
-        "score_detail": "unparseable",
+        "score_detail": detail or "unparseable",
         "parsed_answer": "",
     }
 
@@ -7372,6 +7872,10 @@ def score_completion_profile(
 ) -> dict:
     profile = profile or {}
     scorer = str(profile.get("scorer") or "")
+    # ``content_text`` is the model's visible answer (reasoning already split
+    # off by the stream reader). ``output_text`` (reasoning + content) is only
+    # consulted when the caller explicitly asked for source=output.
+    visible_text = output_text if source == "output" else (content_text or "")
     if source == "content":
         target = content_text
     elif source == "output":
@@ -7381,14 +7885,38 @@ def score_completion_profile(
 
     if scorer == "numeric_exact":
         expected = float(profile.get("expected_number") or 0)
-        parsed_number = parse_number_from_end(target or output_text or content_text or final_answer)
+        if not visible_text.strip():
+            return _no_answer_result(finish_reason, detail="unparseable: no visible answer")
+        incomplete = is_incomplete_finish(finish_reason)
+        candidates = []
+        anchored = find_anchored_answer(visible_text)
+        if anchored:
+            candidates.append(anchored)
+        last_line = clean_answer_line(extract_final_answer(visible_text))
+        if last_line and last_line not in candidates:
+            candidates.append(last_line)
+        if final_answer and clean_answer_line(final_answer) not in candidates:
+            candidates.append(clean_answer_line(final_answer))
+        parsed_number = None
+        mode = "no number"
+        for candidate in candidates:
+            parsed_number, mode = parse_final_number_strict(candidate)
+            if parsed_number is not None:
+                break
         if parsed_number is None:
+            if incomplete:
+                return _no_answer_result(finish_reason)
             return {
                 "correct": False,
                 "score_label": "fail",
-                "score_detail": "unparseable",
+                "score_detail": f"unparseable: {mode}",
                 "parsed_answer": "",
             }
+        if incomplete and mode == "single":
+            # A cut-off stream whose last visible line merely contains a number
+            # is not an answer; only a bare-number line or an explicit anchor
+            # ("Final answer: 48", "= 48") counts.
+            return _no_answer_result(finish_reason)
         parsed = f"{parsed_number:g}"
         is_exact = abs(parsed_number - expected) < 1e-9
         return {
@@ -7397,6 +7925,15 @@ def score_completion_profile(
             "score_detail": "exact" if is_exact else f"expected {expected:g}, got {parsed}",
             "parsed_answer": parsed,
         }
+
+    if scorer == "country_exact":
+        return score_country_answer(
+            visible_text=visible_text,
+            expected=str(profile.get("expected_answer") or ""),
+            decoys=list(profile.get("decoy_answers") or []),
+            aliases=dict(profile.get("answer_aliases") or {}),
+            finish_reason=finish_reason,
+        )
 
     if scorer == "dataset_gsm8k":
         expected_value = (item or {}).get("expected_number")
@@ -7479,6 +8016,10 @@ def score_completion_profile(
             "parsed_answer": parsed,
         }
 
+    if regex and source != "output" and not visible_text.strip():
+        # Generic regex scoring: an empty visible answer is never a pass, and an
+        # incomplete stream is reported as such instead of a silent FAIL.
+        return _no_answer_result(finish_reason, detail="no visible answer")
     correct = score_completion_text(
         final_answer=final_answer,
         content_text=content_text,
@@ -7527,6 +8068,15 @@ def decode_builtin_test_profile_prompt(profile_name: str) -> tuple[str, str, dic
                     raise ValueError(f"Built-in test profile '{profile_name}' has no embedded prompt or CSV blob")
                 csv_data = zlib.decompress(base64.b64decode(csv_blob)).decode(encoding)
                 prompt = template.format(csv_data=csv_data).rstrip("\n")
+            tail_replace = profile.get("prompt_tail_replace") or {}
+            if tail_replace:
+                old_tail = str(tail_replace.get("old") or "")
+                new_tail = str(tail_replace.get("new") or "")
+                if not old_tail or not prompt.endswith(old_tail):
+                    raise ValueError(
+                        "prompt_tail_replace.old does not match the end of the embedded prompt"
+                    )
+                prompt = prompt[: len(prompt) - len(old_tail)] + new_tail
         prompt_prefix = str(profile.get("prompt_prefix") or "").strip()
         prompt_suffix = str(profile.get("prompt_suffix") or "").strip()
         if prompt_prefix:
@@ -8863,10 +9413,14 @@ async def stream_completion_stats_request(
     profile_config: Optional[dict] = None,
     progress_callback=None,
     item: Optional[dict] = None,
+    stall_timeout: Optional[float] = None,
+    request_timeout: Optional[float] = None,
 ) -> CompletionStatsRun:
     item_id = str((item or {}).get("item_id") or "")
     item_category = str((item or {}).get("category") or "")
     item_expected = str((item or {}).get("expected_answer") or "")
+    stall_timeout = float(stall_timeout) if stall_timeout and stall_timeout > 0 else None
+    request_timeout = float(request_timeout) if request_timeout and request_timeout > 0 else None
     req_start = time.monotonic()
     first_token = None
     second_token = None
@@ -8904,11 +9458,14 @@ async def stream_completion_stats_request(
 
     try:
         await emit_progress("connecting", force=True)
+        # The read timeout doubles as a stall watchdog: httpx raises ReadTimeout
+        # when no bytes arrive for that long, which is exactly "the stream stopped
+        # producing tokens". None keeps the historical unlimited behaviour.
         async with client.stream(
             "POST",
             url,
             json=payload,
-            timeout=httpx.Timeout(None, connect=30.0),
+            timeout=httpx.Timeout(connect=30.0, read=stall_timeout, write=30.0, pool=None),
         ) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
@@ -8925,52 +9482,63 @@ async def stream_completion_stats_request(
                 )
 
             await emit_progress("waiting TTFT", force=True)
-            async for line in resp.aiter_lines():
-                if _quit_event.is_set():
-                    cancelled = True
-                    finish_reason = "client_cancelled"
-                    break
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+            try:
+                async for line in resp.aiter_lines():
+                    if _quit_event.is_set():
+                        cancelled = True
+                        finish_reason = "client_cancelled"
+                        break
+                    if request_timeout is not None and time.monotonic() - req_start > request_timeout:
+                        # Wall-clock watchdog: a model looping on tokens never
+                        # stalls, so the stall timeout alone cannot stop it.
+                        finish_reason = "timeout"
+                        await emit_progress("timeout", force=True)
+                        break
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-                if data.get("usage"):
-                    usage = data["usage"]
+                    if data.get("usage"):
+                        usage = data["usage"]
 
-                choices = data.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                if choice.get("finish_reason") is not None:
-                    finish_reason = str(choice.get("finish_reason") or "")
-                delta = choice.get("delta", {})
-                reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
-                content = delta.get("content") or ""
-                text = reasoning + content
-                if not text:
-                    continue
-                now = time.monotonic()
-                if first_token is None:
-                    first_token = now
-                    await emit_progress("first token", force=True)
-                elif second_token is None:
-                    second_token = now
-                last_token = now
-                chunks += 1
-                live_chars += len(text)
-                live_tokens_est = max(chunks, int(live_chars / CHARS_PER_TOKEN))
-                output_buffer.append(text)
-                if reasoning:
-                    reasoning_buffer.append(reasoning)
-                if content:
-                    content_buffer.append(content)
-                await emit_progress("streaming")
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    if choice.get("finish_reason") is not None:
+                        finish_reason = str(choice.get("finish_reason") or "")
+                    delta = choice.get("delta", {})
+                    reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                    content = delta.get("content") or ""
+                    text = reasoning + content
+                    if not text:
+                        continue
+                    now = time.monotonic()
+                    if first_token is None:
+                        first_token = now
+                        await emit_progress("first token", force=True)
+                    elif second_token is None:
+                        second_token = now
+                    last_token = now
+                    chunks += 1
+                    live_chars += len(text)
+                    live_tokens_est = max(chunks, int(live_chars / CHARS_PER_TOKEN))
+                    output_buffer.append(text)
+                    if reasoning:
+                        reasoning_buffer.append(reasoning)
+                    if content:
+                        content_buffer.append(content)
+                    await emit_progress("streaming")
+            except httpx.ReadTimeout:
+                # Keep whatever arrived; the scorer labels the run "stalled".
+                finish_reason = "stalled"
+                await emit_progress("stalled", force=True)
     except Exception as exc:
         await emit_progress("error", force=True)
         return CompletionStatsRun(
@@ -8988,8 +9556,13 @@ async def stream_completion_stats_request(
     output_text = "".join(output_buffer)
     content_text = "".join(content_buffer)
     reasoning_text = "".join(reasoning_buffer)
-    answer_text = content_text or output_text
-    final_answer = extract_final_answer(answer_text)
+    # Score only the visible answer. Servers that stream <think> blocks inside
+    # content get them split off here; an unclosed <think> means the model was
+    # still reasoning, so its text is moved to reasoning and nothing is visible.
+    visible_text, unclosed_think = split_visible_answer_text(content_text)
+    if unclosed_think and not reasoning_text:
+        reasoning_text = content_text
+    final_answer = extract_answer_line(visible_text)
     completion_tokens = int(usage.get("completion_tokens") or 0)
     estimated_tokens = False
     if completion_tokens <= 0 and chunks > 0:
@@ -9005,14 +9578,14 @@ async def stream_completion_stats_request(
     score = score_completion_profile(
         profile=profile_config,
         final_answer=final_answer,
-        content_text=content_text,
+        content_text=visible_text,
         output_text=output_text,
         regex=correct_regex,
         source=score_source,
         item=item,
         finish_reason=finish_reason,
     )
-    excerpt_source = output_text if save_text else final_answer
+    excerpt_source = output_text if save_text else (final_answer or extract_final_answer(visible_text))
     excerpt = (excerpt_source or "").replace("\n", " ")[:240]
     await emit_progress("done" if not cancelled else "cancelled", force=True)
     return CompletionStatsRun(
@@ -9037,7 +9610,10 @@ async def stream_completion_stats_request(
         output_text=output_text if save_text else "",
         reasoning_text=reasoning_text if save_text else "",
         content_text=content_text if save_text else "",
-        error="",
+        error=(
+            f"{finish_reason} before the first token"
+            if finish_reason in ("stalled", "timeout") and not (first_token or output_text) else ""
+        ),
         correct=score.get("correct"),
         hit_max_tokens=finish_reason == "length",
         estimated_tokens=estimated_tokens,
@@ -9051,6 +9627,19 @@ async def stream_completion_stats_request(
 # ---------------------------------------------------------------------------
 # Run one cell
 # ---------------------------------------------------------------------------
+
+FORCED_TOKEN_LOGIT_BIAS = 100
+
+
+def _apply_fixed_token_route(payload: dict, forced_token_id: Optional[int]) -> None:
+    """Constrain a decode request to a repeatable token route for performance diagnosis."""
+    if forced_token_id is None:
+        return
+    payload["temperature"] = 0.0
+    payload["logit_bias"] = {
+        str(forced_token_id): FORCED_TOKEN_LOGIT_BIAS,
+    }
+
 
 async def run_one_cell(
     client: httpx.AsyncClient,
@@ -9070,6 +9659,7 @@ async def run_one_cell(
     warmup_request_count: int = 0,
     cell_warmup_timeout_seconds: Optional[float] = None,
     temperature: Optional[float] = None,
+    forced_token_id: Optional[int] = None,
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     stream_options = {"include_usage": True}
@@ -9092,6 +9682,7 @@ async def run_one_cell(
         payload["ignore_eos"] = True
     if temperature is not None:
         payload["temperature"] = temperature
+    _apply_fixed_token_route(payload, forced_token_id)
 
     url = f"{base_url}/v1/chat/completions"
     cancel_event = asyncio.Event()
@@ -9145,6 +9736,7 @@ async def run_one_cell(
         }
         if ignore_eos:
             scout_payload["ignore_eos"] = True
+        _apply_fixed_token_route(scout_payload, forced_token_id)
         should_record_prefill = (
             context_tokens in state.prefill_contexts
             and context_tokens not in state.prefill_results
@@ -10830,6 +11422,7 @@ def summarize_completion_stats_runs(runs: list[CompletionStatsRun]) -> dict:
     def stats(values):
         return summarize_numbers([float(v) for v in values])
 
+    incomplete = [r for r in ok if r.score_label in INCOMPLETE_SCORE_LABELS]
     return {
         "attempted": len(runs),
         "completed": len(ok),
@@ -10841,7 +11434,24 @@ def summarize_completion_stats_runs(runs: list[CompletionStatsRun]) -> dict:
         "near": int(score_counts.get("near", 0)),
         "fail": int(score_counts.get("fail", 0)),
         "truncated": int(score_counts.get("truncated", 0)),
+        "stalled": int(score_counts.get("stalled", 0)),
+        "timeout": int(score_counts.get("timeout", 0)),
+        "decoy": int(score_counts.get("decoy", 0)),
+        "not_stated": int(score_counts.get("not_stated", 0)),
+        "ambiguous": int(score_counts.get("ambiguous", 0)),
+        "unparseable": len([
+            r for r in ok
+            if r.correct is False and str(r.score_detail or "").startswith("unparseable")
+        ]),
+        "incomplete": len(incomplete),
         "correct_rate": (len(correct) / len(correct_known)) if correct_known else 0.0,
+        # Pass-rate over runs that actually finished (excludes truncated/stalled/
+        # timeout). Reported next to correct_rate so a budget artifact is visible
+        # as such instead of silently dragging the headline number down.
+        "correct_rate_completed": (
+            len(correct) / (len(correct_known) - len(incomplete))
+            if len(correct_known) - len(incomplete) > 0 else 0.0
+        ),
         "score_available": bool(correct_known or score_counts),
         "hit_max_tokens": len([r for r in ok if r.hit_max_tokens]),
         "estimated_token_runs": len([r for r in ok if r.estimated_tokens]),
@@ -10856,36 +11466,59 @@ def summarize_completion_stats_runs(runs: list[CompletionStatsRun]) -> dict:
     }
 
 
+# Score labels, their display names and which quality-bar bucket they fall in.
+# "wrong" labels are genuine model failures; "incomplete" labels are runtime /
+# budget artifacts (still not correct, but reported separately).
+SCORE_LABEL_DISPLAY = {
+    "exact": "EXACT",
+    "pass": "PASS",
+    "near": "NEAR",
+    "fail": "FAIL",
+    "decoy": "DECOY",
+    "not_stated": "NOT_STATED",
+    "ambiguous": "AMBIG",
+    "truncated": "TRUNC",
+    "stalled": "STALL",
+    "timeout": "TIMEOUT",
+    "cancelled": "CANCEL",
+}
+SCORE_LABEL_ORDER = (
+    "exact", "pass", "near", "fail", "decoy", "not_stated", "ambiguous",
+    "truncated", "stalled", "timeout", "cancelled",
+)
+INCOMPLETE_SCORE_LABELS = ("truncated", "stalled", "timeout")
+CORRECT_SCORE_LABELS = ("exact", "pass")
+WRONG_SCORE_LABELS = ("fail", "decoy", "not_stated", "ambiguous")
+
+
 def format_completion_score_summary(summary: dict) -> str:
     counts = summary.get("score_counts") or {}
-    trunc = int(counts.get("truncated", 0) or 0)
-    trunc_suffix = f" / TRUNC {trunc}" if trunc else ""
-    if counts.get("exact") is not None and any(k in counts for k in ("exact", "near", "fail")):
-        return (
-            f"EXACT {counts.get('exact', 0)} / NEAR {counts.get('near', 0)} / "
-            f"FAIL {counts.get('fail', 0)}{trunc_suffix}"
+    if not counts:
+        if summary.get("score_available"):
+            return f"{summary['correct']}/{summary['completed']}"
+        return "-"
+    parts = []
+    for label in SCORE_LABEL_ORDER:
+        value = int(counts.get(label, 0) or 0)
+        # Always show the primary correct/wrong buckets the profile uses so a
+        # clean run still reads "PASS 30 / FAIL 0"; show the rest only when hit.
+        primary = label in ("fail",) or (label in CORRECT_SCORE_LABELS and label in counts) or (
+            label == "near" and "near" in counts
         )
-    if any(k in counts for k in ("pass", "fail")):
-        return f"PASS {counts.get('pass', 0)} / FAIL {counts.get('fail', 0)}{trunc_suffix}"
-    if trunc and summary.get("score_available"):
-        return f"{summary['correct']}/{summary['completed']}{trunc_suffix}"
-    if summary.get("score_available"):
-        return f"{summary['correct']}/{summary['completed']}"
-    return "-"
+        if value or primary:
+            parts.append(f"{SCORE_LABEL_DISPLAY[label]} {value}")
+    for label, value in counts.items():
+        if label not in SCORE_LABEL_DISPLAY and value:
+            parts.append(f"{str(label).upper()} {value}")
+    return " / ".join(parts) if parts else "-"
 
 
 def completion_star_bar(summary: dict, width: int = 10) -> str:
     counts = summary.get("score_counts") or {}
-    if "pass" in counts and not any(k in counts for k in ("exact", "near")):
-        exact = int(counts.get("pass", 0) or 0)
-        near = 0
-        fail = int(counts.get("fail", 0) or 0)
-        truncated = 0
-    else:
-        exact = int(summary.get("exact", counts.get("exact", 0)) or 0)
-        near = int(summary.get("near", counts.get("near", 0)) or 0)
-        fail = int(summary.get("fail", counts.get("fail", 0)) or 0)
-        truncated = int(summary.get("truncated", counts.get("truncated", 0)) or 0)
+    exact = sum(int(counts.get(label, 0) or 0) for label in CORRECT_SCORE_LABELS)
+    near = int(counts.get("near", 0) or 0)
+    fail = sum(int(counts.get(label, 0) or 0) for label in WRONG_SCORE_LABELS)
+    truncated = sum(int(counts.get(label, 0) or 0) for label in INCOMPLETE_SCORE_LABELS)
     scored = exact + near + fail + truncated
     if scored <= 0:
         return "✕" * width
@@ -10913,16 +11546,8 @@ def format_completion_run_score(run: CompletionStatsRun) -> str:
     if not run.ok:
         return "ERR"
     label = (run.score_label or "").lower()
-    if label == "exact":
-        return "EXACT"
-    if label == "near":
-        return "NEAR"
-    if label == "fail":
-        return "FAIL"
-    if label == "truncated":
-        return "TRUNC"
-    if label == "pass":
-        return "PASS"
+    if label in SCORE_LABEL_DISPLAY:
+        return SCORE_LABEL_DISPLAY[label]
     if run.correct is True:
         return "PASS"
     if run.correct is False:
@@ -11261,6 +11886,11 @@ async def run_completion_stats_batch(
                 run_payload = dict(payload)
                 if run_item is not None and run_item.get("messages"):
                     run_payload["messages"] = run_item["messages"]
+                seed_base = getattr(args, "completion_stats_seed", None)
+                if seed_base is not None:
+                    # One deterministic seed per run index: identical across
+                    # engines/quants, different across the N resamples.
+                    run_payload["seed"] = int(seed_base) + int(run_index)
                 run = await stream_completion_stats_request(
                     client=client,
                     url=url,
@@ -11274,6 +11904,8 @@ async def run_completion_stats_batch(
                     profile_config=getattr(args, "completion_stats_profile_config", {}) or {},
                     progress_callback=progress_callback,
                     item=run_item,
+                    stall_timeout=getattr(args, "completion_stats_stall_timeout", None),
+                    request_timeout=getattr(args, "completion_stats_request_timeout", None),
                 )
             except asyncio.CancelledError:
                 async with lock:
@@ -11459,6 +12091,12 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
         "A compact reasoning profile with a known numeric answer. It checks whether "
         "the model handles repeated toggles plus the cat reset rule and returns 48. "
     ) if scorer == "numeric_exact" else (
+        "[bold]Estonia Long-Context Chain Test[/bold]\n"
+        "The same 700k-character packet is resampled N times. The model must follow a "
+        "six-hop cross-reference chain past planted decoys and name the vendor's country. "
+        "Wrong answers split into DECOY (took the planted country), NOT_STATED (gave up) "
+        "and FAIL; incomplete streams are reported separately. "
+    ) if scorer == "country_exact" else (
         "[bold]Completion Token Statistics[/bold]\n"
         "One optional prefix-cache scout request is used to populate prefill first. "
     )
@@ -11559,14 +12197,51 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
             )
         if accuracy.get("unparseable"):
             selected_table.add_row("unparseable (format)", str(accuracy["unparseable"]))
+    if selected.get("score_available") and not accuracy:
+        counts = selected.get("score_counts") or {}
+        scored = sum(int(v or 0) for k, v in counts.items() if k != "cancelled")
+        incomplete = int(selected.get("incomplete", 0) or 0)
+        if scored:
+            selected_table.add_row(
+                "pass rate",
+                f"{selected['correct_rate'] * 100:.1f}% ({selected['correct']}/{scored})",
+            )
+        if incomplete:
+            finished = scored - incomplete
+            finished_text = (
+                f"{selected['correct_rate_completed'] * 100:.1f}% ({selected['correct']}/{finished})"
+                if finished > 0 else "n/a (no run finished)"
+            )
+            selected_table.add_row(
+                "[yellow]pass rate, finished runs only[/yellow]",
+                f"[yellow]{finished_text}; {incomplete} incomplete "
+                f"(truncated/stalled/timeout) excluded[/yellow]",
+            )
+        for label in ("decoy", "not_stated", "ambiguous"):
+            if counts.get(label):
+                selected_table.add_row(
+                    SCORE_LABEL_DISPLAY[label].lower().replace("_", " "),
+                    str(counts[label]),
+                )
+        if selected.get("unparseable"):
+            selected_table.add_row("unparseable (format)", str(selected["unparseable"]))
     hit_max = selected["hit_max_tokens"]
-    trunc_no_answer = int(accuracy.get("truncated_no_answer", 0) or 0) if accuracy else 0
+    trunc_no_answer = (
+        int(accuracy.get("truncated_no_answer", 0) or 0) if accuracy
+        else int(selected.get("truncated", 0) or 0)
+    )
     hit_max_detail = (
         f"{hit_max}  ({trunc_no_answer} produced no answer, "
         f"{hit_max - trunc_no_answer} answered before the cap)"
         if trunc_no_answer else str(hit_max)
     )
     selected_table.add_row("hit max_tokens", hit_max_detail)
+    if selected.get("stalled") or selected.get("timeout"):
+        selected_table.add_row(
+            "[yellow]watchdog stops[/yellow]",
+            f"[yellow]{int(selected.get('stalled', 0) or 0)} stalled, "
+            f"{int(selected.get('timeout', 0) or 0)} wall-clock timeout[/yellow]",
+        )
     selected_table.add_row("completion tokens avg", f"{selected['completion_tokens']['avg']:,.0f}")
     selected_table.add_row("completion tokens p50", f"{selected['completion_tokens']['p50']:,.0f}")
     selected_table.add_row("completion tokens p90", f"{selected['completion_tokens']['p90']:,.0f}")
@@ -11624,10 +12299,17 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
             elif detail:
                 answer = f"({detail}) | {answer}"
             label = str(row.get("score_label") or "fail").lower()
-            score_cell = (
-                "[yellow]TRUNC[/yellow]" if label == "truncated"
-                else (row.get("score_label") or "fail").upper()
-            )
+            label_text = SCORE_LABEL_DISPLAY.get(label, label.upper())
+            if not row.get("ok", True):
+                score_cell = "[red]ERR[/red]"
+            elif label in INCOMPLETE_SCORE_LABELS:
+                score_cell = f"[yellow]{label_text}[/yellow]"
+            elif label == "ambiguous":
+                score_cell = f"[magenta]{label_text}[/magenta]"
+            elif label in ("decoy", "not_stated"):
+                score_cell = f"[cyan]{label_text}[/cyan]"
+            else:
+                score_cell = label_text
             cells = [str(row["run_index"])]
             if has_items:
                 cells.append(str(row.get("item_id") or "-"))
@@ -11649,9 +12331,27 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
         )
     elif str(metadata.get("profile_scorer") or "") == "numeric_exact":
         console.print(
-            "[dim]Interpretation: EXACT means the final parsed number matches the expected answer. "
-            "FAIL means the answer was unparseable or a different number. The 10-slot quality bar "
-            "is a rounded distribution: ★=EXACT, ✕=FAIL.[/dim]"
+            "[dim]Interpretation: EXACT means the number the visible answer asserts matches the "
+            "expected value. The scorer reads an explicit 'Final answer:' line, a line that is just "
+            "the number, or a number anchored at the end of the last line ('= 48', 'answer is 48'); "
+            "'Not 48', hedged statements and lines with several unanchored numbers are "
+            "unparseable (FAIL). Private reasoning is never scored. TRUNC/STALL/TIMEOUT (glyph ⊘) "
+            "mark runs that never produced a visible answer because of max_tokens, a token stall "
+            "or the wall-clock limit; they count as not-correct but are runtime artifacts, so the "
+            "report also shows the pass rate over finished runs. The 10-slot quality bar is a "
+            "rounded distribution: ★=EXACT, ✕=FAIL, ⊘=incomplete.[/dim]"
+        )
+    elif str(metadata.get("profile_scorer") or "") == "country_exact":
+        console.print(
+            "[dim]Interpretation: PASS means the country the visible answer asserts is the expected "
+            "one (an explicit 'Final answer:' line wins; otherwise the last line that names a "
+            "country). Countries mentioned only as a negated contrast ('not Latvia') or in a "
+            "parenthetical aside do not count. DECOY = the model committed to the planted wrong "
+            "country; NOT_STATED = the model said the packet does not contain the answer (gave up); "
+            "AMBIG = one conclusion line asserts two countries (scored wrong, review manually); "
+            "FAIL = another country or no country at all. TRUNC/STALL/TIMEOUT (⊘) never produced "
+            "a visible answer and are runtime artifacts, reported separately from wrong answers. "
+            "Private reasoning is never scored. Quality bar: ★=PASS, ✕=wrong, ⊘=incomplete.[/dim]"
         )
     elif str(metadata.get("profile_scorer") or "") in ("dataset_gsm8k", "dataset_mc_letter"):
         trunc = int((report.get("accuracy") or {}).get("truncated_no_answer", 0) or 0)
@@ -11753,6 +12453,16 @@ def build_paired_comparison(
         "dataset_match": (
             base_info["dataset_sha256"] == cand_info["dataset_sha256"]
             if (base_info["dataset_sha256"] or cand_info["dataset_sha256"]) else True
+        ),
+        "prompt_match": (
+            (baseline_report.get("metadata") or {}).get("prompt_sha256")
+            == (candidate_report.get("metadata") or {}).get("prompt_sha256")
+            if ((baseline_report.get("metadata") or {}).get("prompt_sha256")
+                or (candidate_report.get("metadata") or {}).get("prompt_sha256")) else True
+        ),
+        "scorer_match": (
+            (baseline_report.get("metadata") or {}).get("scorer_version", 1)
+            == (candidate_report.get("metadata") or {}).get("scorer_version", 1)
         ),
     }
     if not paired_ids:
@@ -11870,6 +12580,10 @@ def print_paired_comparison(comparison: dict, console: Console) -> None:
         header_bits.append("[yellow]warning: the two runs use different test profiles[/yellow]")
     if not comparison.get("dataset_match", True):
         header_bits.append("[yellow]warning: the two runs use different dataset pins[/yellow]")
+    if not comparison.get("prompt_match", True):
+        header_bits.append("[yellow]warning: the two runs use different prompt versions (prompt sha256 differs)[/yellow]")
+    if not comparison.get("scorer_match", True):
+        header_bits.append("[yellow]warning: the two runs were scored by different scorer versions[/yellow]")
     header_text = (
         f"Paired per-item comparison over {comparison['paired_items']} shared items.\n"
         f"baseline:  {base.get('model')} @ {base.get('server')} ({base.get('timestamp')})\n"
@@ -12313,7 +13027,7 @@ async def run_completion_stats_benchmark(args) -> dict:
                 "wilson95_high": wilson_high,
                 "unparseable": len([
                     r for r in scored_runs
-                    if r.correct is False and r.score_detail == "unparseable"
+                    if r.correct is False and str(r.score_detail or "").startswith("unparseable")
                 ]),
                 "truncated_no_answer": len([
                     r for r in scored_runs if r.score_label == "truncated"
@@ -12367,12 +13081,16 @@ async def run_completion_stats_benchmark(args) -> dict:
                 "correct_regex": args.completion_stats_correct_regex,
                 "score_source": args.completion_stats_score_source,
                 "profile_scorer": (profile or {}).get("scorer", "regex" if args.completion_stats_correct_regex else ""),
+                "scorer_version": SCORER_VERSION,
+                "profile_version": int((profile or {}).get("profile_version") or 1),
                 "expected_answer": (
                     f"{(profile or {}).get('expected_count')}, {(profile or {}).get('expected_hours'):g}"
                     if (profile or {}).get("scorer") == "ledger_lavd" else
                     str((profile or {}).get("expected_number"))
-                    if (profile or {}).get("expected_number") is not None else ""
+                    if (profile or {}).get("expected_number") is not None else
+                    str((profile or {}).get("expected_answer") or "")
                 ),
+                "decoy_answers": list((profile or {}).get("decoy_answers") or []),
                 "approx_tolerance": (profile or {}).get("approx_tolerance", ""),
                 "dataset_rows": (profile or {}).get("dataset_rows", ""),
                 "dataset_sha256": dataset_meta.get("sha256") or (profile or {}).get("dataset_sha256", ""),
@@ -12381,10 +13099,19 @@ async def run_completion_stats_benchmark(args) -> dict:
                 "dataset_source": dataset_meta.get("source", ""),
                 "dataset_items_total": len(dataset_items) if dataset_items else 0,
                 "dataset_items_selected": len(selected_items) if selected_items else 0,
-                "prompt_sha256": (profile or {}).get("prompt_sha256", ""),
+                # Hash of the prompt actually sent (dataset profiles: first item),
+                # so reports from different prompt versions are never confused.
+                "prompt_sha256": (
+                    hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt and not dataset_name
+                    else (profile or {}).get("prompt_sha256", "")
+                ),
+                "prompt_sha256_pinned": (profile or {}).get("prompt_sha256", ""),
                 "prefill_scout": not args.completion_stats_no_prefill_scout,
                 "temperature": args.completion_stats_temperature,
                 "top_p": args.completion_stats_top_p,
+                "seed_base": getattr(args, "completion_stats_seed", None),
+                "stall_timeout_s": getattr(args, "completion_stats_stall_timeout", None),
+                "request_timeout_s": getattr(args, "completion_stats_request_timeout", None),
                 "reasoning_effort": args.reasoning_effort,
                 "request_overrides": (profile or {}).get("request_overrides") or {},
                 "system_prompt": bool((profile or {}).get("system_prompt")),
@@ -12506,6 +13233,15 @@ async def run_benchmark(args):
 
     def remember_startup(message: str) -> None:
         startup_events.append(message)
+
+    if args.forced_token_id is not None:
+        route_message = (
+            f"Fixed-token diagnostic route: token_id={args.forced_token_id}, "
+            "logit_bias=100, temperature=0, ignore_eos=true. Reported throughput "
+            "isolates a repeatable decode route and is not natural model throughput."
+        )
+        console.print(f"[yellow]{route_message}[/yellow]")
+        remember_startup(route_message)
 
     startup_diagnostics = collect_startup_diagnostics(args, base_url)
     setattr(args, "startup_diagnostics", startup_diagnostics)
@@ -13783,6 +14519,7 @@ async def run_benchmark(args):
                         warmup_request_count=0,
                         cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                         temperature=args.temperature,
+                        forced_token_id=args.forced_token_id,
                     )
                 finally:
                     state.prefill_contexts = saved_prefill_contexts
@@ -13854,6 +14591,7 @@ async def run_benchmark(args):
                             warmup_request_count=args.warmup_request_count,
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                             temperature=args.temperature,
+                            forced_token_id=args.forced_token_id,
                         )
                         if result.aggregate_tps == -2:
                             state.results[(ctx, conc)] = -2
@@ -13932,6 +14670,7 @@ async def run_benchmark(args):
                             warmup_request_count=warmup_requests,
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                             temperature=args.temperature,
+                            forced_token_id=args.forced_token_id,
                         )
                         result.benchmark_mode = "burst-e2e"
                         if result.aggregate_tps == -2:
@@ -14704,6 +15443,31 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
         },
     }
 
+    forced_token_id = getattr(args, "forced_token_id", None)
+    if forced_token_id is not None:
+        output["metadata"].update({
+            "temperature": 0.0,
+            "forced_token_id": forced_token_id,
+            "forced_token_logit_bias": FORCED_TOKEN_LOGIT_BIAS,
+            "decode_route": "fixed_token_diagnostic",
+        })
+        output["methodology"]["fixed_token_route"] = {
+            "name": "Fixed-token decode route",
+            "status": "implemented",
+            "request_contract": (
+                "Every decode warmup, prefix-cache scout, and measured decode request "
+                "uses temperature=0, ignore_eos=true, and logit_bias=100 for one token ID."
+            ),
+            "purpose": (
+                "Hold the generated token route constant while comparing backend, kernel, "
+                "CUDA graph, and communication throughput."
+            ),
+            "limitation": (
+                "The result is a performance diagnostic. It does not measure natural model "
+                "quality, natural output throughput, or speculative-decoding acceptance."
+            ),
+        }
+
     with open(filepath, "w") as f:
         json.dump(output, f, indent=2)
 
@@ -14735,6 +15499,7 @@ def resume_config_signature(args) -> dict:
         "run_burst": getattr(args, "run_burst", False),
         "respect_eos": getattr(args, "respect_eos", False),
         "temperature": getattr(args, "temperature", None),
+        "forced_token_id": getattr(args, "forced_token_id", None),
         "max_total_tokens": args.max_total_tokens,
         "skip_prefill": getattr(args, "skip_prefill", False),
         "standalone_prefill": getattr(args, "standalone_prefill", False),
@@ -15208,6 +15973,29 @@ def parse_args():
         help="Optional top_p override for --completion-stats requests. Default leaves server/model default unchanged."
     )
     parser.add_argument(
+        "--completion-stats-seed", type=int, default=None,
+        help=(
+            "Base sampling seed for --completion-stats/profile requests. Run i is sent with "
+            "seed = base + i, so resamples differ from each other but are identical across "
+            "engines/quants. Default sends no seed (engine picks)."
+        ),
+    )
+    parser.add_argument(
+        "--completion-stats-stall-timeout", type=float, default=600.0,
+        help=(
+            "Stall watchdog for --completion-stats/profile streams: if no token arrives for this "
+            "many seconds the request is closed and scored STALL. 0 disables. (default: 600)"
+        ),
+    )
+    parser.add_argument(
+        "--completion-stats-request-timeout", type=float, default=0.0,
+        help=(
+            "Wall-clock watchdog per --completion-stats/profile request in seconds: a stream still "
+            "running after this long is closed and scored TIMEOUT. Catches models that loop "
+            "without ever stalling when max_tokens is omitted. 0 disables. (default: 0)"
+        ),
+    )
+    parser.add_argument(
         "--reasoning-effort",
         choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
         default=None,
@@ -15278,6 +16066,14 @@ def parse_args():
     parser.add_argument(
         "--temperature", type=float, default=None,
         help="Optional decode request temperature override. Use 0 for deterministic greedy decode. Default leaves the server/model default unchanged."
+    )
+    parser.add_argument(
+        "--forced-token-id", type=int, default=None,
+        help=(
+            "Force one token during the sustained and burst decode matrices by sending "
+            "logit_bias=100, temperature=0, and ignore_eos=true. This produces a "
+            "repeatable fixed-route performance diagnostic, not natural model throughput."
+        ),
     )
     parser.add_argument(
         "--accept-len-ref", type=float, default=0.0,
@@ -15549,6 +16345,15 @@ def parse_args():
              "Useful for prefill/PCIe communication sweeps. Implies --standalone-prefill."
     )
     args = parser.parse_args()
+    if args.forced_token_id is not None:
+        if args.forced_token_id < 0:
+            parser.error("--forced-token-id must be >= 0")
+        if args.temperature is not None and args.temperature != 0:
+            parser.error("--forced-token-id requires --temperature 0 when --temperature is set")
+        if args.respect_eos:
+            parser.error("--forced-token-id cannot be combined with --respect-eos")
+        if args.prefill_only:
+            parser.error("--forced-token-id cannot be combined with --prefill-only")
     if args.prefill_only:
         if args.skip_prefill:
             parser.error("--prefill-only cannot be combined with --skip-prefill")
@@ -15613,6 +16418,8 @@ def parse_args():
     if args.test_profile:
         args.test_profile = normalize_builtin_test_profile_name(args.test_profile)
         args.completion_stats = True
+    if args.forced_token_id is not None and args.completion_stats:
+        parser.error("--forced-token-id applies only to decode matrices, not --completion-stats")
     if args.completion_stats and not args.test_profile and not args.prompt and not args.prompt_file:
         args.test_profile = "estonia"
     if args.test_profile:
@@ -15629,6 +16436,10 @@ def parse_args():
             default_temperature = profile.get("default_temperature")
             if default_temperature is not None:
                 args.completion_stats_temperature = float(default_temperature)
+        if not cli_option_present("--completion-stats-top-p"):
+            default_top_p = profile.get("default_top_p")
+            if default_top_p is not None:
+                args.completion_stats_top_p = float(default_top_p)
         default_concurrency = int(profile.get("default_concurrency") or 0)
         if (
             default_concurrency > 0
@@ -15806,6 +16617,7 @@ def main():
         config_title = (
             "LAVD Context Consistency Test" if args.test_profile == "lavd-test" else
             "Hotel Lights Reasoning Test" if args.test_profile == "hotel-lights" else
+            "Estonia Long-Context Chain Test" if profile_config.get("scorer") == "country_exact" else
             "GSM8K Accuracy Benchmark" if args.test_profile == "gsm8k" else
             "MMLU-Pro Accuracy Benchmark" if args.test_profile == "mmlu-pro" else
             "GPQA Diamond Accuracy Benchmark" if args.test_profile == "gpqa-diamond" else
@@ -15814,16 +16626,34 @@ def main():
         score_label = (
             "EXACT / NEAR / FAIL numeric pair"
             if profile_config.get("scorer") == "ledger_lavd" else
-            "EXACT / FAIL final number"
+            "EXACT / FAIL asserted final number (strict; reasoning never scored)"
             if profile_config.get("scorer") == "numeric_exact" else
+            f"PASS / DECOY / NOT_STATED / FAIL asserted country (expected {profile_config.get('expected_answer')})"
+            if profile_config.get("scorer") == "country_exact" else
             "per-item final number vs GSM8K reference"
             if profile_config.get("scorer") == "dataset_gsm8k" else
             "per-item option letter vs dataset reference"
             if profile_config.get("scorer") == "dataset_mc_letter" else
             (args.completion_stats_correct_regex or "disabled")
         )
+        sampling_bits = []
+        if args.completion_stats_temperature is not None:
+            sampling_bits.append(f"temperature {args.completion_stats_temperature:g}")
+        if args.completion_stats_top_p is not None:
+            sampling_bits.append(f"top_p {args.completion_stats_top_p:g}")
+        if getattr(args, "completion_stats_seed", None) is not None:
+            sampling_bits.append(f"seed {args.completion_stats_seed} + run index")
+        if args.reasoning_effort:
+            sampling_bits.append(f"reasoning_effort {args.reasoning_effort}")
+        watchdog_bits = []
+        stall_t = getattr(args, "completion_stats_stall_timeout", 0) or 0
+        wall_t = getattr(args, "completion_stats_request_timeout", 0) or 0
+        watchdog_bits.append(f"stall {stall_t:g}s" if stall_t > 0 else "stall off")
+        watchdog_bits.append(f"wall-clock {wall_t:g}s" if wall_t > 0 else "wall-clock off")
         compare_line = (
-            f"\nCompare baseline: {args.compare_baseline}" if args.compare_baseline else ""
+            f"\nSampling: {', '.join(sampling_bits) if sampling_bits else 'server/model defaults (unpinned)'}"
+            f" | Watchdog: {', '.join(watchdog_bits)}"
+            + (f"\nCompare baseline: {args.compare_baseline}" if args.compare_baseline else "")
         )
         console.print(Panel(
             f"[bold {PHOSPHOR}]{config_title}[/bold {PHOSPHOR}]\n"

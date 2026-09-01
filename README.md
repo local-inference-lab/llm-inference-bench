@@ -159,7 +159,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--burst-request-count` | `0` | Measured requests per Burst / E2E cell. `0` means `concurrency × --burst-requests-per-concurrency` |
 | `--burst-warmup-request-count` | `0` | Warmup requests per Burst / E2E cell. `0` means `concurrency` |
 | `--burst-requests-per-concurrency` | `5` | Auto Burst / E2E measured request multiplier |
-| `--test-profile` | | Built-in task profile. `estonia` embeds the GLM long-context prompt inside the script and implies `--completion-stats`. `gsm8k` and `mmlu-pro` are pinned multi-item accuracy benchmarks for quantization A/B tests |
+| `--test-profile` | | Built-in task profile. `estonia` embeds the GLM long-context prompt inside the script and implies `--completion-stats` (`estonia-v1` is the legacy question tail, `estonia-long` adds a high-reasoning-effort wrapper); `hotel-lights` is a compact numeric reasoning test. `gsm8k`, `mmlu-pro` and `gpqa-diamond` are pinned multi-item accuracy benchmarks for quantization A/B tests |
 | `--compare-baseline` | | Path to a previous dataset-profile results JSON; after the run, a paired per-item comparison (accuracy delta, flips, exact McNemar p, per-category deltas, token inflation) is printed and embedded in the output JSON |
 | `--compare-candidate` | | Standalone mode: compare `--compare-baseline` against this results JSON and exit without contacting a server |
 | `--profile-concurrency` | `0` | Fixed task-profile concurrency. `0` keeps adaptive probing |
@@ -167,8 +167,13 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--completion-stats` | `false` | Run adaptive completion-token statistics mode instead of the decode matrix |
 | `--completion-stats-min-results` | `30` | Minimum completed runs collected at the selected concurrency |
 | `--completion-stats-concurrency-levels` | `1,2,4,8,16,30` | Candidate concurrency levels for the adaptive probe |
-| `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness; empty disables scoring |
+| `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness for custom `--prompt`/`--prompt-file` runs; empty disables scoring. Built-in profiles use their own typed scorer instead |
 | `--completion-stats-save-text` | `false` | Store full streamed output/reasoning/content text in JSON instead of only final answer/excerpts |
+| `--completion-stats-temperature` | profile default | Sampling temperature for profile requests. `estonia*` and `hotel-lights` pin `0.6`; dataset profiles pin `0`; custom prompts leave the server default |
+| `--completion-stats-top-p` | profile default | Sampling top_p for profile requests. `estonia*` and `hotel-lights` pin `0.95` |
+| `--completion-stats-seed` | | Base sampling seed; run *i* is sent with `seed = base + i`, so resamples differ from each other but are identical across engines/quants |
+| `--completion-stats-stall-timeout` | `600` | Stall watchdog (seconds without a token) for profile streams; the run is closed and scored `STALL`. `0` disables |
+| `--completion-stats-request-timeout` | `0` | Per-request wall-clock limit (seconds) for profile streams; catches models that loop without stalling when `max_tokens` is omitted. Scored `TIMEOUT`. `0` disables |
 | `--reasoning-effort` | | Optional reasoning effort for completion-stats/test-profile requests: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Omitted by default |
 | `--hw-monitor-interval` | `2` | Live CPU/GPU hardware sampling interval in seconds |
 | `--hw-gpu-limit` | `8` | Maximum GPUs shown in the live hardware panel |
@@ -343,17 +348,73 @@ If `--profile-concurrency` is not set, the adaptive flow is:
 
 The final report prints per-concurrency probe rows and a selected-concurrency
 summary with completion-token avg/p50/p90/p99, elapsed time, TTFT, aggregate
-generation tok/s, max-token hits, and correctness rate when scoring is enabled.
-Correctness is scored by default from the final non-empty answer line using
-`--completion-stats-correct-regex`; this matches the GLM dense-MLA vs NSA
-methodology where mentioning the right country during reasoning is not enough.
+generation tok/s, max-token hits, and the pass rate when scoring is enabled.
+
+#### How answers are scored
+
+Only the model's **visible** answer is scored. Reasoning streamed in a separate
+`reasoning`/`reasoning_content` field, or inline `<think>…</think>` blocks
+inside `content`, is recorded for token statistics but never read for
+correctness: a truncated thinking trace that happens to mention the right value
+is not an answer. An explicit `Final answer:` / `Answer:` line wins; otherwise
+the last non-empty line is used (markdown emphasis, bullets and trailing
+punctuation are stripped).
+
+- `estonia`, `estonia-v1`, `estonia-long` use the `country_exact` scorer. It
+  extracts the country the answer *asserts*: negated mentions (`not Latvia`),
+  parenthetical asides next to an asserted country (`…in Estonia (not Latvia…)`)
+  and superseded values (`from Latvia to Estonia`) do not count. Labels:
+  `PASS`, `DECOY` (committed to the planted wrong country, Latvia),
+  `NOT_STATED` (the model says the packet does not contain the answer, i.e. it
+  gave up), `AMBIG` (one conclusion line asserts two countries; scored wrong
+  and flagged for manual review), `FAIL` (another country or no country).
+- `hotel-lights` uses a strict `numeric_exact`: a bare-number line, a number
+  anchored at the end of the line (`= 48`, `answer is 48`, `Final answer: 48`)
+  or a line whose only number is neither negated nor hedged. `Not 48`,
+  `47, not 48` and `48 rooms out of 100` are `unparseable` (FAIL with the
+  reason shown), not a pass or a "got 100".
+- Runs that never produced a visible answer are labelled by *why*: `TRUNC`
+  (hit `max_tokens`), `STALL` (no token within `--completion-stats-stall-timeout`)
+  or `TIMEOUT` (`--completion-stats-request-timeout`), glyph `⊘`. They count
+  as not-correct in the headline pass rate — the model did not deliver — but
+  they are runtime/budget artifacts, so the report also prints `pass rate,
+  finished runs only` and lists every label with a count
+  (`PASS 19 / FAIL 0 / DECOY 4 / NOT_STATED 5 / TRUNC 2`). A cancelled run
+  (`q`) is `CANCEL` and not scored.
+- `--prompt` / `--prompt-file` runs fall back to `--completion-stats-correct-regex`
+  on the extracted answer line.
+
+The `estonia` prompt is **v2** since 0.4.31: the 700k-character packet is
+byte-identical, only the question tail changed. It names the *vendor
+(manufacturer)* — the packet links a vendor account, it never uses the word
+"manufacturer" — and asks for exactly one `Final answer: <country>` line so the
+scorer can parse an asserted country. `estonia-v1` (alias `estonia-legacy`)
+keeps the old bare `Question:/Answer:` tail for comparison with older reports.
+Result metadata records `profile_version`, `scorer_version` and the sha256 of
+the prompt actually sent; `--compare-baseline` warns when they differ.
+
+#### Why 30 runs of the same prompt give different answers
+
+`estonia*` and `hotel-lights` are *resample consistency* tests: the same
+prompt is sent N times and the metric is the pass rate plus the completion
+tokens needed. Sampling is therefore stochastic on purpose, but pinned so runs
+are comparable across engines and quantizations: `temperature 0.6`,
+`top_p 0.95` (override with `--completion-stats-temperature` /
+`--completion-stats-top-p`). Add `--completion-stats-seed BASE` to send
+`seed = BASE + run_index`, which keeps the N samples distinct but reproducible.
+The estonia packet contains planted decoys (Mirel Industrial in Latvia,
+K-27B/V-447, AR-13, MX-86/N-2), so wrong answers are almost always the decoy
+country or "not stated" — that split is the signal the report shows.
 
 If `--max-tokens` is not explicitly provided in this mode, the tool defaults to
 the built-in profile default, currently `40000` for `estonia` and
-`estonia-long`. Override it for shorter tasks. `--prompt` and `--prompt-file`
-remain available for custom completion-token statistics, but the reproducible
-bundled task should use `--test-profile estonia` or `--test-profile
-estonia-long`.
+`estonia-long` and *no cap* for `hotel-lights` (the model decides when to
+stop). Uncapped runs are guarded by the stall watchdog (default 600 s without a
+token) and, optionally, a per-request wall-clock limit
+(`--completion-stats-request-timeout`) for models that loop without ever
+stalling. `--prompt` and `--prompt-file` remain available for custom
+completion-token statistics, but the reproducible bundled task should use
+`--test-profile estonia` or `--test-profile estonia-long`.
 
 If SGLang is running with DCP/CP and `/get_server_info` reports only the local KV
 budget, pass `--dcp-size N` or set `LLM_BENCH_DCP_SIZE=N`. For example, a local
@@ -429,7 +490,9 @@ the report shows the count explicitly (`truncated (no answer)` and a
 the cap) so a high number is an unambiguous signal to raise `--max-tokens`
 rather than a misleading "unparseable". Because a damaged quant tends to think
 longer, a rising TRUNCATED count between two runs is itself a degradation
-signal, and the paired comparison reports it per side.
+signal, and the paired comparison reports it per side. The same treatment
+applies to the watchdog stops `STALL` and `TIMEOUT` (see the completion-stats
+section above).
 
 ### Paired A/B Comparison
 
