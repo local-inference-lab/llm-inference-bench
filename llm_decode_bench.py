@@ -61,7 +61,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.33"
+VERSION = "0.4.34"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -9069,11 +9069,36 @@ def compute_spec_normalization(
 _accept_len_ref = 0.0  # --accept-len-ref; reference accept len for normalized tok/s
 
 
-def apply_spec_normalization(cell: CellResult, norm: dict, engine: str, gauge_accept_len: float) -> None:
+def sglang_step_rate_sample(
+    generation_tokens_per_second: float,
+    acceptance_length: float,
+) -> float:
+    """Convert one matched SGLang metric snapshot to verifier steps/s.
+
+    SGLang exports generation throughput and speculative acceptance length as
+    gauges for the same recent scheduler interval. Their quotient is a valid
+    per-interval verifier rate. A final acceptance-length gauge cannot normalize
+    an entire measurement because acceptance can change substantially as the
+    generated sequence evolves.
+    """
+    if generation_tokens_per_second <= 0 or acceptance_length <= 1.0:
+        return 0.0
+    return generation_tokens_per_second / acceptance_length
+
+
+def apply_spec_normalization(
+    cell: CellResult,
+    norm: dict,
+    engine: str,
+    gauge_accept_len: float,
+    sampled_steps_per_s: float = 0.0,
+) -> None:
     """Fill acceptance-normalized fields on a finished cell.
 
-    vLLM: exact window deltas. SGLang exports only lifetime-average gauges, so
-    fall back to steps/s derived from the accept-length gauge.
+    vLLM uses exact window deltas. SGLang exposes matched recent-interval
+    throughput and acceptance gauges, so its verifier rate is the median of
+    their per-snapshot quotients. The final gauge remains a last-resort fallback
+    when a measurement is too short to collect a matched snapshot.
     """
     if norm:
         cell.server_spec_drafts = norm["drafts"]
@@ -9085,6 +9110,10 @@ def apply_spec_normalization(cell: CellResult, norm: dict, engine: str, gauge_ac
         cell.server_accept_len_effective = norm["accept_len_effective"]
         cell.server_engine_steps = norm["engine_steps"]
         cell.server_steps_per_s = norm["steps_per_s"]
+    elif engine == ENGINE_SGLANG and sampled_steps_per_s > 0:
+        cell.server_steps_per_s = sampled_steps_per_s
+        cell.server_accept_len_effective = cell.aggregate_tps / sampled_steps_per_s
+        cell.server_engine_steps = sampled_steps_per_s * cell.measurement_seconds
     elif engine == ENGINE_SGLANG and gauge_accept_len > 1.0 and cell.aggregate_tps > 0:
         cell.server_accept_len_effective = gauge_accept_len
         cell.server_steps_per_s = cell.aggregate_tps / gauge_accept_len
@@ -10160,6 +10189,7 @@ async def run_one_cell(
         hw_measurement_start_idx = len(state.hw_history)
         add_event(state, f"measure start C={concurrency} ctx={format_context(context_tokens)} request-count={request_count}")
         gen_throughput_samples = []
+        sglang_step_rate_samples = []
         running_reqs_samples = []
         queue_reqs_samples = []
         last_metrics_time = 0.0
@@ -10248,6 +10278,13 @@ async def run_one_cell(
 
                 if state.srv_gen_throughput > 0:
                     gen_throughput_samples.append(state.srv_gen_throughput)
+                if engine == ENGINE_SGLANG:
+                    step_rate = sglang_step_rate_sample(
+                        state.srv_gen_throughput,
+                        state.srv_spec_accept_length,
+                    )
+                    if step_rate > 0:
+                        sglang_step_rate_samples.append(step_rate)
                 if state.metrics_available:
                     running_reqs_samples.append(state.srv_running_reqs)
                     queue_reqs_samples.append(state.srv_queue_reqs)
@@ -10422,7 +10459,13 @@ async def run_one_cell(
             capacity_limited=capacity_limited,
             hardware_summary=summarize_hardware_history(state.hw_history[hw_measurement_start_idx:]),
         )
-        apply_spec_normalization(cell, spec_norm, engine, state.srv_spec_accept_length)
+        apply_spec_normalization(
+            cell,
+            spec_norm,
+            engine,
+            state.srv_spec_accept_length,
+            median(sglang_step_rate_samples) if sglang_step_rate_samples else 0.0,
+        )
 
         state.cell_running = False
         state.results[(context_tokens, concurrency)] = cell.aggregate_tps
@@ -10475,6 +10518,7 @@ async def run_one_cell(
     )
     last_metrics_time = 0.0
     gen_throughput_samples = []
+    sglang_step_rate_samples = []
     # For vLLM: compute throughput rate from generation_tokens counter
     prev_gen_tokens = None
     prev_gen_time = None
@@ -10671,6 +10715,13 @@ async def run_one_cell(
                 update_state_request_stats(state, shared_request_samples)
                 if state.srv_gen_throughput > 0:
                     gen_throughput_samples.append(state.srv_gen_throughput)
+                if engine == ENGINE_SGLANG:
+                    step_rate = sglang_step_rate_sample(
+                        state.srv_gen_throughput,
+                        state.srv_spec_accept_length,
+                    )
+                    if step_rate > 0:
+                        sglang_step_rate_samples.append(step_rate)
                 if state.metrics_available:
                     running_reqs_samples.append(state.srv_running_reqs)
                     queue_reqs_samples.append(state.srv_queue_reqs)
@@ -10980,7 +11031,13 @@ async def run_one_cell(
         capacity_limited=capacity_limited,
         hardware_summary=summarize_hardware_history(state.hw_history[hw_measurement_start_idx:]),
     )
-    apply_spec_normalization(cell, spec_norm, engine, state.srv_spec_accept_length)
+    apply_spec_normalization(
+        cell,
+        spec_norm,
+        engine,
+        state.srv_spec_accept_length,
+        median(sglang_step_rate_samples) if sglang_step_rate_samples else 0.0,
+    )
 
     state.cell_running = False
     state.results[(context_tokens, concurrency)] = cell.aggregate_tps

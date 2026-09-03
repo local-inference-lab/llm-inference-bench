@@ -65,5 +65,37 @@ class SGLangAbortTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
 
 
+class SGLangSpecNormalizationTests(unittest.TestCase):
+    def test_matched_gauges_produce_verifier_rate(self):
+        self.assertAlmostEqual(
+            BENCH.sglang_step_rate_sample(286.0, 4.0),
+            71.5,
+        )
+
+    def test_invalid_or_non_speculative_gauges_are_ignored(self):
+        self.assertEqual(BENCH.sglang_step_rate_sample(0.0, 3.0), 0.0)
+        self.assertEqual(BENCH.sglang_step_rate_sample(200.0, 1.0), 0.0)
+
+    def test_sampled_rate_overrides_unmatched_final_gauge(self):
+        cell = BENCH.CellResult(
+            concurrency=1,
+            context_tokens=0,
+            aggregate_tps=270.0,
+            measurement_seconds=30.0,
+        )
+
+        BENCH.apply_spec_normalization(
+            cell,
+            {},
+            BENCH.ENGINE_SGLANG,
+            gauge_accept_len=2.0,
+            sampled_steps_per_s=72.0,
+        )
+
+        self.assertEqual(cell.server_steps_per_s, 72.0)
+        self.assertEqual(cell.server_accept_len_effective, 3.75)
+        self.assertEqual(cell.server_engine_steps, 2160.0)
+
+
 if __name__ == "__main__":
     unittest.main()

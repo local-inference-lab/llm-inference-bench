@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.34 - 2026-09-03
+
+### SGLang verifier rates use matched metric snapshots
+
+- SGLang speculative decode now derives verifier steps per second from each
+  matched generation-throughput and acceptance-length metric snapshot, then
+  reports the median interval rate.
+- The final acceptance-length gauge is no longer applied to the complete
+  measurement window. That gauge describes only a recent scheduler interval
+  and can otherwise make a stable verifier path appear to vary with the final
+  generated tokens.
+
 ## 0.4.33 - 2026-09-03
 
 ### Decode cells require scheduler isolation
