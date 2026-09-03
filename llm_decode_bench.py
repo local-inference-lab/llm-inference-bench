@@ -61,7 +61,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.32"
+VERSION = "0.4.33"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -9206,6 +9206,96 @@ class NullLive:
 # Streaming request
 # ---------------------------------------------------------------------------
 
+async def abort_sglang_request(
+    client: httpx.AsyncClient,
+    abort_url: str,
+    request_id: str,
+) -> bool:
+    """Abort one SGLang request before its OpenAI stream is closed.
+
+    SGLang exposes its scheduler request id as the OpenAI SSE ``id``. Closing
+    the HTTP stream alone can leave the scheduler generating until its
+    asynchronous disconnect handler runs. Targeted aborts prevent that work
+    from overlapping the following benchmark cell without affecting unrelated
+    requests on the same server.
+    """
+    if not abort_url or not request_id:
+        return False
+    try:
+        response = await client.post(
+            abort_url,
+            json={"rid": request_id},
+            timeout=httpx.Timeout(5.0, connect=5.0),
+        )
+        return response.status_code < 400
+    except (httpx.HTTPError, asyncio.TimeoutError):
+        # The strict idle barrier reports a persistent failure. An abort race
+        # with a request that just completed is harmless and needs no warning.
+        return False
+
+
+async def require_decode_server_idle(
+    client: httpx.AsyncClient,
+    base_url: str,
+    engine: str,
+    state: TUIState,
+    live: object,
+    boundary: str,
+    timeout_seconds: float = 300.0,
+) -> None:
+    """Require an empty scheduler at a decode measurement boundary.
+
+    Duration-based streams are deliberately cut off at the end of their timing
+    window. Some servers acknowledge the closed HTTP stream before removing
+    the request from the scheduler. Starting another cell in that interval
+    silently raises the effective concurrency. Metrics-capable local servers
+    therefore must report zero running and queued requests before measurement
+    continues.
+    """
+    if not state.metrics_available or engine not in (ENGINE_SGLANG, ENGINE_VLLM):
+        return
+
+    metrics = await scrape_metrics(client, base_url)
+    running_name = metric_name(engine, "running_reqs")
+    waiting_name = metric_name(engine, "queue_reqs")
+    if not has_metric(metrics, running_name) or not has_metric(metrics, waiting_name):
+        raise RuntimeError(
+            f"scheduler isolation metrics are unavailable {boundary}: "
+            f"expected {running_name} and {waiting_name}"
+        )
+    running = extract_metric(metrics, running_name)
+    waiting = extract_metric(metrics, waiting_name)
+    if running == 0 and waiting == 0:
+        return
+
+    add_event(
+        state,
+        f"waiting for scheduler drain {boundary}: running={int(running)} queue={int(waiting)}",
+    )
+    metrics = await wait_server_idle(
+        client,
+        base_url,
+        engine,
+        stable_seconds=0.5,
+        timeout_seconds=timeout_seconds,
+        state=state,
+        live=live,
+        status=f"waiting for scheduler drain {boundary}",
+    )
+    if not has_metric(metrics, running_name) or not has_metric(metrics, waiting_name):
+        raise RuntimeError(
+            f"scheduler isolation metrics disappeared {boundary}: "
+            f"expected {running_name} and {waiting_name}"
+        )
+    running = extract_metric(metrics, running_name)
+    waiting = extract_metric(metrics, waiting_name)
+    if running != 0 or waiting != 0:
+        raise RuntimeError(
+            f"scheduler did not drain {boundary} within {timeout_seconds:g}s: "
+            f"running={int(running)} queue={int(waiting)}"
+        )
+    add_event(state, f"scheduler drained {boundary}")
+
 async def stream_one_request(
     client: httpx.AsyncClient,
     url: str,
@@ -9221,6 +9311,7 @@ async def stream_one_request(
     shared_usage_token_count: list = None,
     shared_usage_last_time: list = None,
     shared_token_last_time: list = None,
+    abort_url: str = "",
 ) -> StreamResult:
     """Stream requests in a loop until cancel_event. When a request finishes
     (hits max_tokens or EOS), immediately start a new one to keep concurrency
@@ -9250,6 +9341,8 @@ async def stream_one_request(
         req_chunks = 0
         req_completed = False
         req_last_usage_tokens = 0
+        request_id = ""
+        abort_sent = False
         try:
             async with client.stream("POST", url, json=payload, timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
                 if resp.status_code != 200:
@@ -9259,6 +9352,17 @@ async def stream_one_request(
 
                 async for line in resp.aiter_lines():
                     if cancel_event.is_set():
+                        # SGLang removes the request from its tokenizer map as
+                        # soon as the HTTP stream closes. Its targeted abort
+                        # endpoint ignores ids no longer present in that map,
+                        # so the abort must be sent while the SSE stream still
+                        # owns the request.
+                        if request_id and abort_url:
+                            abort_sent = await abort_sglang_request(
+                                client,
+                                abort_url,
+                                request_id,
+                            )
                         break
 
                     if not line or not line.startswith("data: "):
@@ -9273,6 +9377,9 @@ async def stream_one_request(
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+
+                    if not request_id:
+                        request_id = str(data.get("id") or "")
 
                     # Check for usage in final chunk (stream_options.include_usage)
                     usage = data.get("usage")
@@ -9336,6 +9443,9 @@ async def stream_one_request(
         except Exception as e:
             result.error = f"{type(e).__name__}: {e}"
             break
+
+        if request_id and not req_completed and abort_url and not abort_sent:
+            await abort_sglang_request(client, abort_url, request_id)
 
         req_output_tokens = usage_tokens if usage_tokens is not None else req_chunks
         if req_first is not None and req_output_tokens > 0:
@@ -9683,7 +9793,22 @@ async def run_one_cell(
     shared_usage_last_time = [0.0]
     shared_token_last_time = [0.0]
 
-    # Fresh client per cell — avoids stale keepalive connections from previous cells
+    abort_url = f"{base_url}/abort_request" if engine == ENGINE_SGLANG else ""
+
+    await require_decode_server_idle(
+        client,
+        base_url,
+        engine,
+        state,
+        live,
+        boundary=(
+            f"before C={concurrency} ctx={format_context(context_tokens)}"
+        ),
+    )
+
+    # Fresh client per cell — avoids stale keepalive connections from previous cells.
+    # Create it only after the scheduler boundary succeeds so a failed boundary
+    # cannot leak an unused connection pool.
     cell_limits = httpx.Limits(
         max_connections=concurrency + 10,
         max_keepalive_connections=concurrency + 5,
@@ -9964,6 +10089,7 @@ async def run_one_cell(
                         batch_started,
                         batch_completed,
                         target_count,
+                        abort_url=abort_url,
                     )
                 )
                 for i in range(workers)
@@ -10064,6 +10190,7 @@ async def run_one_cell(
                     batch_started,
                     batch_completed,
                     request_count,
+                    abort_url=abort_url,
                 )
             )
             for i in range(workers)
@@ -10134,7 +10261,23 @@ async def run_one_cell(
             if _skip_event.is_set():
                 _skip_event.clear()
                 batch_cancel.set()
+                done, pending = await asyncio.wait(tasks, timeout=30.0)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=5.0)
                 await cell_client.aclose()
+                await require_decode_server_idle(
+                    client,
+                    base_url,
+                    engine,
+                    state,
+                    live,
+                    boundary=(
+                        f"after skipped C={concurrency} "
+                        f"ctx={format_context(context_tokens)}"
+                    ),
+                )
                 return CellResult(
                     concurrency=concurrency,
                     context_tokens=context_tokens,
@@ -10295,6 +10438,16 @@ async def run_one_cell(
             cell_done_msg += f" | norm {cell.server_steps_per_s:.1f} step/s len={cell.server_accept_len_effective:.2f}"
         add_event(state, cell_done_msg)
         await cell_client.aclose()
+        await require_decode_server_idle(
+            client,
+            base_url,
+            engine,
+            state,
+            live,
+            boundary=(
+                f"after C={concurrency} ctx={format_context(context_tokens)}"
+            ),
+        )
         return cell
 
     # Launch all streams on fresh client (no stale keepalive connections)
@@ -10305,7 +10458,8 @@ async def run_one_cell(
                                shared_request_samples,
                                shared_usage_token_count=shared_usage_token_count,
                                shared_usage_last_time=shared_usage_last_time,
-                               shared_token_last_time=shared_token_last_time)
+                               shared_token_last_time=shared_token_last_time,
+                               abort_url=abort_url)
         )
         for i in range(concurrency)
     ]
@@ -10577,6 +10731,23 @@ async def run_one_cell(
             _skip_event.clear()
             cancel_event.set()
             add_event(state, f"cell skipped C={concurrency} ctx={format_context(context_tokens)}")
+            done, pending = await asyncio.wait(tasks, timeout=30.0)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=5.0)
+            await cell_client.aclose()
+            await require_decode_server_idle(
+                client,
+                base_url,
+                engine,
+                state,
+                live,
+                boundary=(
+                    f"after skipped C={concurrency} "
+                    f"ctx={format_context(context_tokens)}"
+                ),
+            )
             return CellResult(
                 concurrency=concurrency,
                 context_tokens=context_tokens,
@@ -10826,6 +10997,14 @@ async def run_one_cell(
     add_event(state, cell_done_msg)
 
     await cell_client.aclose()
+    await require_decode_server_idle(
+        client,
+        base_url,
+        engine,
+        state,
+        live,
+        boundary=f"after C={concurrency} ctx={format_context(context_tokens)}",
+    )
     return cell
 
 

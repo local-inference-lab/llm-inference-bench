@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.33 - 2026-09-03
+
+### Decode cells require scheduler isolation
+
+- Duration-based SGLang measurements now send a targeted `/abort_request` for
+  the request id returned by the OpenAI stream when the timing window closes.
+  Closing an HTTP stream alone can leave SGLang generating briefly after the
+  client has discarded the request.
+- Every decode cell now starts and finishes with a metrics-backed scheduler
+  drain barrier. A server that does not reach zero running and queued requests
+  fails the cell instead of silently measuring a higher effective concurrency.
+- The abort is request-specific; the benchmark never uses SGLang's
+  `abort_all` operation and therefore does not cancel unrelated traffic.
+
 ## 0.4.32 - 2026-09-01
 
 ### Consistency profiles no longer pin sampling
