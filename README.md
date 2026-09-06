@@ -149,6 +149,8 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--max-tokens` | `2048` | Max tokens to generate per request |
 | `--duration` | `30` | Duration per decode test cell (seconds) |
 | `--decode-warmup-seconds` | `3` | Hidden pre-measurement warmup at `C=1` using the largest requested context that fits current model/KV limits. Set `0` to disable |
+| `--loop-detection` / `--no-loop-detection` | enabled | Check each decode response for sustained exact repetition, including warmup. Confirmed loops invalidate the cell instead of reporting throughput |
+| `--display-mode` | `screen` | `screen` uses an alternate-screen dashboard; `live` uses inline updates; `plain` disables the dashboard. Press `o` for an output preview in `screen`/`live` mode |
 | `--prefill-contexts` | `8k,64k,128k` | Extra scout prefill contexts in default mode; standalone profile contexts with `--standalone-prefill` |
 | `--prefill-metric` | `client` | Prefill headline source: `client`, `auto`, or `prometheus`. `auto` adds Prometheus validation when available |
 | `--standalone-prefill` | `false` | Run the old repeated cold-prefill profile before decode |
@@ -249,6 +251,75 @@ validation fields are unavailable.
 Use this section as the main tuning/regression signal for kernels, NCCL, DCP,
 MTP, scheduler, and KV-cache changes. It answers: "How much decode throughput
 can the engine sustain once it is already running this concurrency?"
+
+### Decode loop detection
+
+Status: implemented. Sustained Decode and Burst / E2E Decode check each
+request's reasoning and content separately, including warmup requests. State
+does not cross request or channel boundaries. The guard is enabled by default;
+`--no-loop-detection` disables it for deliberately repetitive workloads such
+as a forced-token kernel diagnostic. Sampling parameters are unchanged.
+
+A confirmed structural loop contains at least **four identical cycles spanning
+4096 Unicode characters**. Shorter evidence (three cycles spanning at least
+1024 characters) is retained as `suspected` and does not invalidate throughput.
+Whitespace-only repetition is ignored. Checks run every 256 characters and at
+stream completion, independent of SSE chunk boundaries, over at most 131072
+characters per request/channel. The bounded search considers up to 64 matching
+suffix anchors and periods up to 32768 characters.
+
+When any worker confirms a loop, all requests belonging to that benchmark cell
+stop. Its throughput tables display `ERROR: loop` (stacked `ERROR` / `loop` in
+compact dashboard columns), not the speed of the repeated output. Cancellation
+uses the existing targeted SGLang abort and, when metrics are available,
+scheduler-drain checks; it does not send a server-wide abort. A drain timeout is retained
+in the invalid cell's `timeout_reason`; each following cell must still pass its
+own pre-request idle barrier. The JSON cell retains `loop_detected`,
+`loop_detection_enabled`, and bounded `loop_diagnostics`: channel, request ID,
+stream index, Unicode offsets, cycle length, cycle hash, and text excerpts.
+Invalid cells use the `aggregate_tps=-3` sentinel and `null` in the summary
+throughput matrix. They are excluded from throughput statistics. Pre-decode
+warmup evidence is stored in `metadata.decode_warmup_loop_diagnostics`.
+The detection setting is part of resume compatibility.
+
+This is an exact-text heuristic, **not a semantic quality evaluator**. It can
+miss paraphrased loops, periods outside the search limit, or repetition that
+does not reach the threshold before the request stops. Intentional verbatim
+repetition can trigger it. A result without a detected loop is not proof of a
+correct or coherent answer. Completion-statistics, task-profile, coding-peak,
+and standalone prefill modes do not use this decode-cell guard.
+
+### Live decode output preview
+
+Status: implemented. In an interactive terminal using `--display-mode screen`
+(the default) or `--display-mode live`, press `o` to open or close a model-output
+panel. It reads the benchmark's existing SSE stream; it creates no additional
+inference requests and does not change sampling.
+
+| Key | Action |
+|---|---|
+| `o` | Show or hide the panel |
+| Space | Freeze the displayed snapshot, or resume live scrolling |
+| PageUp / PageDown | Pause and page through the snapshot |
+| Home | Go to the beginning of retained history |
+| End | Return to the live output tail |
+| `[` / `]` | Select the preceding/following worker; collect its output from that point |
+| `s` / `q` | Skip the benchmark cell / finish the benchmark, unchanged |
+
+Only one selected worker is displayed, labeled with the concurrency, context,
+worker number, request ID, and reasoning/content boundaries. Answers from
+different workers are not interleaved. The panel retains up to 65536 Unicode
+characters of that worker's output, including while hidden. Selecting another
+worker clears live history. A paused snapshot stays readable while the HTTP
+reader continues collecting output; pressing End returns to that buffer.
+Pausing never pauses generation or benchmark timing, and loop detection still
+checks every worker. Model text is rendered literally, without terminal control
+characters or interpreted Rich markup.
+
+The panel is available in the sustained and request-count decode dashboards,
+not `--display-mode plain` or completion-statistics/task-profile dashboards.
+On short terminals, opening it reduces the space used by hardware and event
+panels. Close it with `o` to restore the dashboard layout.
 
 ### Burst / E2E Decode
 

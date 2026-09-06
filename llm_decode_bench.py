@@ -25,6 +25,7 @@ import io
 import json
 import math
 import os
+import queue
 import random
 import re
 import select
@@ -39,6 +40,7 @@ import time
 import tty
 import zipfile
 import zlib
+from collections import deque
 from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from datetime import datetime
 from pathlib import Path
@@ -61,7 +63,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.34"
+VERSION = "0.6.0"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -4611,6 +4613,10 @@ class CellResult:
     timeout_reason: str = ""
     capacity_limited: bool = False
     hardware_summary: dict = field(default_factory=dict)
+    loop_detection_enabled: bool = False
+    loop_detected: bool = False
+    loop_diagnostics: list = field(default_factory=list)
+    loop_diagnostics_omitted: int = 0
 
 
 @dataclass
@@ -4668,6 +4674,154 @@ class GpuStats:
 class CpuTemp:
     label: str = ""
     temp_c: float = 0.0
+
+
+class OutputViewer:
+    """Bounded, read-only preview of one decode worker's response stream.
+
+    Pausing freezes a snapshot, not the HTTP reader or the model. Keyboard
+    commands and response fragments are applied on the asyncio/UI thread.
+    Unselected workers are not retained; selecting a worker starts its preview
+    at the next received fragment. Loop detection still checks every worker.
+    """
+
+    MAX_CHARS = 65536
+
+    def __init__(self):
+        self.visible = False
+        self.selected = 0
+        self.workers = 1
+        self.cell_label = "waiting for decode"
+        self.phase = ""
+        self.parts = deque()
+        self.chars = 0
+        self.dropped = 0
+        self.identity = None
+        self.channel = ""
+        self.snapshot = None
+        self.snapshot_label = ""
+        self.scroll_end = None
+        self.page_rows = 6
+        self._wrapped = None
+        self._wrapped_width = 0
+        self._pending_pages = deque(maxlen=64)
+
+    def start_cell(self, concurrency, context_tokens, phase="warmup"):
+        self.workers = max(1, concurrency)
+        self.selected = min(self.selected, self.workers - 1)
+        self.cell_label = f"C={concurrency} ctx={format_context(context_tokens)}"
+        self.phase = phase
+        self._clear_buffer()
+
+    def _clear_buffer(self):
+        self.parts.clear()
+        self.chars = 0
+        self.dropped = 0
+        self.identity = None
+        self.channel = ""
+
+    def _append(self, text):
+        # Model text is data, not terminal commands or Rich markup. Preserve
+        # line breaks, tabs and Unicode while removing terminal control bytes.
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
+        if not text:
+            return
+        self.parts.append(text)
+        self.chars += len(text)
+        while self.chars > self.MAX_CHARS:
+            excess = self.chars - self.MAX_CHARS
+            first = self.parts.popleft()
+            count = min(excess, len(first))
+            self.dropped += count
+            self.chars -= count
+            if count < len(first):
+                self.parts.appendleft(first[count:])
+
+    def feed(self, index, ordinal, request_id, channel, text):
+        if index != self.selected or not text:
+            return
+        identity = (self.phase, index, ordinal, request_id)
+        if identity != self.identity:
+            self.identity = identity
+            self.channel = ""
+            rid = str(request_id)[:80]
+            self._append(f"\n--- {self.phase}: request {ordinal + 1}, id={rid or 'unavailable'} ---\n")
+        if channel != self.channel:
+            self._append(f"\n[{channel}]\n")
+            self.channel = channel
+        self._append(text)
+
+    def label(self):
+        return f"{self.cell_label} | stream {self.selected + 1}/{self.workers}"
+
+    def pause(self):
+        if self.snapshot is None:
+            self.snapshot = "".join(self.parts)
+            self.snapshot_label = self.label()
+            self.scroll_end = None
+            self._wrapped = None
+
+    def resume(self):
+        self.snapshot = None
+        self._wrapped = None
+        self.scroll_end = None
+        self._pending_pages.clear()
+
+    def handle_key(self, key):
+        if key == "o":
+            self.visible = not self.visible
+        elif not self.visible:
+            return
+        elif key == " ":
+            self.pause() if self.snapshot is None else self.resume()
+        elif key == "end":
+            self.resume()
+        elif key in ("pageup", "pagedown", "home"):
+            self.pause()
+            # Wrapping depends on terminal width; apply paging at render time.
+            self._pending_pages.append(key)
+        elif key in ("[", "]"):
+            self.selected = (self.selected + (1 if key == "]" else -1)) % self.workers
+            self.resume()
+            self._clear_buffer()
+
+    def render(self, width, height):
+        rows = max(1, height - 2)
+        self.page_rows = rows
+        text_width = max(1, width - 4)
+        wrap_console = Console(width=text_width)
+        if self.snapshot is not None:
+            if self._wrapped is None or self._wrapped_width != text_width:
+                self._wrapped = Text(self.snapshot, overflow="fold").wrap(wrap_console, text_width)
+                self._wrapped_width = text_width
+            lines = self._wrapped
+            end = min(len(lines), self.scroll_end if self.scroll_end is not None else len(lines))
+            while self._pending_pages:
+                key = self._pending_pages.popleft()
+                if key == "home":
+                    end = min(rows, len(lines))
+                else:
+                    end = max(min(rows, len(lines)), min(len(lines), end + (-rows if key == "pageup" else rows)))
+            self.scroll_end = end
+            status = f"PAUSED {max(1, end - rows + 1)}-{end}/{len(lines)}"
+            label = self.snapshot_label
+        else:
+            # Only wrap the visible tail while following live output. History
+            # wrapping is cached on pause, outside the per-fragment hot path.
+            tail = "".join(self.parts)[-max(4096, text_width * rows * 4):]
+            lines = Text(tail, overflow="fold").wrap(wrap_console, text_width)
+            end = len(lines)
+            status = "LIVE"
+            label = self.label()
+        body = Text("\n").join(lines[max(0, end - rows):end])
+        if not body.plain:
+            body = Text("Waiting for output from the selected stream...", style="dim")
+        return Panel(
+            body, title=Text(f"OUTPUT {status} | {label}"),
+            subtitle=Text("o hide | Space pause | PgUp/PgDn history | End live | [ ] stream"),
+            title_align="left", height=height, padding=(0, 1),
+            border_style=FRAME_BORDER,
+        )
 
 
 @dataclass
@@ -4745,6 +4899,7 @@ class TUIState:
     gpu_stats: list[GpuStats] = field(default_factory=list)
     hw_history: list = field(default_factory=list)
     events: list = field(default_factory=list)
+    output_viewer: OutputViewer = field(default_factory=OutputViewer)
 
 
 # ---------------------------------------------------------------------------
@@ -8694,6 +8849,8 @@ def live_decode_panel_width(state: TUIState, prefill_visible: bool, detail_mode:
     # dashboard. The cap preserves room for the vertical event log.
     mode, terminal_width, _ = live_layout_mode()
     col_width = live_decode_column_width(mode, detail_mode=detail_mode)
+    if len(state.concurrency_levels) <= 4 and LOOP_CELL_TPS in state.results.values():
+        col_width = max(col_width, len("ERROR: loop"))
     desired = 20 + len(state.concurrency_levels) * (col_width + 1)
     min_width = 32
     prefill_width = 31 if prefill_visible and mode == "wide" else 0
@@ -9235,6 +9392,160 @@ class NullLive:
 # Streaming request
 # ---------------------------------------------------------------------------
 
+LOOP_CELL_TPS = -3.0
+LOOP_CHECK_CHARS = 256
+LOOP_MAX_PERIOD_CHARS = 32768
+LOOP_WINDOW_CHARS = 4 * LOOP_MAX_PERIOD_CHARS
+LOOP_CONFIRMED_CHARS = 4096
+LOOP_CONFIRMED_CYCLES = 4
+
+
+def exact_periodic_tail(text: str) -> Optional[dict]:
+    """Find a character-exact periodic suffix with bounded candidate search.
+
+    Three copies spanning 1024 characters establish a suspicion, not a semantic
+    quality judgment. Candidate periods are at most 32768 Unicode code points.
+    Slice comparisons run in C; binary search locates the longest proven suffix
+    without a Python loop over every character. Whitespace alone is ignored.
+    """
+    n = len(text)
+    if n < 1024:
+        return None
+    anchor_size = 64
+    anchor_start = n - anchor_size
+    anchor = text[anchor_start:]
+    left = max(0, anchor_start - LOOP_MAX_PERIOD_CHARS)
+    end = n - 1
+    for _ in range(64):
+        previous = text.rfind(anchor, left, end)
+        if previous < 0:
+            break
+        period = anchor_start - previous
+        end = previous + anchor_size - 1
+        minimum = max(1024, 3 * period)
+        if minimum > n or text[n - minimum:n - period] != text[n - minimum + period:]:
+            continue
+        if not text[-period:].strip():
+            continue
+        lo, hi = minimum, n
+        while lo < hi:
+            length = (lo + hi + 1) // 2
+            if text[n - length:n - period] == text[n - length + period:]:
+                lo = length
+            else:
+                hi = length - 1
+        return {
+            "observed_start_char": n - lo,
+            "period_chars": period,
+            "repeated_chars": lo,
+            "complete_cycles": lo // period,
+        }
+    return None
+
+
+class StreamingLoopDetector:
+    """Bounded exact-repetition evidence for one request text channel.
+
+    Fragment boundaries do not define checks: all fragments are reblocked into
+    256-character pieces. At most 128 Ki characters of history are retained.
+    A negative result cannot exclude paraphrased or longer-period loops.
+    """
+
+    def __init__(self):
+        self.text = ""
+        self.pending = []
+        self.pending_chars = 0
+        self.total_chars = 0
+        self.reported_level = 0
+
+    def _check(self) -> Optional[dict]:
+        if self.pending:
+            self.text = (self.text + "".join(self.pending))[-LOOP_WINDOW_CHARS:]
+            self.pending = []
+            self.pending_chars = 0
+        evidence = exact_periodic_tail(self.text)
+        if evidence is None:
+            return None
+        confirmed = (evidence["complete_cycles"] >= LOOP_CONFIRMED_CYCLES
+                     and evidence["repeated_chars"] >= LOOP_CONFIRMED_CHARS)
+        level = 2 if confirmed else 1
+        if level <= self.reported_level:
+            return None
+        self.reported_level = level
+        offset = self.total_chars - len(self.text)
+        start = evidence["observed_start_char"]
+        period = evidence["period_chars"]
+        cycle = self.text[start:start + period]
+        return {
+            **evidence,
+            "status": "confirmed" if confirmed else "suspected",
+            "observed_start_char": offset + start,
+            "detected_at_char": self.total_chars,
+            "coordinate_unit": "unicode_code_points_in_channel",
+            "period_sha256": hashlib.sha256(cycle.encode()).hexdigest(),
+            "cycle_excerpt": cycle[:512],
+            "context_excerpt": self.text[max(0, start - 128):start + min(period, 512)],
+            "tail_excerpt": self.text[-1024:],
+        }
+
+    def feed(self, fragment: str) -> Optional[dict]:
+        finding = None
+        offset = 0
+        while offset < len(fragment):
+            count = min(LOOP_CHECK_CHARS - self.pending_chars, len(fragment) - offset)
+            self.pending.append(fragment[offset:offset + count])
+            self.pending_chars += count
+            self.total_chars += count
+            offset += count
+            if self.pending_chars == LOOP_CHECK_CHARS:
+                finding = self._check() or finding
+                if finding and finding["status"] == "confirmed":
+                    break
+        return finding
+
+    def finish(self) -> Optional[dict]:
+        return self._check()
+
+
+@dataclass
+class LoopCheckState:
+    enabled: bool = True
+    confirmed: bool = False
+    findings: list = field(default_factory=list)
+    omitted: int = 0
+
+    def record(self, finding: Optional[dict], **identity) -> None:
+        if finding is None:
+            return
+        finding = {**finding, **identity}
+        self.confirmed |= finding["status"] == "confirmed"
+        key = tuple(identity.get(k) for k in ("phase", "stream_index", "request_ordinal", "channel"))
+        for i, previous in enumerate(self.findings):
+            if tuple(previous.get(k) for k in ("phase", "stream_index", "request_ordinal", "channel")) == key:
+                self.findings[i] = finding
+                return
+        if len(self.findings) < 64:
+            self.findings.append(finding)
+        elif finding["status"] == "confirmed":
+            self.findings[-1] = finding
+            self.omitted += 1
+        else:
+            self.omitted += 1
+
+
+def apply_loop_diagnostics(cell: CellResult, check: LoopCheckState) -> None:
+    cell.loop_detection_enabled = check.enabled
+    cell.loop_detected = check.confirmed
+    cell.loop_diagnostics = list(check.findings)
+    cell.loop_diagnostics_omitted = check.omitted
+
+
+def invalid_decode_label(cell: CellResult) -> str:
+    if cell.loop_detected:
+        return "ERROR: loop"
+    return capacity_limit_cell() if cell.capacity_limited else "skip"
+
+
 async def abort_sglang_request(
     client: httpx.AsyncClient,
     abort_url: str,
@@ -9341,6 +9652,9 @@ async def stream_one_request(
     shared_usage_last_time: list = None,
     shared_token_last_time: list = None,
     abort_url: str = "",
+    loop_check: Optional[LoopCheckState] = None,
+    output_viewer: Optional[OutputViewer] = None,
+    loop_phase: str = "measurement",
 ) -> StreamResult:
     """Stream requests in a loop until cancel_event. When a request finishes
     (hits max_tokens or EOS), immediately start a new one to keep concurrency
@@ -9352,6 +9666,8 @@ async def stream_one_request(
     total_usage_tokens = 0
     iterations = 0
     active_signaled = False
+    if loop_check is None:
+        loop_check = LoopCheckState()
 
     while not cancel_event.is_set():
         if target_request_count > 0 and shared_started_count is not None:
@@ -9372,6 +9688,20 @@ async def stream_one_request(
         req_last_usage_tokens = 0
         request_id = ""
         abort_sent = False
+        detectors = {} if loop_check.enabled else None
+
+        def inspect_text(channel, fragment="", *, finish=False):
+            if detectors is None:
+                return
+            detector = detectors.setdefault(channel, StreamingLoopDetector())
+            finding = detector.finish() if finish else detector.feed(fragment)
+            loop_check.record(
+                finding, channel=channel, stream_index=index,
+                request_ordinal=iterations, request_id=request_id,
+                observed_completion_tokens=usage_tokens,
+                phase=loop_phase,
+            )
+
         try:
             async with client.stream("POST", url, json=payload, timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
                 if resp.status_code != 200:
@@ -9400,6 +9730,11 @@ async def stream_one_request(
                     data_str = line[6:]
                     if data_str == "[DONE]":
                         req_completed = True
+                        for channel in tuple(detectors or {}):
+                            inspect_text(channel, finish=True)
+                        if loop_check.confirmed:
+                            result.error = "LoopDetected"
+                            cancel_event.set()
                         break
 
                     try:
@@ -9433,10 +9768,16 @@ async def stream_one_request(
                     reasoning = delta.get("reasoning") or delta.get("reasoning_content")
                     if reasoning:
                         text += reasoning
+                        if output_viewer is not None:
+                            output_viewer.feed(index, iterations, request_id, "reasoning", reasoning)
+                        inspect_text("reasoning", reasoning)
 
                     content = delta.get("content")
                     if content:
                         text += content
+                        if output_viewer is not None:
+                            output_viewer.feed(index, iterations, request_id, "content", content)
+                        inspect_text("content", content)
 
                     if text:
                         token_time = time.monotonic()
@@ -9457,6 +9798,23 @@ async def stream_one_request(
                         shared_token_count[0] += 1
                         if shared_token_last_time is not None:
                             shared_token_last_time[0] = token_time
+
+                    if loop_check.confirmed:
+                        result.error = "LoopDetected"
+                        cancel_event.set()
+                        if request_id and abort_url:
+                            abort_sent = await abort_sglang_request(client, abort_url, request_id)
+                        break
+
+                # EOF and cancellation can precede [DONE]. Inspect the final
+                # partial detector block while the SSE request is still owned.
+                for channel in tuple(detectors or {}):
+                    inspect_text(channel, finish=True)
+                if loop_check.confirmed:
+                    result.error = "LoopDetected"
+                    cancel_event.set()
+                    if request_id and not req_completed and abort_url and not abort_sent:
+                        abort_sent = await abort_sglang_request(client, abort_url, request_id)
 
         except httpx.ReadTimeout:
             result.error = "ReadTimeout"
@@ -9789,6 +10147,7 @@ async def run_one_cell(
     cell_warmup_timeout_seconds: Optional[float] = None,
     temperature: Optional[float] = None,
     forced_token_id: Optional[int] = None,
+    loop_detection: bool = True,
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     stream_options = {"include_usage": True}
@@ -9815,6 +10174,7 @@ async def run_one_cell(
 
     url = f"{base_url}/v1/chat/completions"
     cancel_event = asyncio.Event()
+    loop_check = LoopCheckState(enabled=loop_detection)
     shared_token_count = [0]
     shared_usage_token_count = [0]
     shared_active_streams = [0]  # how many streams have received first token
@@ -9863,9 +10223,55 @@ async def run_one_cell(
     state.cell_user_tps_p50 = 0.0
     state.cell_request_latency_p50_ms = 0.0
     state.cell_request_latency_p90_ms = 0.0
+    state.output_viewer.start_cell(concurrency, context_tokens)
     hw_cell_start_idx = len(state.hw_history)
     hw_measurement_start_idx = hw_cell_start_idx
     add_event(state, f"cell start C={concurrency} ctx={format_context(context_tokens)}")
+
+    async def finish_loop_cell(stream_results, phase):
+        # The caller joins every stream before invalidating the cell. A loop
+        # found in warmup also invalidates measurement: there is no valid rate
+        # for an input whose response has already failed the repetition guard.
+        cell = CellResult(
+            concurrency=concurrency, context_tokens=context_tokens,
+            benchmark_mode="request-count" if request_count > 0 else "duration",
+            request_count_target=request_count,
+            warmup_request_count=warmup_request_count,
+            aggregate_tps=LOOP_CELL_TPS,
+            aggregate_source="invalid_exact_repetition",
+            ready_reason=f"loop_detected_during_{phase}",
+            wall_time=time.monotonic() - state.cell_start,
+            num_errors=max(1, sum(bool(r.error) for r in stream_results)),
+            hardware_summary=summarize_hardware_history(state.hw_history[hw_cell_start_idx:]),
+        )
+        apply_loop_diagnostics(cell, loop_check)
+        state.cell_running = False
+        state.cell_warmup = False
+        state.cell_live_tps = 0.0
+        state.cell_tps_history = []
+        key = (context_tokens, concurrency)
+        state.results[key] = LOOP_CELL_TPS
+        state.errors[key] = cell.num_errors
+        state.client_info.pop(key, None)
+        state.queue_info.pop(key, None)
+        finding = next(f for f in loop_check.findings if f["status"] == "confirmed")
+        add_event(state, f"ERROR: loop C={concurrency} ctx={format_context(context_tokens)} "
+                  f"{finding['channel']} period={finding['period_chars']} chars "
+                  f"cycles={finding['complete_cycles']}")
+        live.update(build_display(state))
+        await cell_client.aclose()
+        try:
+            await require_decode_server_idle(
+                client, base_url, engine, state, live,
+                boundary=f"after loop C={concurrency} ctx={format_context(context_tokens)}",
+            )
+        except RuntimeError as exc:
+            # A drain failure must not overwrite a proven loop with a numeric
+            # result in the caller's generic error handler. Every subsequent
+            # cell still requires its own successful pre-request idle barrier.
+            cell.timeout_reason = str(exc)
+            add_event(state, f"loop cell scheduler drain failed: {exc}")
+        return cell
 
     # Scout request: ensure prefix cache is warm before launching full concurrency.
     # Send one request with max_tokens=1 to populate/refresh prefix cache,
@@ -10119,11 +10525,17 @@ async def run_one_cell(
                         batch_completed,
                         target_count,
                         abort_url=abort_url,
+                        loop_check=loop_check,
+                        output_viewer=state.output_viewer,
+                        loop_phase="warmup",
                     )
                 )
                 for i in range(workers)
             ]
             while not all(t.done() for t in batch_tasks):
+                if loop_check.confirmed:
+                    batch_cancel.set()
+                    break
                 if _skip_event.is_set():
                     _skip_event.clear()
                     batch_cancel.set()
@@ -10135,7 +10547,7 @@ async def run_one_cell(
                     elapsed = time.monotonic() - state.cell_measurement_start
                     if elapsed > 0.5 and batch_tokens[0] > 0:
                         state.cell_live_tps = batch_tokens[0] / elapsed
-                    live.update(build_display(state))
+                live.update(build_display(state))
                 await asyncio.sleep(0.25)
             done, pending = await asyncio.wait(batch_tasks, timeout=30.0)
             for t in pending:
@@ -10162,9 +10574,12 @@ async def run_one_cell(
             state.cell_measurement_start = 0.0
             state.request_count_target = warmup_request_count
             live.update(build_display(state))
-            await run_fixed_request_batch(warmup_request_count, record_samples=False)
+            warmup_results, *_ = await run_fixed_request_batch(warmup_request_count, record_samples=False)
+            if loop_check.confirmed:
+                return await finish_loop_cell(warmup_results, "warmup")
 
         state.cell_warmup = False
+        state.output_viewer.phase = "measurement"
         state.request_count_target = request_count
         state.cell_tokens = 0
         state.cell_live_tps = 0.0
@@ -10221,6 +10636,8 @@ async def run_one_cell(
                     batch_completed,
                     request_count,
                     abort_url=abort_url,
+                    loop_check=loop_check,
+                    output_viewer=state.output_viewer,
                 )
             )
             for i in range(workers)
@@ -10228,6 +10645,9 @@ async def run_one_cell(
 
         while not all(t.done() for t in tasks):
             await asyncio.sleep(0.25)
+            if loop_check.confirmed:
+                batch_cancel.set()
+                break
             now = time.monotonic()
             state.cell_tokens = batch_tokens[0]
             state._active_streams = batch_active[0]
@@ -10336,6 +10756,8 @@ async def run_one_cell(
                 stream_results.append(t.result())
             except (asyncio.CancelledError, Exception):
                 stream_results.append(StreamResult(error="cancelled"))
+        if loop_check.confirmed:
+            return await finish_loop_cell(stream_results, "measurement")
         request_samples = []
         for stream_result in stream_results:
             request_samples.extend(stream_result.request_samples)
@@ -10466,6 +10888,7 @@ async def run_one_cell(
             state.srv_spec_accept_length,
             median(sglang_step_rate_samples) if sglang_step_rate_samples else 0.0,
         )
+        apply_loop_diagnostics(cell, loop_check)
 
         state.cell_running = False
         state.results[(context_tokens, concurrency)] = cell.aggregate_tps
@@ -10502,7 +10925,10 @@ async def run_one_cell(
                                shared_usage_token_count=shared_usage_token_count,
                                shared_usage_last_time=shared_usage_last_time,
                                shared_token_last_time=shared_token_last_time,
-                               abort_url=abort_url)
+                               abort_url=abort_url,
+                               loop_check=loop_check,
+                               output_viewer=state.output_viewer,
+                               loop_phase="sustained_decode")
         )
         for i in range(concurrency)
     ]
@@ -10552,6 +10978,9 @@ async def run_one_cell(
             remaining = duration - (time.monotonic() - measurement_start)
             sleep_for = 0.0 if remaining <= 0 else min(0.5, max(0.02, remaining))
         await asyncio.sleep(sleep_for)
+        if loop_check.confirmed:
+            cancel_event.set()
+            break
         now = time.monotonic()
         elapsed = now - state.cell_start
 
@@ -10645,6 +11074,7 @@ async def run_one_cell(
                         elif now - warmup_stable_since >= ready_stable_seconds:
                             warmup_done = True
                             state.cell_warmup = False
+                            state.output_viewer.phase = "measurement"
                             warmup_duration = now - state.cell_start
                             if state.metrics_available:
                                 ready_reason = (
@@ -10680,6 +11110,7 @@ async def run_one_cell(
                         warmup_timed_out = True
                         warmup_done = True
                         state.cell_warmup = False
+                        state.output_viewer.phase = "measurement"
                         warmup_duration = now - state.cell_start
                         ready_reason = "warmup_timeout"
                         if not state.metrics_available:
@@ -10825,6 +11256,8 @@ async def run_one_cell(
             stream_results.append(t.result())
         except (asyncio.CancelledError, Exception):
             stream_results.append(StreamResult(error="cancelled", total_time=wall_time))
+    if loop_check.confirmed:
+        return await finish_loop_cell(stream_results, "measurement" if warmup_done else "warmup")
     request_samples = []
     for stream_result in stream_results:
         request_samples.extend(stream_result.request_samples)
@@ -11038,6 +11471,7 @@ async def run_one_cell(
         state.srv_spec_accept_length,
         median(sglang_step_rate_samples) if sglang_step_rate_samples else 0.0,
     )
+    apply_loop_diagnostics(cell, loop_check)
 
     state.cell_running = False
     state.results[(context_tokens, concurrency)] = cell.aggregate_tps
@@ -11070,6 +11504,11 @@ async def run_one_cell(
 # ---------------------------------------------------------------------------
 
 def build_display(state: TUIState) -> Layout:
+    while True:
+        try:
+            state.output_viewer.handle_key(_viewer_commands.get_nowait())
+        except queue.Empty:
+            break
     mode, term_width, term_height = live_layout_mode()
     narrow = mode == "narrow"
     mid = mode == "mid"
@@ -11082,20 +11521,26 @@ def build_display(state: TUIState) -> Layout:
         current_ratio, server_ratio, hardware_ratio = (4, 2, 8)
     ratio_sum = current_ratio + server_ratio + (hardware_ratio if show_hw_panel else 0)
     hardware_est_width = max(0, int(term_width * hardware_ratio / max(1, ratio_sum))) if show_hw_panel else 0
-    show_narrow_hw = show_hw_panel and narrow and term_height >= 30
+    output_size = max(6, min(12, term_height // 3, term_height - 18)) if state.output_viewer.visible else 0
+    show_narrow_hw = show_hw_panel and narrow and term_height >= 30 and not output_size
     narrow_hw_size = 0
     narrow_top_size = 0
     if show_narrow_hw:
         narrow_hw_size = 10 if term_height >= 40 else (8 if term_height >= 34 else 6)
         narrow_top_size = 8 if term_height >= 34 else 7
     middle_size = 14 if not narrow else ((narrow_top_size + narrow_hw_size) if show_narrow_hw else 10)
+    if output_size:
+        middle_size = min(middle_size, max(4, term_height - output_size - 14))
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="middle", size=middle_size),
-        Layout(name="results", ratio=1, minimum_size=10 if not narrow else 12),
+        Layout(name="output", size=output_size, visible=bool(output_size)),
+        Layout(name="results", ratio=1, minimum_size=4 if output_size else (10 if not narrow else 12)),
         Layout(name="footer", size=3),
     )
+    if output_size:
+        layout["output"].update(state.output_viewer.render(term_width, output_size))
     if narrow:
         if show_narrow_hw:
             layout["middle"].split_column(
@@ -11316,6 +11761,8 @@ def build_display(state: TUIState) -> Layout:
     show_cell_details = detail_mode != "none"
     inline_cell_details = detail_mode == "inline"
     col_width = live_decode_column_width(mode, detail_mode=detail_mode)
+    if len(state.concurrency_levels) <= 4 and LOOP_CELL_TPS in state.results.values():
+        col_width = max(col_width, len("ERROR: loop"))
     decode_suffix = "tok/s + TTFT/ITL" if show_cell_details else ("" if narrow else "tok/s")
     results_table = Table(
         title=render_title("DECODE tok/s" if narrow else "AGGREGATE DECODE", decode_suffix),
@@ -11361,6 +11808,10 @@ def build_display(state: TUIState) -> Layout:
             key = (ctx, conc)
             if key in state.results:
                 val = state.results[key]
+                if val == LOOP_CELL_TPS:
+                    label = "ERROR: loop" if col_width >= len("ERROR: loop") else "ERROR\nloop"
+                    row.append(f"[{PHOSPHOR_WARN}]{label}[/{PHOSPHOR_WARN}]")
+                    continue
                 if val == -2:
                     row.append(f"[{PHOSPHOR_WARN}]{'skip' if narrow else 'skipped'}[/{PHOSPHOR_WARN}]")
                     continue
@@ -11465,7 +11916,7 @@ def build_display(state: TUIState) -> Layout:
             border_style=SUBTLE_BORDER,
             padding=(0, 1) if not narrow else (0, 0),
         )
-        results_height = max(8, term_height - middle_size - 6)
+        results_height = max(6, term_height - middle_size - output_size - 6)
         mid_side_events = mid and results_height >= 16 and term_width >= decode_width + 28
         side_event_limit = max(4, results_height - 7)
         full_event_limit = max(6, results_height - 2)
@@ -11529,7 +11980,7 @@ def build_display(state: TUIState) -> Layout:
                     Layout(decode_panel, size=decode_rows),
                     Layout(render_events_panel(state, limit=max(1, event_rows - 2)), size=event_rows),
                 )
-        layout["results"].update(results_layout)
+        layout["results"].update(decode_panel if output_size and results_height < 12 else results_layout)
     else:
         decode_width = live_decode_panel_width(state, prefill_visible=False, detail_mode=detail_mode)
         results_layout = Layout()
@@ -11539,7 +11990,7 @@ def build_display(state: TUIState) -> Layout:
             border_style=SUBTLE_BORDER,
             padding=(0, 1) if not narrow else (0, 0),
         )
-        results_height = max(8, term_height - middle_size - 6)
+        results_height = max(6, term_height - middle_size - output_size - 6)
         mid_side_events = mid and results_height >= 14 and term_width >= decode_width + 28
         full_event_limit = max(6, results_height - 2)
         show_side_stats = False
@@ -11583,7 +12034,7 @@ def build_display(state: TUIState) -> Layout:
                 Layout(decode_panel, size=decode_rows),
                 Layout(render_events_panel(state, limit=max(1, event_rows - 2)), size=event_rows),
             )
-        layout["results"].update(results_layout)
+        layout["results"].update(decode_panel if output_size and results_height < 12 else results_layout)
 
     # Footer - overall progress
     if state.total_tests > 0:
@@ -11596,12 +12047,12 @@ def build_display(state: TUIState) -> Layout:
         else:
             eta_str = "calculating..."
 
-        bar = render_progress_bar(overall_pct, 24 if narrow else 50)
+        bar = render_progress_bar(overall_pct, 12 if narrow else 50)
         if narrow or mid:
             footer_text = (
                 f" {bar} {state.completed_tests}/{state.total_tests} "
                 f"E:{format_time(elapsed_total)} ETA:{eta_str} "
-                f"[dim]v{VERSION} s=skip q=finish[/dim]"
+                f"[dim]o=output s=skip q=finish[/dim]"
             )
         else:
             footer_text = (
@@ -11610,7 +12061,7 @@ def build_display(state: TUIState) -> Layout:
                 f"Elapsed: {format_time(elapsed_total)}  "
                 f"ETA: {eta_str}  "
             )
-            footer_text += f"[dim]{CAPACITY_LIMIT_MARK}=KV limit  llm-decode-bench v{VERSION}  s=skip  q=finish[/dim]"
+            footer_text += f"[dim]{CAPACITY_LIMIT_MARK}=KV limit  v{VERSION}  o=output  s=skip  q=finish[/dim]"
     else:
         footer_text = "Initializing..."
     layout["footer"].update(
@@ -14727,7 +15178,7 @@ async def run_benchmark(args):
                 saved_prefill_contexts = list(state.prefill_contexts)
                 state.prefill_contexts = []
                 try:
-                    await run_one_cell(
+                    warmup_result = await run_one_cell(
                         client=client,
                         base_url=base_url,
                         concurrency=warmup_conc,
@@ -14746,9 +15197,13 @@ async def run_benchmark(args):
                         cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                         temperature=args.temperature,
                         forced_token_id=args.forced_token_id,
+                        loop_detection=args.loop_detection,
                     )
                 finally:
                     state.prefill_contexts = saved_prefill_contexts
+                args.decode_warmup_loop_diagnostics = warmup_result.loop_diagnostics
+                if warmup_result.loop_detected:
+                    console.print("[red]ERROR: loop detected during pre-decode warmup; evidence retained in JSON.[/red]")
                 state.results.pop((warmup_ctx, warmup_conc), None)
                 state.errors.pop((warmup_ctx, warmup_conc), None)
                 state.queue_info.pop((warmup_ctx, warmup_conc), None)
@@ -14818,6 +15273,7 @@ async def run_benchmark(args):
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                             temperature=args.temperature,
                             forced_token_id=args.forced_token_id,
+                            loop_detection=args.loop_detection,
                         )
                         if result.aggregate_tps == -2:
                             state.results[(ctx, conc)] = -2
@@ -14897,6 +15353,7 @@ async def run_benchmark(args):
                             cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                             temperature=args.temperature,
                             forced_token_id=args.forced_token_id,
+                            loop_detection=args.loop_detection,
                         )
                         result.benchmark_mode = "burst-e2e"
                         if result.aggregate_tps == -2:
@@ -14937,6 +15394,17 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                         hardware_run_summary: dict = None):
     console.print("\n")
     console.print(f"[dim]llm-decode-bench v{VERSION}[/dim]")
+    for cell in [*results, *(burst_results or [])]:
+        for finding in cell.loop_diagnostics:
+            if finding["status"] != "confirmed":
+                continue
+            console.print(Text(
+                f"ERROR: loop | {cell.benchmark_mode} C={cell.concurrency} "
+                f"ctx={format_context(cell.context_tokens)} | stream {finding['stream_index'] + 1} "
+                f"{finding['channel']} | {finding['complete_cycles']} cycles, "
+                f"period {finding['period_chars']} chars. Throughput invalid; evidence in JSON.",
+                style="bold red",
+            ))
 
     def needs_effective_note(r: CellResult, requested: int) -> bool:
         if getattr(r, "benchmark_mode", "") == "request-count":
@@ -15063,10 +15531,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         for conc in concurrency_levels:
             r = result_map.get((ctx, conc))
             if r and r.aggregate_tps < 0:
-                if r.capacity_limited:
-                    row.append(capacity_limit_cell())
-                else:
-                    row.append("skip")
+                row.append(invalid_decode_label(r))
             elif r:
                 if r.capacity_limited and not show_capacity_limited_values:
                     val = capacity_limit_cell()
@@ -15128,10 +15593,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         for conc in concurrency_levels:
             r = result_map.get((ctx, conc))
             if r and r.aggregate_tps < 0:
-                if r.capacity_limited:
-                    row.append(capacity_limit_cell())
-                else:
-                    row.append("skip")
+                row.append(invalid_decode_label(r))
             elif r and r.per_request_avg_tps > 0:
                 if r.capacity_limited and not show_capacity_limited_values:
                     val = capacity_limit_cell()
@@ -15178,7 +15640,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
 
         def client_cell(r: CellResult, kind: str) -> str:
             if r.aggregate_tps < 0:
-                return capacity_limit_cell() if r.capacity_limited else "skip"
+                return invalid_decode_label(r)
             if r.request_count <= 0:
                 return "-"
             if kind == "latency":
@@ -15305,7 +15767,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
             for conc in concurrency_levels:
                 r = burst_map.get((ctx, conc))
                 if r and r.aggregate_tps < 0:
-                    row.append(capacity_limit_cell() if r.capacity_limited else "skip")
+                    row.append(invalid_decode_label(r))
                 elif r:
                     val = f"{r.aggregate_tps:.1f}"
                     if r.request_count_target:
@@ -15414,7 +15876,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
             for conc in concurrency_levels:
                 r = result_map.get((ctx, conc))
                 if r and r.aggregate_tps < 0:
-                    row.append(capacity_limit_cell() if r.capacity_limited else "skip")
+                    row.append(invalid_decode_label(r))
                 elif r:
                     if r.capacity_limited and not show_capacity_limited_values:
                         val = capacity_limit_cell()
@@ -15498,19 +15960,19 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
 
     # Build summary table (exclude skipped)
     summary = {}
-    actual_results = [r for r in results if r.aggregate_tps >= 0]
+    actual_results = [r for r in results if r.aggregate_tps >= 0 or r.loop_detected]
     for r in actual_results:
         ctx_key = str(r.context_tokens)
         if ctx_key not in summary:
             summary[ctx_key] = {}
-        summary[ctx_key][str(r.concurrency)] = r.aggregate_tps
+        summary[ctx_key][str(r.concurrency)] = None if r.loop_detected else r.aggregate_tps
     burst_summary = {}
-    actual_burst_results = [r for r in (burst_results or []) if r.aggregate_tps >= 0]
+    actual_burst_results = [r for r in (burst_results or []) if r.aggregate_tps >= 0 or r.loop_detected]
     for r in actual_burst_results:
         ctx_key = str(r.context_tokens)
         if ctx_key not in burst_summary:
             burst_summary[ctx_key] = {}
-        burst_summary[ctx_key][str(r.concurrency)] = r.aggregate_tps
+        burst_summary[ctx_key][str(r.concurrency)] = None if r.loop_detected else r.aggregate_tps
 
     # Prefill summary
     prefill_summary = {}
@@ -15574,6 +16036,18 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "burst_requests_per_concurrency": getattr(args, "burst_requests_per_concurrency", 5),
             "decode_warmup_seconds": getattr(args, "decode_warmup_seconds", 0),
             "decode_warmup_context": getattr(args, "decode_warmup_context", 0),
+            "decode_warmup_loop_diagnostics": getattr(args, "decode_warmup_loop_diagnostics", []),
+            "loop_detection": {
+                "enabled": getattr(args, "loop_detection", True),
+                "scope": "decode_cells_and_their_warmups",
+                "confirmed_min_chars": LOOP_CONFIRMED_CHARS,
+                "confirmed_min_cycles": LOOP_CONFIRMED_CYCLES,
+                "max_period_chars": LOOP_MAX_PERIOD_CHARS,
+                "history_chars_per_request_channel": LOOP_WINDOW_CHARS,
+                "check_interval_chars": LOOP_CHECK_CHARS,
+                "invalid_cell_aggregate_tps_sentinel": LOOP_CELL_TPS,
+                "limitation": "exact repeated text heuristic; not a semantic correctness test",
+            },
             "decode_warmup_concurrency": 1 if getattr(args, "decode_warmup_seconds", 0) > 0 else 0,
             "cell_warmup_timeout_seconds": getattr(args, "cell_warmup_timeout_seconds", 0),
             "cell_warmup_timeout_policy": "<=32k:60s,64k:120s,>=128k:180s when override is 0",
@@ -15726,6 +16200,7 @@ def resume_config_signature(args) -> dict:
         "respect_eos": getattr(args, "respect_eos", False),
         "temperature": getattr(args, "temperature", None),
         "forced_token_id": getattr(args, "forced_token_id", None),
+        "loop_detection": getattr(args, "loop_detection", True),
         "max_total_tokens": args.max_total_tokens,
         "skip_prefill": getattr(args, "skip_prefill", False),
         "standalone_prefill": getattr(args, "standalone_prefill", False),
@@ -15970,21 +16445,57 @@ _skip_event = threading.Event()
 _quit_event = threading.Event()
 _original_term_settings = None
 _keyboard_soft_quit = False
+_viewer_commands = queue.Queue(maxsize=128)
+
+
+class TerminalKeyParser:
+    """Decode fragmented CSI/SS3 navigation keys without treating them as commands."""
+
+    SEQUENCES = {
+        "\x1b[5~": "pageup", "\x1b[6~": "pagedown",
+        "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x1b[8~": "end",
+        "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home",
+    }
+
+    def __init__(self):
+        self.pending = ""
+
+    def feed(self, text):
+        keys = []
+        for ch in text:
+            if ch == "\x1b":
+                self.pending = ch
+            elif self.pending:
+                self.pending += ch
+                if len(self.pending) == 2 and ch in "[O":
+                    continue
+                if len(self.pending) == 2 or "@" <= ch <= "~" or len(self.pending) > 32:
+                    if self.pending in self.SEQUENCES:
+                        keys.append(self.SEQUENCES[self.pending])
+                    self.pending = ""
+            else:
+                keys.append(ch.lower())
+        return keys
 
 
 def _keyboard_listener():
-    """Background thread: listen for 's' skip and 'q' graceful stop."""
+    """Read benchmark control keys; queue output-view commands for the UI thread."""
     global _original_term_settings
     try:
         fd = sys.stdin.fileno()
         _original_term_settings = termios.tcgetattr(fd)
         tty.setcbreak(fd)
+        parser = TerminalKeyParser()
         while True:
-            if select.select([sys.stdin], [], [], 0.2)[0]:
-                ch = sys.stdin.read(1)
-                if ch.lower() == "s":
+            if not select.select([fd], [], [], 0.2)[0]:
+                continue
+            data = os.read(fd, 1024)
+            if not data:
+                break
+            for ch in parser.feed(data.decode("utf-8", errors="ignore")):
+                if ch == "s":
                     _skip_event.set()
-                elif ch.lower() == "q":
+                elif ch == "q":
                     if _quit_event.is_set():
                         continue
                     _quit_event.set()
@@ -15995,6 +16506,11 @@ def _keyboard_listener():
                     _quit_event.set()
                     _restore_terminal()
                     os.kill(os.getpid(), signal.SIGINT)
+                elif ch in ("o", " ", "pageup", "pagedown", "home", "end", "[", "]"):
+                    try:
+                        _viewer_commands.put_nowait(ch)
+                    except queue.Full:
+                        pass
     except Exception:
         pass  # not a terminal (piped input, etc.)
 
@@ -16004,6 +16520,11 @@ def start_keyboard_listener(*, soft_quit: bool = False) -> threading.Thread:
     global _keyboard_soft_quit
     _skip_event.clear()
     _quit_event.clear()
+    while not _viewer_commands.empty():
+        try:
+            _viewer_commands.get_nowait()
+        except queue.Empty:
+            break
     _keyboard_soft_quit = soft_quit
     thread = threading.Thread(target=_keyboard_listener, daemon=True)
     thread.start()
@@ -16391,8 +16912,14 @@ def parse_args():
     parser.add_argument(
         "--display-mode", choices=("screen", "live", "plain"), default="screen",
         help="Progress display mode. screen uses Rich alternate screen to avoid "
-             "inline flicker; live is the old inline live table; plain disables "
+             "inline flicker; live uses inline updates; plain disables "
              "live updates. (default: screen)"
+    )
+    parser.add_argument(
+        "--loop-detection", action=argparse.BooleanOptionalAction, default=True,
+        help="Check every decode response for sustained exact repetition, including warmup. "
+             "A confirmed loop invalidates the cell (ERROR: loop), not a speed result. "
+             "Use --no-loop-detection for deliberately repetitive output. (default: enabled)"
     )
     parser.add_argument(
         "--refresh-rate", type=float, default=1.0,
@@ -17008,6 +17535,8 @@ def main():
         f"Decode contexts: {[format_context(c) for c in context_lengths]}\n"
         f"{decode_mode} | Max tokens: {args.max_tokens}\n"
         f"Pre-decode warmup: {'disabled' if args.decode_warmup_seconds <= 0 else f'C=1 max-runnable context for {args.decode_warmup_seconds:g}s'}\n"
+        f"Exact-loop guard: {'enabled' if args.loop_detection else 'disabled'} | "
+        f"Output preview: {'unavailable in plain mode' if args.display_mode == 'plain' else 'press o'}\n"
         f"{prefill_label} | Sustained decode: {decode_count} cells{phase3}",
         title=render_title("Configuration"),
         box=PANEL_BOX,

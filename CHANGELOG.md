@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 - 2026-09-06
+
+### Decode repetition guard and output preview
+
+- Sustained and request-count decode cells check reasoning and content per
+  request for sustained exact repetition by default, including their warmups.
+  Four identical cycles spanning at least 4096 Unicode characters invalidate
+  the cell: tables show `ERROR: loop` instead of throughput. The existing
+  targeted SGLang abort and scheduler-drain boundaries remain active.
+- JSON retains bounded repetition evidence and invalid cells; summary speeds
+  are `null` for those cells. `--no-loop-detection` permits deliberate repetitive
+  workloads without changing their sampling parameters. Detection is a bounded
+  exact-text heuristic, not a semantic correctness verdict.
+- The `o` key opens a bounded model-output panel in the decode dashboard.
+  Space freezes its snapshot, PageUp/PageDown navigate history, End restores
+  live scrolling, and `[`/`]` select a worker without interleaving responses.
+  Preview controls do not pause the request reader or create inference work.
+- Regression tests cover threshold and fragment-boundary behavior, per-request
+  and per-channel isolation, concurrent cancellation, report/resume handling,
+  terminal key parsing, bounded history, and compact dashboard rendering.
+
 ## 0.4.34 - 2026-09-03
 
 ### SGLang verifier rates use matched metric snapshots
