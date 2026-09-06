@@ -214,6 +214,91 @@ class StreamingGuardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CellGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sustained_duration_stop_preserves_valid_speed(self):
+        state = BENCH.TUIState(metrics_available=False, hw_monitor_enabled=False)
+        fake = FakeStreamingClient([{"content": "An ordinary response."}])
+        with patch.object(BENCH.httpx, "AsyncClient", return_value=fake), patch.object(BENCH, "require_decode_server_idle", AsyncMock()):
+            cell = await BENCH.run_one_cell(
+                fake, "http://fixture", 1, 0, "", 0.1, 10000, "model",
+                state, BENCH.NullLive(), temperature=1.0,
+                cell_warmup_timeout_seconds=0.01,
+            )
+        self.assertGreater(cell.aggregate_tps, 0)
+        self.assertFalse(cell.failure_reason)
+        self.assertFalse(cell.loop_detected)
+        self.assertTrue(fake.closed)
+
+    async def test_sustained_stream_error_after_warmup_invalidates_speed(self):
+        state = BENCH.TUIState(metrics_available=False, hw_monitor_enabled=False)
+
+        async def fail_during_measurement(index):
+            if index == 1:
+                async def ready():
+                    while state.cell_warmup:
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(ready(), timeout=5)
+                raise BENCH.httpx.RemoteProtocolError("engine disconnected")
+
+        fake = FakeStreamingClient(
+            [{"content": "Beginning."}, {"content": "Unreachable."}],
+            before_delta=fail_during_measurement,
+        )
+        with patch.object(BENCH.httpx, "AsyncClient", return_value=fake), patch.object(BENCH, "require_decode_server_idle", AsyncMock()):
+            cell = await BENCH.run_one_cell(
+                fake, "http://fixture", 1, 0, "", 30, 10000, "model",
+                state, BENCH.NullLive(), temperature=1.0,
+                cell_warmup_timeout_seconds=0.01,
+            )
+        self.assertEqual(cell.aggregate_tps, BENCH.ERROR_CELL_TPS)
+        self.assertEqual(cell.ready_reason, "stream_failure_during_measurement")
+        self.assertIn("engine disconnected", cell.failure_reason)
+
+    async def test_stream_failure_before_measurement_is_error_not_speed(self):
+        await self.assert_stream_failure_cell()
+
+    async def test_burst_stream_failures_are_errors_during_warmup_and_measurement(self):
+        for warmup in (0, 2):
+            with self.subTest(warmup=warmup):
+                await self.assert_stream_failure_cell(request_count=2, warmup=warmup)
+
+    async def assert_stream_failure_cell(self, *, request_count=0, warmup=0):
+        async def fail_after_one_token(index):
+            if index == 1:
+                raise BENCH.httpx.RemoteProtocolError("engine disconnected")
+
+        fake = FakeStreamingClient(
+            [{"content": "Beginning."}, {"content": "Unreachable."}],
+            before_delta=fail_after_one_token,
+        )
+        state = BENCH.TUIState(metrics_available=False, hw_monitor_enabled=False)
+        drain = AsyncMock()
+        with patch.object(BENCH.httpx, "AsyncClient", return_value=fake), patch.object(BENCH, "require_decode_server_idle", drain):
+            cell = await BENCH.run_one_cell(
+                fake, "http://fixture", 2, 0, "", 30, 10000, "model",
+                state, BENCH.NullLive(), temperature=1.0,
+                request_count=request_count, warmup_request_count=warmup,
+            )
+        self.assertLess(cell.aggregate_tps, 0)
+        self.assertEqual(cell.num_errors, 2)
+        self.assertIn("engine disconnected", cell.failure_reason)
+        self.assertEqual(BENCH.invalid_decode_label(cell), "ERROR")
+        self.assertFalse(cell.loop_detected)
+        self.assertFalse(state.cell_running)
+        self.assertEqual(state.cell_live_tps, 0)
+        self.assertEqual(drain.await_count, 2)
+        self.assertTrue(fake.closed)
+        console = BENCH.Console(file=io.StringIO(), width=140, color_system=None)
+        BENCH.print_final_results([cell], [2], [0], console)
+        self.assertIn("ERROR", console.file.getvalue())
+        with patch("sys.argv", [str(MODULE_PATH), "--concurrency", "2", "--contexts", "0"]):
+            args = BENCH.parse_args()
+        with tempfile.TemporaryDirectory() as directory:
+            args.output = str(Path(directory) / "report.json")
+            BENCH.save_results([cell], args, args.output)
+            report = json.loads(Path(args.output).read_text())
+        self.assertIsNone(report["summary_table"]["0"]["2"])
+        self.assertIn("engine disconnected", report["results"][0]["failure_reason"])
+
     async def run_cell(self, *, request_count=0, warmup=0, loop_detection=True):
         fake = FakeStreamingClient([{"content": "duct" * 1500}])
         state = BENCH.TUIState(metrics_available=False, hw_monitor_enabled=False)

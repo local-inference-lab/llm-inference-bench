@@ -282,6 +282,12 @@ throughput matrix. They are excluded from throughput statistics. Pre-decode
 warmup evidence is stored in `metadata.decode_warmup_loop_diagnostics`.
 The detection setting is part of resume compatibility.
 
+Transport and server failures invalidate decode cells independently of the
+repetition guard. These cells display `ERROR`, retain `failure_reason` and
+`aggregate_tps=-4` in JSON, and have `null` summary throughput. A failure during
+warmup is not a zero-throughput measurement. Each subsequent cell must still
+pass the scheduler-idle barrier.
+
 This is an exact-text heuristic, **not a semantic quality evaluator**. It can
 miss paraphrased loops, periods outside the search limit, or repetition that
 does not reach the threshold before the request stops. Intentional verbatim

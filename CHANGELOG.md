@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 - 2026-09-06
+
+### Failed decode streams invalidate throughput
+
+- A disconnected or failed stream invalidates its sustained or request-count
+  decode cell, including failures before warmup completes. Tables show `ERROR`,
+  JSON retains the failure reason, and summary throughput is `null`.
+- Missing measurement timestamps cannot raise a secondary exception or turn a
+  failed request into a zero-throughput result. Scheduler drain checks remain
+  active before another cell starts.
+- Regression tests exercise early disconnection, request-count warmup and
+  measurement errors, terminal output, and JSON reports.
+
 ## 0.6.0 - 2026-09-06
 
 ### Decode repetition guard and output preview
