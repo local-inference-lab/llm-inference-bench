@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.2 - 2026-09-06
+
+### Tagged release of guarded decode measurements
+
+- Publishes the default exact-repetition guard, failed-stream invalidation,
+  request-specific SGLang cancellation, scheduler-drain checks, and interactive
+  model-output viewer as a versioned release.
+- The benchmark reports invalid decode cells as errors, retains bounded
+  diagnostics in JSON, and leaves summary throughput `null` for those cells.
+- Runtime behavior, CLI defaults, sampling parameters, and result schemas are
+  unchanged from 0.6.1. The version and release documentation identify the
+  downloadable package; the 0.6.0 and 0.6.1 entries describe its functional changes.
+
 ## 0.6.1 - 2026-09-06
 
 ### Failed decode streams invalidate throughput

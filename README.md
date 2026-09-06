@@ -18,6 +18,8 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Inline client latency detail** — aggregate decode cells can show `tok/s + TTFT/ITL` when there is enough terminal width
 - **Server-side validation** — optionally scrapes Prometheus `/metrics` for vLLM/SGLang validation, queue, KV, and scheduler signals
 - **Live TUI dashboard** — adaptive Rich layout with compact modes for narrower terminals
+- **Decode loop guard** — detects sustained exact repetition in reasoning and content by default; invalid cells show an error instead of throughput
+- **Interactive output preview** — press `o` to view a request's output, Space to freeze the preview, PageUp/PageDown to browse, and End to return to live scrolling
 - **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency and CPU package temperatures when exposed by the host
 - **Fabric diagnostics** — bundled CUDA/NCCL P2P diagnostic plus AMD CPU NUMA/xGMI bandwidth and latency diagnostic
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
@@ -35,6 +37,10 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 ## Installation
 
 See [CHANGELOG.md](CHANGELOG.md) for versioned methodology changes.
+Versioned source archives and the standalone benchmark script are available
+from [GitHub Releases](https://github.com/local-inference-lab/llm-inference-bench/releases).
+Use a source archive or repository checkout for the bundled datasets and
+fabric-diagnostic tools.
 
 ```bash
 pip install httpx rich psutil
