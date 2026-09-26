@@ -65,7 +65,7 @@ def test_estimate_grows_with_context():
     assert 500 < standard.estimate_seconds(big, STANDARD) < 3600
 
 
-@pytest.mark.parametrize("free,size", [([1500, 1600], 64), ([4000, 4000], 256), ([1100, 9000], 16), ([1000, 1000], None), ([90000], None)])
+@pytest.mark.parametrize("free,size", [([1065, 1065], 32), ([1500, 1600], 128), ([4000, 4000], 256), ([920, 9000], 16), ([880, 880], None), ([90000], None)])
 def test_p2p_buffer_size(free, size):
     assert standard.p2p_buffer_size(free)[0] == size
 
@@ -167,7 +167,8 @@ def test_pci_chain_walks_switch(tmp_path):
     assert chain[0]["host_bridge"] == "pci0000:00"
     assert chain[1]["switch_vendor"] == "Broadcom" and chain[-1]["role"] == "gpu"
     summary = inventory.link_summary(chain)
-    assert summary == {"hops": 4, "bridges": 3, "behind_switch": True, "min_current_gt_s": 16.0, "min_current_width": 16}
+    assert summary == {"hops": 4, "bridges": 3, "behind_switch": True, "switches": "Broadcom switch",
+                       "min_current_gt_s": 16.0, "min_current_width": 16}
     links = telemetry.read_links([h["bdf"] for h in chain], str(sys_root))
     assert links["0000:02:10.0"] == "16.0x16"
 
@@ -237,6 +238,12 @@ def test_analyze_power_capped_phase():
     assert gpu["sm_mhz"]["median"] == 2400 and gpu["sm_clock_drop_pct"] > 10
     assert gpu["power_to_limit_max"] == 1.0
     assert gpu["reason_share"]["sw_power_cap"] == 0.8
+
+
+def test_unknown_reason_bits_are_kept():
+    series = series_of([row(2800, 0x400)] * 5 + [row(2800)] * 5)
+    gpu = telemetry.analyze_phase(series, 1000.0, 1010.0, [{}])["gpus"][0]
+    assert gpu["reason_share"] == {"bit_0x400": 0.5} and gpu["verdict"] == "ok"
 
 
 def test_analyze_hw_slowdown_wins_and_idle_is_ignored():

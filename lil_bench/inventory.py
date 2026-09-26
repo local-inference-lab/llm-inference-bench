@@ -99,11 +99,15 @@ def link_summary(chain: list[dict]) -> dict:
     widths = [int(h["current_link_width"]) for h in chain
               if str(h.get("current_link_width", "")).isdigit() and int(h["current_link_width"]) > 0]
     bridges = [h for h in chain if h.get("role") == "bridge"]
+    vendors = sorted({h["switch_vendor"] for h in bridges if h.get("switch_vendor")})
     return {
         "hops": len(chain),
         "bridges": len(bridges),
         # A root port plus the switch upstream and downstream ports.
-        "behind_switch": len(bridges) >= 3 or any(h.get("switch_vendor") for h in bridges),
+        "behind_switch": len(bridges) >= 3 or bool(vendors),
+        "switches": " + ".join(f"{v} switch" for v in vendors),
+        # Idle links train down and switch-internal ports report nominal
+        # speeds, so these are a snapshot; telemetry samples links under load.
         "min_current_gt_s": min(speeds) if speeds else None,
         "min_current_width": min(widths) if widths else None,
     }

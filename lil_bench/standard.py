@@ -61,7 +61,7 @@ PROFILES = {
     },
 }
 P2P_SIZES_MIB = (256, 128, 64, 32, 16)
-P2P_OVERHEAD_MIB = 1024  # CUDA contexts plus NCCL buffers of the p2pmark process
+P2P_OVERHEAD_MIB = 850  # CUDA contexts plus NCCL buffers of the p2pmark process (measured ~780 MiB)
 
 
 class Output:
@@ -365,8 +365,13 @@ def run_p2pmark(out: Output, gpu_count: int) -> dict:
         p2pmark_timeout=300.0, p2pmark_detail=False,
     )
     from rich.console import Console
+    console = Console(force_terminal=out.color, width=120)
     try:
-        diagnostic = bench.run_p2pmark_diagnostic(args, Console(force_terminal=out.color, width=120))
+        diagnostic = bench.run_p2pmark_diagnostic(args, console)
+        if diagnostic.get("status") != "ok" and size > P2P_SIZES_MIB[-1]:
+            out.warn(f"p2pmark {diagnostic.get('status')} with {size} MiB buffers; retrying with {P2P_SIZES_MIB[-1]} MiB")
+            args.p2pmark_size_mb = size = P2P_SIZES_MIB[-1]
+            diagnostic = {**bench.run_p2pmark_diagnostic(args, console), "retried": True}
     except Exception as error:  # noqa: BLE001
         diagnostic = {"status": "error", "error": f"{type(error).__name__}: {error}"}
     if diagnostic.get("status") != "ok":
@@ -638,10 +643,12 @@ def command_run(out: Output, args) -> int:
         out.ok(f"{len(gpus)} × {gpus[0]['name'] if gpus else '?'} · "
                f"{hardware['cpu'].get('lscpu', {}).get('Model name', '?')} · "
                f"{(hardware['memory'].get('mem_total_mib') or 0) // 1024} GiB RAM")
-        for path in hardware["pcie"]["gpu_paths"].values():
-            s = path["summary"]
-            out.info(f"GPU {path['gpu']}: {s['hops']} PCIe hops{' behind a switch' if s['behind_switch'] else ''}, "
-                     f"narrowest {s['min_current_gt_s']} GT/s x{s['min_current_width']}")
+        for gpu in gpus:
+            path = hardware["pcie"]["gpu_paths"].get(gpu.get("bdf") or "", {})
+            s, pcie = path.get("summary") or {}, gpu.get("pcie") or {}
+            switch = f", {s['switches']}" if s.get("switches") else ""
+            out.info(f"GPU {gpu['index']} {gpu.get('bdf')}: PCIe Gen{pcie.get('max_gen')} x{pcie.get('max_width')}, "
+                     f"{s.get('bridges', '?')} bridges to the root port{switch}")
         for item in hardware.get("tuning", []):
             out.warn(f"GPU {item['gpu']}: {item['detail']}")
 

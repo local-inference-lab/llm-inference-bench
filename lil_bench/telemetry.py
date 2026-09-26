@@ -231,6 +231,10 @@ def analyze_phase(series: dict, start: float, end: float, limits: list[dict]) ->
         energy = pick("energy_j")
         busy = [r for r in reasons if not r & REASONS["gpu_idle"]]
         shares = {name: _share(reasons, bit) for name, bit in REASONS.items()}
+        known = sum(REASONS.values())
+        for bit in (1 << i for i in range(32)):
+            if not bit & known and any(r & bit for r in reasons):
+                shares[f"bit_0x{bit:x}"] = _share(reasons, bit)  # newer drivers add reasons
         drop = (median(head) - median(tail)) / median(head) if median(head) else 0.0
         if busy and _share(busy, HW_REASONS) > 0.05:
             verdict = "hw_slowdown"
