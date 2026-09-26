@@ -202,6 +202,32 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
 | `--skip-prefill` | | Skip prefill reporting entirely |
 
+## Standardized container benchmark (`lil-bench`)
+
+Karmic Kraken images ship this repository as `lil-bench`. With the model
+loaded and no other traffic, run it inside the serving container:
+
+```bash
+docker exec -it -e LIL_BENCH_TOKEN=lilb_... <container> lil-bench
+```
+
+Your identifier and the ready command are at
+<https://docker.local-inference-lab.ai/bench/token> (GitHub sign-in). The run
+takes about 15–30 minutes: hardware and PCIe inventory, p2pmark, prefill 32k
+and 128k, decode C1/C8/C16 at 0/64k/128k context, with GPU clocks, power and
+throttle reasons sampled throughout. The result is saved in the container at
+`/cache/lil-bench/<run>.json.gz` and uploaded to your private run list.
+
+```bash
+lil-bench --no-upload          # measure and save only
+lil-bench --profile quick      # a few minutes, to test the setup
+lil-bench upload /cache/lil-bench/<run>.json.gz
+lil-bench inventory            # print the hardware/topology record
+```
+
+Without the image, run it from a checkout inside the container:
+`python3 -m lil_bench` (needs `httpx`, `rich`, and `pynvml`).
+
 ## Measurement Methodology
 
 ### Prefill

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.7.0 - 2026-09-26
+
+### Standardized container benchmark with upload (`lil-bench`)
+
+- New `lil_bench` package and `lil-bench` launcher. Run inside a Karmic Kraken
+  container (`docker exec -it -e LIL_BENCH_TOKEN=lilb_… <container> lil-bench`),
+  it reads the exact vLLM command line and serving environment from `/proc`,
+  identifies the image by its runtime manifest, and refuses to start while the
+  server has other requests.
+- Standard matrix `standard/1`: p2pmark with buffers that fit next to the
+  loaded model (else skipped with the reason), standalone prefill at 32k and
+  128k, decode at C1/C8/C16 with 0, 64k and 128k context. Cells beyond
+  max_model_len, `--max-num-seqs` or the KV cache are skipped and listed.
+- Records GPUs (part number, VBIOS, power and clock limits, clock offsets),
+  the PCIe path of every GPU (root port, switch ports, link speed and width,
+  sampled again under load), CPU, memory and board, without serial numbers.
+- Samples every GPU twice a second through NVML: SM/memory clocks, power,
+  temperature, utilization, PCIe link, and clocks event (throttle) reasons.
+  Each phase gets a verdict (ok, power capped, thermal, hardware slowdown);
+  clocks above the rated maximum are reported.
+- Saves the result to `/cache/lil-bench` and uploads it to
+  docker.local-inference-lab.ai (identifier from `/bench/token`); without an
+  identifier it stops with instructions before measuring. `lil-bench upload`
+  retries a saved result; `--no-upload` measures locally; `--profile quick`
+  tests the setup in a few minutes.
+- `llm_decode_bench.py`: `LLM_BENCH_EVENT_FILE` receives every event line
+  with its wall-clock time plus a `cell end` event, so external tools can align
+  telemetry with phases; `LLM_BENCH_NO_UPDATE_CHECK=1` skips the self-update
+  prompt for pinned copies.
+
 ## 0.6.2 - 2026-09-06
 
 ### Tagged release of guarded decode measurements
