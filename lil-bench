@@ -1,0 +1,5 @@
+#!/bin/sh
+# Standardized benchmark of the Karmic Kraken container this runs in.
+# Usage inside the container: LIL_BENCH_TOKEN=lilb_... lil-bench [--help]
+here=$(dirname "$(readlink -f "$0")")
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m lil_bench "$@"

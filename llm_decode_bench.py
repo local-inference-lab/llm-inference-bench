@@ -63,7 +63,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -5174,6 +5174,23 @@ def add_event(state: TUIState, message: str) -> None:
     state.events.append(f"{ts} {message}")
     if len(state.events) > 80:
         state.events = state.events[-80:]
+    emit_external_event(message)
+
+
+def emit_external_event(message: str) -> None:
+    """Append one event to $LLM_BENCH_EVENT_FILE for an external orchestrator.
+
+    lil-bench aligns its GPU telemetry with benchmark phases from these
+    lines (JSON: wall-clock time and the event text).
+    """
+    path = os.environ.get("LLM_BENCH_EVENT_FILE")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": time.time(), "event": message}) + "\n")
+    except OSError:
+        pass
 
 
 def snapshot_partial_prefill(state: TUIState) -> None:
@@ -12532,6 +12549,18 @@ def render_completion_stats_display(state: dict) -> Panel:
     )
 
 
+_run_one_cell_measured = run_one_cell
+
+
+async def run_one_cell(*args, **kwargs) -> CellResult:
+    result = await _run_one_cell_measured(*args, **kwargs)
+    emit_external_event(
+        f"cell end C={result.concurrency} ctx={format_context(result.context_tokens)} "
+        f"tps={result.aggregate_tps:.1f}"
+    )
+    return result
+
+
 async def run_completion_stats_batch(
     *,
     client: httpx.AsyncClient,
@@ -16611,6 +16640,8 @@ def cli_option_present(*names: str) -> bool:
 
 def check_for_update(console: Console) -> bool:
     """Check GitHub for newer version. Returns True if user chose to upgrade and re-exec."""
+    if os.environ.get("LLM_BENCH_NO_UPDATE_CHECK") == "1":
+        return False  # pinned copies (lil-bench in the docker image) never self-update
     try:
         import urllib.request
         req = urllib.request.Request(GITHUB_RAW_URL, method="GET")
