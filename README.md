@@ -208,8 +208,13 @@ Karmic Kraken images ship this repository as `lil-bench`. With the model
 loaded and no other traffic, run it inside the serving container:
 
 ```bash
-docker exec -it -e LIL_BENCH_TOKEN=lilb_... <container> lil-bench
+docker exec --privileged -it -e LIL_BENCH_TOKEN=lilb_... <container> lil-bench
 ```
+
+`--privileged` applies only to the benchmark process. It lets `lil-bench` read
+the PCIe ACS settings of the GPUs' root ports and switches (whether
+peer-to-peer traffic is redirected through the CPU); without it everything
+else is measured and ACS is reported as unknown.
 
 Your identifier and the ready command are at
 <https://docker.local-inference-lab.ai/bench/token> (GitHub sign-in). The run

@@ -113,17 +113,60 @@ def link_summary(chain: list[dict]) -> dict:
     }
 
 
+ACS_BITS = ("SrcValid", "TransBlk", "ReqRedir", "CmpltRedir", "UpstreamFwd", "EgressCtrl", "DirectTrans")
+# With these ACS controls on, peer-to-peer requests are redirected up to the
+# root complex instead of being routed inside the switch.
+ACS_REDIRECT = ("ReqRedir", "CmpltRedir", "EgressCtrl")
+
+
+def parse_acs(line: str) -> dict:
+    """``ACSCtl: SrcValid- TransBlk+ …`` → {"SrcValid": False, "TransBlk": True, …}."""
+    return {name: sign == "+" for name, sign in re.findall(r"(\w+)([+-])", line.split(":", 1)[1] if ":" in line else line)
+            if name in ACS_BITS}
+
+
 def lspci_detail(bdfs: list[str]) -> dict:
-    """Link, ACS and ATS lines of ``lspci -vvv`` (root in a container, else partial)."""
+    """Link, ACS and ATS lines of ``lspci -vvv`` for every hop.
+
+    Extended capabilities are readable only with CAP_SYS_ADMIN, which
+    ``docker exec --privileged`` grants; otherwise lspci reports
+    "<access denied>" and ACS stays unknown.
+    """
     detail = {}
     if shutil.which("lspci") is None:
         return detail
     for bdf in bdfs:
         result = run(["lspci", "-vvv", "-s", bdf], timeout=10)
-        lines = [line.strip() for line in result.get("stdout", "").splitlines() if LSPCI_KEEP.match(line)]
-        head = result.get("stdout", "").splitlines()[:1]
-        detail[bdf] = {"name": head[0] if head else "", "lines": lines}
+        output = result.get("stdout", "")
+        lines = [line.strip() for line in output.splitlines() if LSPCI_KEEP.match(line)]
+        head = output.splitlines()[:1]
+        item = {"name": head[0] if head else "", "lines": lines,
+                "readable": bool(output) and "<access denied>" not in output}
+        for line in lines:
+            if line.startswith("ACSCap:"):
+                item["acs_cap"] = parse_acs(line)
+            elif line.startswith("ACSCtl:"):
+                item["acs_ctl"] = parse_acs(line)
+        if "acs_ctl" in item:
+            item["acs_redirect"] = [bit for bit in ACS_REDIRECT if item["acs_ctl"].get(bit)]
+        detail[bdf] = item
     return detail
+
+
+def acs_summary(detail: dict) -> dict:
+    """Whether ACS could be read and which hops redirect peer-to-peer traffic."""
+    readable = [bdf for bdf, item in detail.items() if item.get("readable")]
+    return {
+        "readable": bool(detail) and len(readable) == len(detail),
+        "unreadable": sorted(set(detail) - set(readable)),
+        "hops_with_acs": sorted(bdf for bdf, item in detail.items() if "acs_ctl" in item),
+        "redirect": {bdf: item["acs_redirect"] for bdf, item in detail.items() if item.get("acs_redirect")},
+    }
+
+
+def iommu_group(bdf: str, sys_root: str = "/sys") -> str | None:
+    link = Path(sys_root, "bus/pci/devices", bdf, "iommu_group")
+    return os.path.basename(os.path.realpath(link)) if link.exists() else None
 
 
 def nvml_gpus() -> dict:
@@ -331,6 +374,9 @@ def collect(sys_root: str = "/sys", proc_root: str = "/proc") -> dict:
         topology[gpu["bdf"]] = {"gpu": gpu["index"], "chain": chain, "summary": link_summary(chain)}
         all_hops.extend(h["bdf"] for h in chain)
     unique_hops = list(dict.fromkeys(all_hops))
+    detail = lspci_detail(unique_hops)
+    for path in topology.values():
+        path["iommu_groups"] = {hop["bdf"]: iommu_group(hop["bdf"], sys_root) for hop in path["chain"]}
     return {
         "gpus": gpus,
         "nvml_system": nvml.get("system"),
@@ -338,7 +384,8 @@ def collect(sys_root: str = "/sys", proc_root: str = "/proc") -> dict:
         "tuning": tuning_indicators(gpus),
         "pcie": {
             "gpu_paths": topology,
-            "lspci_detail": lspci_detail(unique_hops),
+            "lspci_detail": detail,
+            "acs": acs_summary(detail),
             "lspci_tree": run(["lspci", "-tv"]).get("stdout"),
             "nvidia_smi_topo": run(["nvidia-smi", "topo", "-m"]).get("stdout"),
             "nvidia_smi_p2p_read": run(["nvidia-smi", "topo", "-p2p", "r"]).get("stdout"),
