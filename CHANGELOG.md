@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.2 - 2026-09-27
+
+### lil-bench 1.2: flags modified images
+
+- Before measuring, lil-bench re-hashes every code file of the container (the
+  venv, torch, triton, the LIL launcher and bench) and compares it with the
+  manifest the image build recorded (`runtime-files.json.gz`). It reports
+  changed, added and removed files (with the text of changed sources), bind
+  mounts over the code, foreign `PYTHONPATH`/`LD_PRELOAD`-style hooks in the
+  server process, package version changes, and whether a file changed after
+  the server started. The run continues and the result is flagged; the site
+  verifies the manifest hash against the release and shows diffs.
+
 ## 0.7.1 - 2026-09-27
 
 ### lil-bench 1.1: server, host and PCIe traffic over time
