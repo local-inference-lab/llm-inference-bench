@@ -624,6 +624,8 @@ def command_run(out: Output, args) -> int:
 
     started = datetime.now(timezone.utc)
     recorder = telemetry.Recorder(interval=0.5).start()
+    server_recorder = telemetry.ServerRecorder(base_url, recorder.t0).start()
+    pcie_recorder = telemetry.PcieRecorder(recorder.t0).start()
     workdir = result_dir()
     run_id = str(uuid.uuid4())
     phases: list[dict] = []
@@ -698,11 +700,16 @@ def command_run(out: Output, args) -> int:
         out.warn("interrupted; the partial result is saved but not uploaded")
     finally:
         recorder.stop()
+        server_recorder.stop()
+        pcie_recorder.stop()
 
     series = recorder.series()
     limits_per_gpu = [g.get("power", {}) for g in (hardware.get("gpus") or [])]
+    pcie_series = pcie_recorder.series()
     for phase in phases:
         phase["analysis"] = telemetry.analyze_phase(series, phase["measure_start"], phase["end"], limits_per_gpu)
+        for gpu, rates in zip(phase["analysis"]["gpus"], telemetry.pcie_rates(pcie_series, phase["measure_start"], phase["end"])):
+            gpu["pcie_gbps"] = rates
     document = {
         "schema": SCHEMA,
         "standard": STANDARD,
@@ -725,6 +732,8 @@ def command_run(out: Output, args) -> int:
                     "bench_log_tail": bench_log_tail},
         "phases": phases,
         "telemetry": series,
+        "server_telemetry": server_recorder.series(),
+        "pcie_telemetry": pcie_series,
         "analysis": {"overclock": telemetry.overclock_signals(series, hardware.get("gpus") or [])},
     }
     document["summary"] = summarize(document)
