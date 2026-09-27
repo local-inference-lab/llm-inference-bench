@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import DEFAULT_SITE, SCHEMA, STANDARD, TOKEN_URL_PATH, VERSION
-from . import inventory, server, telemetry, upload
+from . import integrity, inventory, server, telemetry, upload
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "llm_decode_bench.py"
@@ -445,7 +445,10 @@ def summarize(document: dict) -> dict:
         })
     verdicts = [p["analysis"]["verdict"] for p in document.get("phases", []) if "analysis" in p]
     order = ["no_data", "ok", "power_capped", "thermal", "hw_slowdown"]
+    code = document.get("integrity") or {}
     return {
+        "integrity": {"status": code.get("status"), "changed": code.get("changed_count", 0),
+                      "added": code.get("added_count", 0), "removed": code.get("removed_count", 0)},
         "prefill": prefill,
         "decode": decode,
         "throttle_verdict": max(verdicts, key=order.index) if verdicts else "no_data",
@@ -595,6 +598,18 @@ def command_run(out: Output, args) -> int:
            f"max-num-seqs {limits['max_num_seqs']} ({limits['max_num_seqs_source']}) · KV {kv_tokens:,} tokens")
     image = server.image_identity()
     out.ok(f"image {image.get('alias') or 'unknown'} · assembly {(image.get('assembly_sha256') or '?')[:16]}")
+    code = integrity.check(process["pid"] if process else None)
+    if code["status"] == "stock":
+        out.ok(f"image code matches its build ({code['files_checked']:,} files, {code['scan_seconds']} s)")
+    elif code["status"] == "modified":
+        out.error_panel("MODIFIED IMAGE: the result will be flagged", [
+            "Files differ from this image's build; the benchmark still runs and records what changed:",
+            *["  " + line for line in integrity.summary_lines(code)],
+            *([f"  … {code['changed_count'] + code['added_count'] + code['removed_count']} files in total"]
+              if code['changed_count'] + code['added_count'] + code['removed_count'] > 12 else []),
+        ])
+    else:
+        out.warn(f"image code not verified: {code.get('reason')}")
 
     busy = 0.0
     for _ in range(profile["idle_check_s"]):
@@ -722,6 +737,7 @@ def command_run(out: Output, args) -> int:
                    "uploader": (identity or {}).get("login"), "note": args.note[:500],
                    "allow_busy": bool(busy and args.allow_busy)},
         "image": image,
+        "integrity": code,
         "server": {"pid": process and process["pid"], "argv": process and process["argv"],
                    "environment": server.filtered_environment(process["pid"]) if process else {},
                    "model": serve.get("model"), "options": serve["options"], "limits": limits, "api": state,

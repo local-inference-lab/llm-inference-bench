@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -559,3 +561,87 @@ def test_server_recorder_samples_metrics_and_cpu(tmp_path):
     assert series["metrics"]["vllm:num_requests_running"] == [8.0, None]
     assert series["host"]["cpu_pct"][0] == 50.0  # 200 busy of 400 jiffies
     assert series["host"]["cpu_temp_c"] == [71.5, 71.5] and series["errors"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Image integrity
+# ---------------------------------------------------------------------------
+
+from lil_bench import integrity  # noqa: E402
+
+
+def make_reference(tmp_path):
+    site = tmp_path / "venv/lib/python3.12/site-packages"
+    (site / "vllm").mkdir(parents=True)
+    (site / "b12x").mkdir()
+    (site / "vllm/model.py").write_text("def forward():\n    return 1\n")
+    (site / "vllm/_C.so").write_bytes(b"\0\1\2binary")
+    (site / "b12x/kernel.py").write_text("SPEED = 1\n")
+    roots = [str(site)]
+    files = integrity.scan(roots)
+    ref = tmp_path / "runtime-files.json.gz"
+    ref.write_bytes(gzip.compress(json.dumps({"schema": "lil-runtime-files/1", "roots": roots, "files": files,
+                                              "packages": {}}).encode()))
+    return site, ref
+
+
+def proc_without_mounts(tmp_path, extra=""):
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self/mountinfo").write_text("22 1 0:21 / / rw - overlay overlay rw\n" + extra)
+    return proc
+
+
+def test_integrity_stock_image(tmp_path):
+    site, ref = make_reference(tmp_path)
+    (site / "vllm/__pycache__").mkdir()
+    (site / "vllm/__pycache__/model.cpython-312.pyc").write_bytes(b"cache")
+    result = integrity.check(None, str(ref), str(proc_without_mounts(tmp_path)), user_site=str(tmp_path / "none"))
+    assert result["status"] == "stock" and result["files_checked"] == 3
+    assert result["reference"]["sha256"] == hashlib.sha256(ref.read_bytes()).hexdigest()
+
+
+def test_integrity_reports_changes_with_content(tmp_path):
+    site, ref = make_reference(tmp_path)
+    (site / "vllm/model.py").write_text("def forward():\n    return 2  # faster!\n")
+    (site / "b12x/kernel.py").unlink()
+    (site / "vllm/patch.py").write_text("import vllm\n")
+    (site / "vllm/_C.so").write_bytes(b"other binary")
+    proc = proc_without_mounts(tmp_path, "90 22 0:50 /patched /opt/venv/lib/python3.12/site-packages/vllm/model.py ro - ext4 /dev/md1 rw\n")
+    result = integrity.check(None, str(ref), str(proc), user_site=str(tmp_path / "none"))
+    assert result["status"] == "modified"
+    changed = {Path(c["path"]).name: c for c in result["changed"]}
+    assert changed["model.py"]["content"].endswith("return 2  # faster!\n") and "content" not in changed["_C.so"]
+    assert changed["model.py"]["expected_sha256"] != changed["model.py"]["sha256"]
+    assert [Path(a["path"]).name for a in result["added"]] == ["patch.py"]
+    assert [Path(r["path"]).name for r in result["removed"]] == ["kernel.py"]
+    assert result["mounts"][0]["mount_point"].endswith("vllm/model.py")
+    lines = integrity.summary_lines(result)
+    assert any(line.startswith("changed:") for line in lines) and any("mounted over" in line for line in lines)
+
+
+def test_integrity_hooks_and_missing_reference(tmp_path):
+    proc = proc_without_mounts(tmp_path)
+    (proc / "7").mkdir()
+    (proc / "7/environ").write_bytes(b"PATH=/usr/bin\0PYTHONPATH=/work/overlay\0LD_PRELOAD=/x.so\0")
+    assert integrity.hooks(7, str(proc)) == {"PYTHONPATH": "/work/overlay", "LD_PRELOAD": "/x.so"}
+    result = integrity.check(7, str(tmp_path / "missing.json.gz"), str(proc))
+    assert result["status"] == "unverified" and result["hooks"]["LD_PRELOAD"] == "/x.so"
+
+
+def test_integrity_marks_edits_after_server_start(tmp_path, monkeypatch):
+    site, ref = make_reference(tmp_path)
+    monkeypatch.setattr(integrity, "process_start", lambda pid, proc_root="/proc": time.time() - 60)
+    (site / "vllm/model.py").write_text("changed later\n")
+    result = integrity.check(1, str(ref), str(proc_without_mounts(tmp_path)), user_site=str(tmp_path / "none"))
+    assert result["changed"][0]["after_server_start"] is True
+
+
+def test_hooks_into_the_verified_image_are_allowed(tmp_path):
+    site, ref = make_reference(tmp_path)
+    proc = proc_without_mounts(tmp_path)
+    (proc / "9").mkdir()
+    (proc / "9/environ").write_bytes(f"LD_PRELOAD={site / 'vllm/_C.so'}\0PYTHONPATH={site}:/work/overlay\0".encode())
+    result = integrity.check(9, str(ref), str(proc), user_site=str(tmp_path / "none"))
+    assert result["hooks_verified"] == {"LD_PRELOAD": str(site / "vllm/_C.so")}
+    assert result["hooks"] == {"PYTHONPATH": f"{site}:/work/overlay"} and result["status"] == "modified"
