@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.1 - 2026-09-27
+
+### lil-bench 1.1: server, host and PCIe traffic over time
+
+- lil-bench samples vLLM's Prometheus counters every second (generated and
+  prompt tokens, running and waiting requests, KV cache usage, speculative
+  acceptance, preemptions, prefix cache) and the host CPU load and temperature,
+  stored as `server_telemetry`.
+- PCIe traffic per GPU comes from `nvidia-smi dmon -s t` (MB/s, one value per
+  second) as `pcie_telemetry`; each phase reports mean and peak rx/tx GB/s.
+  NVML's PCIe byte counters are 32-bit and wrap within one sample at GB/s,
+  so they are not used; the NVML replay, correctable-error and recovery
+  counters are sampled and each phase reports their increase.
+
 ## 0.7.0 - 2026-09-26
 
 ### Standardized container benchmark with upload (`lil-bench`)

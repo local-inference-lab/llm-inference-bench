@@ -220,6 +220,12 @@ def row(sm, reasons=0, power=3000, temp=60):
             "energy_j": 100, "mem_used_mib": 90000, "fan_pct": None}
 
 
+def with_errors(rows):
+    for i, r in enumerate(rows):
+        r.update(pcie_replay=0 if i < 5 else 3, pcie_corr_err=0, pcie_recovery=0)
+    return rows
+
+
 def series_of(rows, interval=0.5):
     recorder = telemetry.Recorder(interval=interval, source=FakeSource([[r] for r in rows]))
     recorder.t0 = 1000.0
@@ -498,3 +504,58 @@ def test_busy_server_is_refused(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(standard.time, "sleep", lambda s: None)
     code, out = run_main(["run", "--no-upload"], monkeypatch, capsys)
     assert code == standard.EXIT_SERVER and "The server is busy" in out
+
+
+def test_phase_pcie_errors():
+    series = series_of(with_errors([row(2800) for _ in range(20)]))
+    gpu = telemetry.analyze_phase(series, 1000.0, 1010.0, [{}])["gpus"][0]
+    assert gpu["pcie_errors"] == {"pcie_replay": 3}
+
+
+def test_pcie_recorder_parses_dmon_rounds():
+    recorder = telemetry.PcieRecorder(t0=100.0)
+    lines = ["# gpu  rxpci  txpci", "# Idx   MB/s   MB/s", "    0   1200   1300", "    1   1100   1000",
+             "    0   9000   9100", "    1   8000   8100", "    0      -      -", "    1      5      6"]
+    for k, line in enumerate(lines):
+        recorder.feed(line, 100.0 + k // 2)
+    series = recorder.series()
+    assert series["t_ms"] == [1000, 2000, 3000]
+    assert series["gpus"][0] == {"rx_mbs": [1200.0, 9000.0, None], "tx_mbs": [1300.0, 9100.0, None]}
+    assert series["gpus"][1]["rx_mbs"] == [1100.0, 8000.0, 5.0]
+    rates = telemetry.pcie_rates(series, 100.5, 102.5)
+    assert rates[0] == {"rx": 5.1, "rx_peak": 9.0, "tx": 5.2, "tx_peak": 9.1}
+
+
+def test_pcie_recorder_without_nvidia_smi():
+    recorder = telemetry.PcieRecorder(0.0, command=["definitely-not-installed"]).start()
+    recorder.stop()
+    assert recorder.series()["error"] == "definitely-not-installed not found"
+
+
+def test_server_recorder_samples_metrics_and_cpu(tmp_path):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    stats = iter(["cpu 100 0 100 800 0 0 0 0 0 0\n", "cpu 200 0 200 1000 0 0 0 0 0 0\n"])
+    (proc / "stat").write_text(next(stats))
+    hwmon = tmp_path / "sys/class/hwmon/hwmon0"
+    hwmon.mkdir(parents=True)
+    (hwmon / "name").write_text("k10temp\n")
+    (hwmon / "temp1_input").write_text("71500\n")
+    (hwmon / "temp3_input").write_text("64000\n")
+    pages = iter(["vllm:generation_tokens_total{engine=\"0\"} 100\nvllm:generation_tokens_total{engine=\"1\"} 50\n"
+                  "vllm:num_requests_running{engine=\"0\"} 8\n", RuntimeError("down")])
+
+    def fetch():
+        page = next(pages)
+        if isinstance(page, Exception):
+            raise page
+        return page
+    recorder = telemetry.ServerRecorder("http://x", 0.0, fetch=fetch, proc_root=str(proc), sys_root=str(tmp_path / "sys"))
+    (proc / "stat").write_text(next(stats))
+    recorder.record_once()
+    recorder.record_once()
+    series = recorder.series()
+    assert series["metrics"]["vllm:generation_tokens_total"] == [150.0, None]
+    assert series["metrics"]["vllm:num_requests_running"] == [8.0, None]
+    assert series["host"]["cpu_pct"][0] == 50.0  # 200 busy of 400 jiffies
+    assert series["host"]["cpu_temp_c"] == [71.5, 71.5] and series["errors"] == 1

@@ -14,7 +14,15 @@ import time
 from statistics import median
 
 FIELDS = ("sm_mhz", "mem_mhz", "gr_mhz", "power_dw", "temp_c", "util_pct", "mem_util_pct",
-          "reasons", "pcie_gen", "pcie_width", "pstate", "energy_j", "mem_used_mib", "fan_pct")
+          "reasons", "pcie_gen", "pcie_width", "pstate", "energy_j", "mem_used_mib", "fan_pct",
+          "pcie_replay", "pcie_corr_err", "pcie_recovery")
+# Cumulative NVML link error counters. (The PCIe byte counters are 32-bit
+# and wrap within one sample at GB/s, so traffic comes from nvidia-smi dmon.)
+PCIE_FIELDS = (
+    ("pcie_replay", "NVML_FI_DEV_PCIE_REPLAY_COUNTER"),
+    ("pcie_corr_err", "NVML_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS"),
+    ("pcie_recovery", "NVML_FI_DEV_PCIE_L0_TO_RECOVERY_COUNTER"),
+)
 # NVML clocks event (throttle) reason bits.
 REASONS = {
     "gpu_idle": 0x1,
@@ -43,6 +51,16 @@ class NvmlSource:
         self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
         reasons = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None)
         self.reasons = reasons or pynvml.nvmlDeviceGetCurrentClocksThrottleReasons
+        self.pcie_fields = [(name, getattr(pynvml, const)) for name, const in PCIE_FIELDS if hasattr(pynvml, const)]
+
+    def _counters(self, handle) -> dict:
+        if not self.pcie_fields:
+            return {}
+        values = self._get(self.nvml.nvmlDeviceGetFieldValues, handle, [fid for _, fid in self.pcie_fields])
+        if not values:
+            return {}
+        return {name: (value.value.ullVal if value.nvmlReturn == 0 else None)
+                for (name, _), value in zip(self.pcie_fields, values)}
 
     def _get(self, fn, *args):
         try:
@@ -73,6 +91,7 @@ class NvmlSource:
                 "energy_j": round(energy / 1000) if energy is not None else None,
                 "mem_used_mib": memory.used // 2**20 if memory is not None else None,
                 "fan_pct": self._get(n.nvmlDeviceGetFanSpeed, handle),
+                **self._counters(handle),
             })
         return rows
 
@@ -198,6 +217,7 @@ class Recorder:
             "fields": {"power_dw": "deciwatts", "energy_j": "cumulative joules", "reasons": "NVML clocks event reasons bitmask"},
             "errors": self.errors,
             "pcie_links": self.links,
+            "counters": {"pcie_replay": "cumulative", "pcie_corr_err": "cumulative", "pcie_recovery": "cumulative"},
         }
 
 
@@ -245,6 +265,9 @@ def analyze_phase(series: dict, start: float, end: float, limits: list[dict]) ->
         else:
             verdict = "ok"
         verdicts.append(verdict)
+        def delta(field):
+            values = [v for v in (columns.get(field) or [])[indexes[0]: indexes[-1] + 1] if v is not None]
+            return values[-1] - values[0] if len(values) > 1 else None
         result["gpus"].append({
             "gpu": gpu_index,
             "samples": len(sm),
@@ -258,6 +281,8 @@ def analyze_phase(series: dict, start: float, end: float, limits: list[dict]) ->
             "pcie": {"gen_min": min(pick("pcie_gen"), default=None), "width_min": min(pick("pcie_width"), default=None)},
             "energy_j": energy[-1] - energy[0] if len(energy) > 1 else None,
             "reason_share": {k: v for k, v in shares.items() if v},
+            "pcie_errors": {k: delta(k) for k in ("pcie_replay", "pcie_corr_err", "pcie_recovery")
+                            if delta(k)},
             "verdict": verdict,
         })
     order = ["ok", "power_capped", "thermal", "hw_slowdown"]
@@ -282,3 +307,210 @@ def overclock_signals(series: dict, gpus: list[dict]) -> list[dict]:
             findings.append({"gpu": gpu_index, "kind": "mem_clock_above_rated",
                              "detail": f"observed {mem_observed} MHz > rated {mem_rated} MHz"})
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Server and host: vLLM Prometheus counters and CPU load, once per second
+# ---------------------------------------------------------------------------
+
+SERVER_METRICS = (
+    "vllm:generation_tokens_total", "vllm:prompt_tokens_total", "vllm:prompt_tokens_cached_total",
+    "vllm:num_requests_running", "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc",
+    "vllm:num_preemptions_total", "vllm:spec_decode_num_accepted_tokens_total",
+    "vllm:spec_decode_num_draft_tokens_total", "vllm:spec_decode_num_drafts_total",
+    "vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total", "vllm:request_success_total",
+)
+
+
+def cpu_times(proc_root: str = "/proc") -> tuple[int, int] | None:
+    try:
+        with open(f"{proc_root}/stat") as handle:
+            fields = [int(v) for v in handle.readline().split()[1:]]
+    except (OSError, ValueError):
+        return None
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+    return sum(fields), idle
+
+
+def cpu_temperature(sys_root: str = "/sys") -> float | None:
+    """Hottest CPU package/die sensor (k10temp, coretemp, zenpower)."""
+    import glob
+    import os
+    hottest = None
+    for hwmon in glob.glob(f"{sys_root}/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(hwmon, "name")) as handle:
+                name = handle.read().strip().lower()
+        except OSError:
+            continue
+        if not any(chip in name for chip in ("k10temp", "coretemp", "zenpower")):
+            continue
+        for path in glob.glob(os.path.join(hwmon, "temp*_input")):
+            try:
+                with open(path) as handle:
+                    value = int(handle.read().strip()) / 1000
+            except (OSError, ValueError):
+                continue
+            hottest = value if hottest is None else max(hottest, value)
+    return hottest
+
+
+class ServerRecorder:
+    """Samples vLLM /metrics counters and host CPU load in the background."""
+
+    def __init__(self, base_url: str, t0: float, interval: float = 1.0, fetch=None,
+                 proc_root: str = "/proc", sys_root: str = "/sys"):
+        from . import server
+        self.url = f"{base_url}/metrics"
+        self.t0 = t0
+        self.interval = interval
+        self.fetch = fetch or (lambda: server.http_text(self.url, timeout=5))
+        self.parse = server.parse_metrics
+        self.proc_root, self.sys_root = proc_root, sys_root
+        self.times: list[int] = []
+        self.metrics: dict[str, list] = {name: [] for name in SERVER_METRICS}
+        self.cpu_pct: list = []
+        self.cpu_temp_c: list = []
+        self.errors = 0
+        self._last_cpu = cpu_times(proc_root)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="lil-bench-server", daemon=True)
+
+    def start(self) -> "ServerRecorder":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        next_at = time.monotonic()
+        while not self._stop.is_set():
+            self.record_once()
+            next_at += self.interval
+            self._stop.wait(max(0.0, next_at - time.monotonic()))
+
+    def record_once(self) -> None:
+        now = time.time()
+        try:
+            samples = self.parse(self.fetch())
+        except Exception:  # noqa: BLE001 - a missed scrape is not fatal
+            self.errors += 1
+            samples = None
+        totals: dict[str, float] = {}
+        for name, _, value in samples or []:
+            if name in self.metrics:
+                totals[name] = totals.get(name, 0.0) + value
+        self.times.append(round((now - self.t0) * 1000))
+        for name, values in self.metrics.items():
+            value = totals.get(name) if samples is not None else None
+            values.append(round(value, 4) if value is not None else None)
+        current = cpu_times(self.proc_root)
+        if current and self._last_cpu and current[0] > self._last_cpu[0]:
+            total, idle = current[0] - self._last_cpu[0], current[1] - self._last_cpu[1]
+            self.cpu_pct.append(round(100 * (total - idle) / total, 1))
+        else:
+            self.cpu_pct.append(None)
+        self._last_cpu = current
+        temperature = cpu_temperature(self.sys_root)
+        self.cpu_temp_c.append(round(temperature, 1) if temperature is not None else None)
+
+    def series(self) -> dict:
+        return {"interval_s": self.interval, "t0": self.t0, "t_ms": self.times, "metrics": self.metrics,
+                "host": {"cpu_pct": self.cpu_pct, "cpu_temp_c": self.cpu_temp_c}, "errors": self.errors,
+                "fields": {"metrics": "vLLM Prometheus values summed over label sets; *_total are cumulative"}}
+
+
+# ---------------------------------------------------------------------------
+# PCIe traffic: nvidia-smi dmon, MB/s per GPU averaged over each second
+# ---------------------------------------------------------------------------
+
+class PcieRecorder:
+    """Streams ``nvidia-smi dmon -s t`` (rx/tx MB/s per GPU, 1 s windows)."""
+
+    def __init__(self, t0: float, command=None):
+        self.t0 = t0
+        self.command = command or ["nvidia-smi", "dmon", "-s", "t", "-d", "1"]
+        self.times: list[int] = []
+        self.gpus: dict[int, dict[str, list]] = {}
+        self.error = None
+        self.proc = None
+        self._last_index = None
+        self._thread = threading.Thread(target=self._run, name="lil-bench-pcie", daemon=True)
+
+    def start(self) -> "PcieRecorder":
+        if shutil.which(self.command[0]) is None:
+            self.error = f"{self.command[0]} not found"
+            return self
+        try:
+            self.proc = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError as error:
+            self.error = str(error)
+            return self
+        self._thread.start()
+        return self
+
+    def feed(self, line: str, now: float) -> None:
+        parts = line.split()
+        if len(parts) < 3 or line.lstrip().startswith("#"):
+            return
+        try:
+            index = int(parts[0])
+        except ValueError:
+            return
+
+        def number(text):
+            try:
+                return float(text)
+            except ValueError:
+                return None  # "-" when the driver has no sample
+        # dmon prints one line per GPU per second; a new second starts when the index does not increase.
+        if self._last_index is None or index <= self._last_index:
+            self.times.append(round((now - self.t0) * 1000))
+        self._last_index = index
+        gpu = self.gpus.setdefault(index, {"rx_mbs": [], "tx_mbs": []})
+        missing = len(self.times) - 1 - len(gpu["rx_mbs"])
+        gpu["rx_mbs"].extend([None] * missing)
+        gpu["tx_mbs"].extend([None] * missing)
+        gpu["rx_mbs"].append(number(parts[1]))
+        gpu["tx_mbs"].append(number(parts[2]))
+
+    def _run(self) -> None:
+        for line in self.proc.stdout:
+            self.feed(line, time.time())
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def series(self) -> dict:
+        n = len(self.times)
+        gpus = []
+        for index in sorted(self.gpus):
+            gpu = self.gpus[index]
+            gpus.append({key: (values + [None] * (n - len(values)))[:n] for key, values in gpu.items()})
+        return {"source": "nvidia-smi dmon -s t", "interval_s": 1.0, "t0": self.t0, "t_ms": self.times,
+                "gpus": gpus, "units": "MB/s", "error": self.error}
+
+
+def pcie_rates(series: dict, start: float, end: float) -> list[dict]:
+    """Mean and peak rx/tx GB/s of every GPU inside a phase."""
+    t0 = series.get("t0") or 0
+    idx = [i for i, t in enumerate(series.get("t_ms") or []) if start <= t0 + t / 1000 <= end]
+    out = []
+    for gpu in series.get("gpus") or []:
+        row = {}
+        for key in ("rx_mbs", "tx_mbs"):
+            values = [gpu[key][i] for i in idx if gpu[key][i] is not None]
+            name = key[:2]
+            row[name] = round(sum(values) / len(values) / 1000, 3) if values else None
+            row[f"{name}_peak"] = round(max(values) / 1000, 3) if values else None
+        out.append(row)
+    return out
