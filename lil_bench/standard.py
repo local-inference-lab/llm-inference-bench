@@ -2,7 +2,7 @@
 
 Run it in the serving container itself::
 
-    docker exec -it -e LIL_BENCH_TOKEN=lilb_... <container> lil-bench
+    docker exec --privileged -it -e LIL_BENCH_TOKEN=lilb_... <container> lil-bench
 
 It checks the uploader identity, reads the exact serving command from
 ``/proc``, records hardware and PCIe topology, runs p2pmark, the standard
@@ -503,7 +503,7 @@ def no_token(out: Output, site: str, reason: str) -> int:
         "Results are uploaded under your GitHub account; the container needs your identifier.",
         f"1. Open {site}{TOKEN_URL_PATH} and sign in with GitHub.",
         "2. Run the command shown there, for example:",
-        "     docker exec -it -e LIL_BENCH_TOKEN=lilb_… <container> lil-bench",
+        "     docker exec --privileged -it -e LIL_BENCH_TOKEN=lilb_… <container> lil-bench",
         "To measure without uploading: lil-bench --no-upload",
     ])
     return EXIT_NO_TOKEN
@@ -574,7 +574,7 @@ def command_run(out: Output, args) -> int:
     process = server.find_server()
     if not process and not args.url:
         out.error_panel("No vLLM server in this container", [
-            "lil-bench runs inside the serving container: docker exec -it … <container> lil-bench",
+            "lil-bench runs inside the serving container: docker exec --privileged -it … <container> lil-bench",
             "Use --url http://127.0.0.1:PORT to measure another server (its command line is then unknown).",
         ])
         return EXIT_SERVER
@@ -668,6 +668,14 @@ def command_run(out: Output, args) -> int:
                      f"{s.get('bridges', '?')} bridges to the root port{switch}")
         for item in hardware.get("tuning", []):
             out.warn(f"GPU {item['gpu']}: {item['detail']}")
+        acs = hardware["pcie"].get("acs") or {}
+        if acs.get("redirect"):
+            out.warn("PCIe ACS redirects peer-to-peer traffic through the CPU on: "
+                     + ", ".join(f"{bdf} ({'+'.join(bits)})" for bdf, bits in acs["redirect"].items()))
+        elif acs.get("readable"):
+            out.ok(f"PCIe ACS: no peer-to-peer redirect on the {len(acs.get('hops_with_acs', []))} ACS-capable ports of the GPU paths")
+        elif acs.get("unreadable"):
+            out.info("PCIe ACS not readable in this container; run with `docker exec --privileged …` to include it")
 
         out.step(f"[2/{total_steps}] p2pmark (GPU-to-GPU bandwidth and latency)")
         if args.no_p2pmark:

@@ -427,7 +427,7 @@ def test_missing_token_is_a_visible_error(monkeypatch, capsys):
     assert code == standard.EXIT_NO_TOKEN
     assert "No LIL benchmark identifier" in out
     assert "https://docker.local-inference-lab.ai/bench/token" in out
-    assert "docker exec -it -e LIL_BENCH_TOKEN=" in out
+    assert "docker exec --privileged -it -e LIL_BENCH_TOKEN=" in out
 
 
 def test_malformed_and_rejected_tokens(monkeypatch, capsys, site):
@@ -645,3 +645,23 @@ def test_hooks_into_the_verified_image_are_allowed(tmp_path):
     result = integrity.check(9, str(ref), str(proc), user_site=str(tmp_path / "none"))
     assert result["hooks_verified"] == {"LD_PRELOAD": str(site / "vllm/_C.so")}
     assert result["hooks"] == {"PYTHONPATH": f"{site}:/work/overlay"} and result["status"] == "modified"
+
+
+def test_acs_parsing_and_summary(monkeypatch):
+    outputs = {
+        "0000:ce:01.1": "ce:01.1 PCI bridge: AMD\n\tCapabilities: [2a0] Access Control Services\n"
+                        "\t\tACSCap:\tSrcValid+ TransBlk+ ReqRedir+ CmpltRedir+ UpstreamFwd+ EgressCtrl- DirectTrans+\n"
+                        "\t\tACSCtl:\tSrcValid- TransBlk- ReqRedir- CmpltRedir- UpstreamFwd- EgressCtrl- DirectTrans-\n",
+        "0000:d5:00.0": "d5:00.0 PCI bridge: Broadcom\n\t\tACSCap:\tSrcValid+ ReqRedir+ CmpltRedir+\n"
+                        "\t\tACSCtl:\tSrcValid+ TransBlk- ReqRedir+ CmpltRedir+ UpstreamFwd+ EgressCtrl- DirectTrans-\n",
+        "0000:d6:00.0": "d6:00.0 VGA compatible controller: NVIDIA\n\tCapabilities: <access denied>\n",
+    }
+    monkeypatch.setattr(inventory.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(inventory, "run", lambda cmd, timeout=15.0, limit=200_000: {"stdout": outputs[cmd[-1]]})
+    detail = inventory.lspci_detail(list(outputs))
+    assert detail["0000:ce:01.1"]["acs_ctl"]["ReqRedir"] is False and detail["0000:ce:01.1"]["acs_redirect"] == []
+    assert detail["0000:d5:00.0"]["acs_redirect"] == ["ReqRedir", "CmpltRedir"]
+    summary = inventory.acs_summary(detail)
+    assert summary == {"readable": False, "unreadable": ["0000:d6:00.0"],
+                       "hops_with_acs": ["0000:ce:01.1", "0000:d5:00.0"],
+                       "redirect": {"0000:d5:00.0": ["ReqRedir", "CmpltRedir"]}}

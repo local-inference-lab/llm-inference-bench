@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.3 - 2026-09-27
+
+### lil-bench 1.3: PCIe ACS
+
+- Records the ACS capability and control bits of every port on the GPUs'
+  PCIe paths and each port's IOMMU group. Request/completion redirect means
+  GPU peer-to-peer traffic is routed through the CPU root complex; the run
+  reports it, and the site flags it. Reading ACS needs `docker exec
+  --privileged` (CAP_SYS_ADMIN for extended PCI config space); without it ACS
+  is reported as unknown and everything else is measured.
+
 ## 0.7.2 - 2026-09-27
 
 ### lil-bench 1.2: flags modified images
