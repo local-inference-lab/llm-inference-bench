@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.4 - 2026-09-28
+
+### lil-bench 1.3.1: p2pmark on every run, no false PCIe recovery warnings
+
+- p2pmark is sized from its footprint measured next to vLLM: a ~560 MiB CUDA
+  context per GPU, ~0.4 GiB more for the NCCL all-reduce comparison, and one
+  copy buffer per GPU in the all-to-all test (the old estimate was 850 MiB
+  plus four buffers). It must leave 256 MiB free on every GPU; when only the
+  copy and latency tests fit, the all-reduce comparison is left out and the
+  result says why. Buffers go down to 4 MiB.
+- p2pmark starts only while the server reports no running or waiting
+  requests, checked right before every launch; a server whose request counts
+  cannot be read counts as busy, and with `--allow-busy` a busy server gets no
+  p2pmark. It is checked every 0.1 s and killed if the server gets a request or
+  a GPU falls below 128 MiB free, so the memory goes back to the server instead
+  of the server hitting CUDA out-of-memory.
+- When p2pmark cannot run, typically on every run after the first because
+  vLLM keeps the ~600 MiB per GPU it grows into under load, the result of an
+  earlier run on the same GPUs, driver, P2P and ACS settings since the last
+  boot is reused from the saved results and marked `reused` (run, time,
+  reason). Without one, the skip reason gives the free and needed memory of
+  the fullest GPU and what to do.
+- PCIe telemetry no longer reports a link "recovery" when an idle Gen1 link
+  ramps up to full speed with the P-state as load starts, or drops back when
+  idle: NVML's L0-to-recovery counter counts every link speed change.
+  Retraining at a steady P-state, replays and correctable errors are still
+  reported, now also when they fall between the last sample before a phase
+  and its first one; the 16-bit recovery counter's wraparound no longer gives
+  negative counts. A link that falls below its maximum generation or width
+  under load is reported as `pcie_downgrade`; one that never reaches its
+  maximum under load is reported once per GPU in `analysis.pcie`. The maximum
+  is NVML's, capped by the upstream port (NVML reports x16 for a card in an x8
+  slot).
+- Cells above `--max-num-seqs` say that the server runs at most that many
+  requests at once and that this is expected for the configuration; the plan
+  lists them once per reason.
+- `llm_decode_bench.py`: `run_p2pmark_diagnostic` takes an `abort` callback
+  that kills the p2pmark process (status `aborted`) and `extra_env` for it
+  (lil-bench sets `NCCL_DEBUG=WARN` so an NCCL failure names its CUDA error).
+
 ## 0.7.3 - 2026-09-27
 
 ### lil-bench 1.3: PCIe ACS

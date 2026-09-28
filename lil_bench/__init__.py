@@ -5,7 +5,7 @@ records the hardware, PCIe topology, GPU clocks and throttling while it
 runs, and uploads one result document to docker.local-inference-lab.ai.
 """
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 STANDARD = "standard/1"
 SCHEMA = "lil-bench-result/1"
 DEFAULT_SITE = "https://docker.local-inference-lab.ai"

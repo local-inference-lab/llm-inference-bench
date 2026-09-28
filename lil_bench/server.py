@@ -200,6 +200,16 @@ def server_state(base_url: str) -> dict:
     return state
 
 
-def busy_requests(base_url: str) -> float:
-    samples = parse_metrics(http_text(f"{base_url}/metrics", timeout=5))
-    return metric_sum(samples, "vllm:num_requests_running") + metric_sum(samples, "vllm:num_requests_waiting")
+REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting")
+
+
+def busy_requests(base_url: str, timeout: float = 5.0, strict: bool = False) -> float | None:
+    """Requests the server is running or has queued.
+
+    ``strict``: None when /metrics does not report the request gauges, so an
+    unknown state is not mistaken for an idle server.
+    """
+    samples = parse_metrics(http_text(f"{base_url}/metrics", timeout=timeout))
+    if strict and not {name for name, _, _ in samples} & set(REQUEST_GAUGES):
+        return None
+    return sum(metric_sum(samples, name) for name in REQUEST_GAUGES)
