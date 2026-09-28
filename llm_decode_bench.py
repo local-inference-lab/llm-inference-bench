@@ -63,7 +63,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.7.3"
+VERSION = "0.7.4"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -6156,7 +6156,15 @@ def resolve_p2pmark_bin(path: str) -> str:
     return candidates[0] if candidates else "llm_p2pmark"
 
 
-def run_p2pmark_diagnostic(args, console: Console) -> dict:
+def run_p2pmark_diagnostic(args, console: Console, abort=None, summary: bool = True,
+                           extra_env: Optional[dict] = None) -> dict:
+    """Run llm_p2pmark and parse its JSON line.
+
+    ``abort`` is polled every 0.1 s while the binary runs; when it returns a
+    reason the process is killed at once (freeing its GPU memory) and the
+    result is ``aborted``. ``summary=False`` leaves printing the result to the
+    caller; ``extra_env`` is added to the binary's environment.
+    """
     binary = resolve_p2pmark_bin(getattr(args, "p2pmark_bin", ""))
     result = {
         "status": "not_run",
@@ -6189,7 +6197,7 @@ def run_p2pmark_diagnostic(args, console: Console) -> dict:
         cmd.extend(["--allreduce-sizes-mb", args.p2pmark_allreduce_sizes_mb])
     if args.p2pmark_max_gpus > 0:
         cmd.extend(["--max-gpus", str(args.p2pmark_max_gpus)])
-    env = os.environ.copy()
+    env = {**os.environ, **(extra_env or {})}
     nccl_libs = [
         "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib",
         "/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib",
@@ -6219,24 +6227,13 @@ def run_p2pmark_diagnostic(args, console: Console) -> dict:
         console.print(f"[cyan]Running P2P diagnostic:[/cyan] {os.path.basename(binary)} [dim](full command in JSON; use --p2pmark-detail to print it)[/dim]")
     started = time.monotonic()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=args.p2pmark_timeout,
             env=env,
         )
-    except subprocess.TimeoutExpired as exc:
-        result.update({
-            "status": "timeout",
-            "cmd": cmd,
-            "timeout_seconds": args.p2pmark_timeout,
-            "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
-            "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else "",
-            "elapsed_seconds": round(time.monotonic() - started, 3),
-        })
-        return result
     except Exception as exc:
         result.update({
             "status": "error",
@@ -6245,8 +6242,46 @@ def run_p2pmark_diagnostic(args, console: Console) -> dict:
             "elapsed_seconds": round(time.monotonic() - started, 3),
         })
         return result
+    stop = None
+    try:
+        while True:
+            left = args.p2pmark_timeout - (time.monotonic() - started)
+            try:
+                out, err = proc.communicate(timeout=max(0.01, min(left, 0.1) if abort else left))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() - started >= args.p2pmark_timeout:
+                    stop = ("timeout", None)
+                elif abort is not None:
+                    try:
+                        reason = abort()
+                    except Exception:
+                        reason = None
+                    if reason:
+                        stop = ("aborted", str(reason))
+                if stop:
+                    proc.kill()
+                    out, err = proc.communicate()
+                    break
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    if stop:
+        result.update({
+            "status": stop[0],
+            "cmd": cmd,
+            "stdout": (out or "").strip(),
+            "stderr": (err or "").strip(),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        })
+        if stop[0] == "timeout":
+            result["timeout_seconds"] = args.p2pmark_timeout
+        else:
+            result["reason"] = stop[1]
+        return result
 
-    stdout = proc.stdout.strip()
+    stdout = (out or "").strip()
     parsed = {}
     parse_error = ""
     if stdout:
@@ -6259,13 +6294,14 @@ def run_p2pmark_diagnostic(args, console: Console) -> dict:
         "cmd": cmd,
         "returncode": proc.returncode,
         "stdout": stdout,
-        "stderr": proc.stderr.strip(),
+        "stderr": (err or "").strip(),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "data": parsed,
         "parse_error": parse_error,
         "detail": bool(getattr(args, "p2pmark_detail", False)),
     })
-    print_p2pmark_summary(console, result)
+    if summary:
+        print_p2pmark_summary(console, result)
     return result
 
 

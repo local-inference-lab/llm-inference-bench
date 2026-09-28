@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import DEFAULT_SITE, SCHEMA, STANDARD, TOKEN_URL_PATH, VERSION
-from . import integrity, inventory, server, telemetry, upload
+from . import integrity, inventory, p2p, server, telemetry, upload
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "llm_decode_bench.py"
@@ -60,8 +60,6 @@ PROFILES = {
         "idle_check_s": 1,
     },
 }
-P2P_SIZES_MIB = (256, 128, 64, 32, 16)
-P2P_OVERHEAD_MIB = 850  # CUDA contexts plus NCCL buffers of the p2pmark process (measured ~780 MiB)
 
 
 class Output:
@@ -127,6 +125,13 @@ def fit_context(requested: int, output_tokens: int, max_model_len: int | None) -
     return None, f"context {fmt_ctx(requested)} + {output_tokens} output tokens exceeds max_model_len {max_model_len:,}"
 
 
+def concurrency_skip(concurrency: int, max_num_seqs: int, source: str | None = None) -> str:
+    """Why a cell above --max-num-seqs is not measured: expected, not a failure."""
+    setting = f"vLLM's default --max-num-seqs {max_num_seqs}" if source == "vllm_default" else f"--max-num-seqs {max_num_seqs}"
+    return (f"the server runs at most {max_num_seqs} requests at once ({setting}), so C{concurrency} would measure "
+            f"a queue, not {concurrency} concurrent users; expected with this configuration")
+
+
 def build_plan(profile: dict, limits: dict) -> list[dict]:
     """Every standard cell with its effective context or the reason it is skipped.
 
@@ -149,7 +154,7 @@ def build_plan(profile: dict, limits: dict) -> list[dict]:
             if effective is None:
                 cell["status"] = "skipped"
             elif max_num_seqs and conc > max_num_seqs:
-                cell.update(status="skipped", reason=f"concurrency {conc} is above max-num-seqs {max_num_seqs}")
+                cell.update(status="skipped", reason=concurrency_skip(conc, max_num_seqs, limits.get("max_num_seqs_source")))
             elif kv and not (effective == 0 and max_num_seqs and conc <= max_num_seqs) and \
                     conc * (effective + profile["max_tokens"]) > kv:
                 need = conc * (effective + profile["max_tokens"])
@@ -173,14 +178,15 @@ def estimate_seconds(plan: list[dict], profile: dict) -> float:
     return total
 
 
-def p2p_buffer_size(free_mib: list[int]) -> tuple[int | None, str | None]:
-    if len(free_mib) < 2:
-        return None, "single GPU: nothing to measure between GPUs"
-    lowest = min(free_mib)
-    for size in P2P_SIZES_MIB:
-        if lowest >= P2P_OVERHEAD_MIB + 4 * size:
-            return size, None
-    return None, f"insufficient free GPU memory with the model loaded ({lowest} MiB free on the fullest GPU)"
+def skipped_lines(plan: list[dict]) -> list[str]:
+    """Skipped cells, one line per reason (C16 at every context is one line)."""
+    groups: dict[tuple, list[str]] = {}
+    for cell in plan:
+        if cell["status"] != "skipped":
+            continue
+        name = "prefill" if cell["kind"] == "prefill" else f"decode C{cell['concurrency']}"
+        groups.setdefault((name, cell["reason"]), []).append(fmt_ctx(cell["requested_context"]))
+    return [f"{name} @ ctx {', '.join(contexts)}: {reason}" for (name, reason), contexts in groups.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -346,37 +352,18 @@ def free_gpu_memory() -> list[int]:
         return []
 
 
-def run_p2pmark(out: Output, gpu_count: int) -> dict:
-    free = free_gpu_memory()
-    size, reason = p2p_buffer_size(free if free else [0] * gpu_count)
-    result: dict = {"free_mib": free, "with_model_loaded": True}
+def run_p2pmark(out: Output, hardware: dict, base_url: str | None, directory: Path | None) -> dict:
+    """p2pmark next to the loaded model; ``lil_bench.p2p`` keeps it out of the server's way."""
     try:
         bench = load_bench_module()
-        result["nvidia_p2p_override"] = bench.detect_nvidia_p2p_override()
-    except Exception as error:  # noqa: BLE001
-        return {**result, "status": "error", "error": f"cannot load llm_decode_bench: {error}"}
-    if size is None:
-        out.warn(f"p2pmark skipped: {reason}")
-        return {**result, "status": "skipped", "reason": reason}
-    out.info(f"buffer {size} MiB per transfer ({min(free)} MiB free on the fullest GPU)")
-    args = argparse.Namespace(
-        p2pmark_bin="", p2pmark_mode="all", p2pmark_size_mb=size, p2pmark_iters=20, p2pmark_warmup=5,
-        p2pmark_latency_iters=10000, p2pmark_allreduce_sizes_mb="full", p2pmark_max_gpus=0,
-        p2pmark_timeout=300.0, p2pmark_detail=False,
-    )
-    from rich.console import Console
-    console = Console(force_terminal=out.color, width=120)
-    try:
-        diagnostic = bench.run_p2pmark_diagnostic(args, console)
-        if diagnostic.get("status") != "ok" and size > P2P_SIZES_MIB[-1]:
-            out.warn(f"p2pmark {diagnostic.get('status')} with {size} MiB buffers; retrying with {P2P_SIZES_MIB[-1]} MiB")
-            args.p2pmark_size_mb = size = P2P_SIZES_MIB[-1]
-            diagnostic = {**bench.run_p2pmark_diagnostic(args, console), "retried": True}
-    except Exception as error:  # noqa: BLE001
-        diagnostic = {"status": "error", "error": f"{type(error).__name__}: {error}"}
-    if diagnostic.get("status") != "ok":
-        out.warn(f"p2pmark {diagnostic.get('status')}: {(diagnostic.get('error') or diagnostic.get('stderr') or '')[:300]}")
-    return {**result, "buffer_mib": size, **diagnostic}
+        from rich.console import Console
+        # None when /metrics has no request gauges: p2pmark then treats the server as busy.
+        busy = (lambda: server.busy_requests(base_url, timeout=0.5, strict=True)) if base_url else None
+        return p2p.measure(out, hardware, bench, free_fn=free_gpu_memory, busy_fn=busy, directory=directory,
+                           console=Console(force_terminal=out.color, width=120))
+    except Exception as error:  # noqa: BLE001 - p2pmark never fails the benchmark
+        out.warn(f"p2pmark error: {type(error).__name__}: {error}")
+        return {"status": "error", "error": f"{type(error).__name__}: {error}", "ran": False}
 
 
 def bench_command(base_url: str, model_id: str, profile: dict, plan: list[dict], output: Path, dcp: int | None) -> list[str]:
@@ -453,6 +440,7 @@ def summarize(document: dict) -> dict:
         "decode": decode,
         "throttle_verdict": max(verdicts, key=order.index) if verdicts else "no_data",
         "p2pmark_status": (document.get("results", {}).get("p2pmark") or {}).get("status"),
+        "p2pmark_reused": bool((document.get("results", {}).get("p2pmark") or {}).get("reused")),
     }
 
 
@@ -478,11 +466,8 @@ def print_summary(out: Output, document: dict) -> None:
                 value = row and row.get("tok_s")
                 cells.append(f"{value:>10,.1f}" if isinstance(value, (int, float)) and value >= 0 else f"{'—':>10}")
             out.info(f"ctx {fmt_ctx(ctx):>8}  " + "".join(cells))
-    for cell in document["plan"]:
-        if cell["status"] == "skipped":
-            label = f"prefill {fmt_ctx(cell['requested_context'])}" if cell["kind"] == "prefill" else \
-                f"decode C{cell['concurrency']} @ {fmt_ctx(cell['requested_context'])}"
-            out.info(f"skipped {label}: {cell['reason']}")
+    for line in skipped_lines(document["plan"]):
+        out.info(f"not measured: {line}")
     verdict = summary["throttle_verdict"]
     (out.ok if verdict in ("ok", "no_data") else out.warn)(f"GPU clocks during the run: {verdict}")
     for phase in document["phases"]:
@@ -491,6 +476,14 @@ def print_summary(out: Output, document: dict) -> None:
             out.warn(f"  {phase['name']}: {analysis['verdict']}")
     for item in document["hardware"].get("tuning", []) + document["analysis"].get("overclock", []):
         out.warn(f"GPU {item['gpu']}: {item['detail']}")
+    links = document["analysis"].get("pcie") or []
+    for item in links:
+        if item["issues"]:
+            out.warn(f"GPU {item['gpu']} PCIe: {'; '.join(item['issues'])}")
+    if links and not any(item["issues"] for item in links) and all(item["error_counters"] for item in links):
+        changes = sum(item["link_speed_changes"] for item in links)
+        out.ok("PCIe links: no replays, errors or retraining under load"
+               + (f" ({changes} speed change(s) between idle and load are link power management)" if changes else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +515,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="'quick' is for testing the setup; its uploads are kept out of statistics")
     parser.add_argument("--no-upload", action="store_true", help="measure and save locally only")
     parser.add_argument("--no-p2pmark", action="store_true")
-    parser.add_argument("--allow-busy", action="store_true", help="measure even if the server has other requests")
+    parser.add_argument("--allow-busy", action="store_true",
+                        help="measure even if the server has other requests (flagged; p2pmark does not run next to them)")
     parser.add_argument("--note", default="", help="free text stored with the result (max 500 characters)")
     return parser.parse_args(argv)
 
@@ -629,12 +623,12 @@ def command_run(out: Output, args) -> int:
     estimate = estimate_seconds(plan, profile)
     out.step(f"Plan: {len(planned)} measurements, about {fmt_duration(estimate)} "
              f"(finishes ≈{datetime.fromtimestamp(time.time() + estimate).strftime('%H:%M')})")
+    for line in skipped_lines(plan):
+        out.info(f"– not measured: {line}")
     for cell in plan:
-        label = (f"prefill {fmt_ctx(cell['requested_context'])}" if cell["kind"] == "prefill"
-                 else f"decode C{cell['concurrency']} @ ctx {fmt_ctx(cell['requested_context'])}")
-        if cell["status"] == "skipped":
-            out.info(f"– {label}: skipped, {cell['reason']}")
-        elif cell.get("reason"):
+        if cell["status"] != "skipped" and cell.get("reason"):
+            label = (f"prefill {fmt_ctx(cell['requested_context'])}" if cell["kind"] == "prefill"
+                     else f"decode C{cell['concurrency']} @ ctx {fmt_ctx(cell['requested_context'])}")
             out.info(f"· {label}: {cell['reason']}")
 
     started = datetime.now(timezone.utc)
@@ -646,7 +640,7 @@ def command_run(out: Output, args) -> int:
     phases: list[dict] = []
     status = "complete"
     bench_json: dict = {}
-    p2p: dict = {"status": "not_run"}
+    p2p_result: dict = {"status": "not_run"}
     hardware: dict = {}
     cmd: list[str] | None = None
     bench_log_tail = ""
@@ -679,12 +673,13 @@ def command_run(out: Output, args) -> int:
 
         out.step(f"[2/{total_steps}] p2pmark (GPU-to-GPU bandwidth and latency)")
         if args.no_p2pmark:
-            p2p = {"status": "skipped", "reason": "--no-p2pmark"}
+            p2p_result = {"status": "skipped", "reason": "--no-p2pmark"}
         else:
             p2p_start = time.time()
-            p2p = run_p2pmark(out, len(gpus))
-            phases.append({"kind": "p2pmark", "name": "p2pmark", "start": p2p_start, "measure_start": p2p_start,
-                           "end": time.time()})
+            p2p_result = run_p2pmark(out, hardware, base_url, workdir)
+            if p2p_result.pop("ran", False):
+                phases.append({"kind": "p2pmark", "name": "p2pmark", "start": p2p_start,
+                               "measure_start": p2p_start, "end": time.time()})
 
         events = workdir / f"{run_id}.events.jsonl"
         output = workdir / f"{run_id}.bench.json"
@@ -728,9 +723,11 @@ def command_run(out: Output, args) -> int:
 
     series = recorder.series()
     limits_per_gpu = [g.get("power", {}) for g in (hardware.get("gpus") or [])]
+    link_events = telemetry.link_events(series, telemetry.link_limits(hardware))
     pcie_series = pcie_recorder.series()
     for phase in phases:
-        phase["analysis"] = telemetry.analyze_phase(series, phase["measure_start"], phase["end"], limits_per_gpu)
+        phase["analysis"] = telemetry.analyze_phase(series, phase["measure_start"], phase["end"], limits_per_gpu,
+                                                    pcie=link_events, errors_from=phase.get("start"))
         for gpu, rates in zip(phase["analysis"]["gpus"], telemetry.pcie_rates(pcie_series, phase["measure_start"], phase["end"])):
             gpu["pcie_gbps"] = rates
     document = {
@@ -752,13 +749,14 @@ def command_run(out: Output, args) -> int:
                    "url": base_url},
         "hardware": hardware,
         "plan": plan,
-        "results": {"p2pmark": p2p, "bench": bench_json, "bench_command": cmd,
+        "results": {"p2pmark": p2p_result, "bench": bench_json, "bench_command": cmd,
                     "bench_log_tail": bench_log_tail},
         "phases": phases,
         "telemetry": series,
         "server_telemetry": server_recorder.series(),
         "pcie_telemetry": pcie_series,
-        "analysis": {"overclock": telemetry.overclock_signals(series, hardware.get("gpus") or [])},
+        "analysis": {"overclock": telemetry.overclock_signals(series, hardware.get("gpus") or []),
+                     "pcie": telemetry.link_health(link_events)},
     }
     document["summary"] = summarize(document)
     path = save(document, workdir)

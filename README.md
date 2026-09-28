@@ -223,6 +223,22 @@ and 128k, decode C1/C8/C16 at 0/64k/128k context, with GPU clocks, power and
 throttle reasons sampled throughout. The result is saved in the container at
 `/cache/lil-bench/<run>.json.gz` and uploaded to your private run list.
 
+p2pmark runs next to the loaded model in its own process: about 0.6 GiB per
+GPU for its CUDA context, 0.5 GiB more for the NCCL all-reduce comparison, and
+its copy buffers. It always leaves 256 MiB free on every GPU for the server
+(without the all-reduce comparison if only the copy and latency tests fit),
+starts only while the server has no requests, and is stopped at once if one
+arrives. vLLM keeps the memory it grows into under load, so after a first
+benchmark there is often no room left; later runs then reuse the p2pmark
+result of an earlier run on the same GPUs, driver and P2P settings since the
+last boot, marked as reused. On a nearly full configuration, run lil-bench
+first after the server starts.
+
+PCIe link speed changes that come with the GPU's P-state between idle and load
+are link power management, not errors. Replays, correctable errors, other link
+retraining, and a link that falls below its maximum generation or width under
+load are reported per phase and summarized per GPU.
+
 ```bash
 lil-bench --no-upload          # measure and save only
 lil-bench --profile quick      # a few minutes, to test the setup

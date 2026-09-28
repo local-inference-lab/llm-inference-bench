@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lil_bench import inventory, server, standard, telemetry, upload  # noqa: E402
+from lil_bench import inventory, p2p, server, standard, telemetry, upload  # noqa: E402
 
 STANDARD = standard.PROFILES["standard"]
 
@@ -67,9 +67,333 @@ def test_estimate_grows_with_context():
     assert 500 < standard.estimate_seconds(big, STANDARD) < 3600
 
 
-@pytest.mark.parametrize("free,size", [([1065, 1065], 32), ([1500, 1600], 128), ([4000, 4000], 256), ([920, 9000], 16), ([880, 880], None), ([90000], None)])
-def test_p2p_buffer_size(free, size):
-    assert standard.p2p_buffer_size(free)[0] == size
+def test_concurrency_above_max_num_seqs_is_explained_once():
+    plan = standard.build_plan(STANDARD, {"max_model_len": 1_000_000, "max_num_seqs": 8, "kv_tokens": 10_000_000,
+                                          "max_num_seqs_source": "argv"})
+    reason = by_key(plan)[("decode", 16, 131072)]["reason"]
+    assert reason == ("the server runs at most 8 requests at once (--max-num-seqs 8), so C16 would measure a queue, "
+                      "not 16 concurrent users; expected with this configuration")
+    assert standard.skipped_lines(plan) == [f"decode C16 @ ctx 0, 64k, 128k: {reason}"]
+    default = standard.concurrency_skip(16, 8, "vllm_default")
+    assert "vLLM's default --max-num-seqs 8" in default
+
+
+# ---------------------------------------------------------------------------
+# p2pmark next to a loaded model
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("free,parts,size", [
+    ([997, 1037], ["bandwidth", "latency"], 64),  # GLM Spark TP2, first run after start
+    ([1062, 1062], ["bandwidth", "latency"], 64),
+    ([1485, 1627], ["bandwidth", "latency", "allreduce"], 256),
+    ([2826] * 4, ["bandwidth", "latency", "allreduce"], 256),
+    ([4178] * 8, ["bandwidth", "latency", "allreduce"], 256),
+    ([1200] * 8, ["bandwidth", "latency"], 32),
+])
+def test_p2p_plan_leaves_the_reserve_free(free, parts, size):
+    chosen = p2p.plan(free)
+    assert chosen["run"] and chosen["parts"] == parts and chosen["size_mib"] == size
+    assert min(free) - p2p.footprint_mib(len(free), size, "allreduce" in parts) >= p2p.RESERVE_MIB
+    assert ("allreduce" in chosen.get("skipped_parts", {})) == ("allreduce" not in parts)
+
+
+def test_p2p_plan_without_room_says_what_it_needs():
+    chosen = p2p.plan([397, 437])  # the same server after its first benchmark
+    assert not chosen["run"] and chosen["need_mib"] == 600 + 2 * 4 + 256
+    assert chosen["reason"].startswith("not enough free GPU memory: GPU 0 has 397 MiB free, p2pmark needs 864 MiB")
+    assert "right after the server starts" in chosen["hint"] and "467 MiB more per GPU" in chosen["hint"]
+    assert p2p.plan([733, 33, 13, 33])["fullest_gpu"] == 2
+    assert p2p.plan([90000])["why"] == "single_gpu"
+
+
+@pytest.mark.parametrize("gpus,size,allreduce,measured_peak_mib", [
+    (2, 32, True, 971), (2, 128, True, 896), (3, 256, True, 1326), (4, 256, True, 1583), (8, 256, True, 2612)])
+def test_p2p_footprint_covers_measured_peaks(gpus, size, allreduce, measured_peak_mib):
+    # Peaks of llm_p2pmark next to vLLM in uploaded runs (NVML memory used minus the server's).
+    assert measured_peak_mib <= p2p.footprint_mib(gpus, size, allreduce) <= measured_peak_mib * 1.25
+
+
+BOOT = 1_790_000_000
+OVERRIDE = {"effective": False, "runtime": {"ForceP2P": "", "EnableResizableBar": "0"}}
+P2P_DATA = {"tool": "llm_p2pmark", "peer_access": [[1, 1], [1, 1]], "bandwidth_gbps": [[0, 53.8], [53.9, 0]],
+            "bandwidth_summary": {"avg_offdiag_gbps": 53.8}, "latency": {"avg_sequential_us": 0.91}, "allreduce": []}
+
+
+def p2p_hardware(uuid="u0"):
+    return {"gpus": [{"index": i, "name": "RTX PRO 6000", "uuid_hash": f"{uuid}{i}", "bdf": f"0000:0{i}:00.0"}
+                     for i in range(2)],
+            "nvml_system": {"driver_version": "610.57.04"},
+            "pcie": {"acs": {"readable": True, "hops_with_acs": ["0000:00:01.1"], "redirect": {}}}}
+
+
+def write_run(directory, name, mtime, p2pmark, hardware=None, started=None):
+    document = {"run_id": name, "started": datetime_iso(started or mtime), "hardware": hardware or p2p_hardware(),
+                "results": {"p2pmark": p2pmark}}
+    path = directory / f"{name}.json.gz"
+    path.write_bytes(gzip.compress(json.dumps(document).encode()))
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def datetime_iso(stamp):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+
+
+def ok_p2pmark(**extra):
+    return {"status": "ok", "data": P2P_DATA, "buffer_mib": 64, "parts": ["bandwidth", "latency"],
+            "elapsed_seconds": 2.1, "free_mib": [997, 1037], "nvidia_p2p_override": OVERRIDE, **extra}
+
+
+@pytest.fixture
+def boot_proc(tmp_path):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "stat").write_text(f"cpu  1 2 3 4\nbtime {BOOT}\nprocesses 5\n")
+    return str(proc)
+
+
+def test_find_earlier_needs_same_boot_gpus_and_settings(tmp_path, boot_proc):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    write_run(runs, "first", BOOT + 100, ok_p2pmark())
+    write_run(runs, "skipped", BOOT + 500, {"status": "skipped", "reason": "no room"})
+    write_run(runs, "other-gpus", BOOT + 400, ok_p2pmark(), hardware=p2p_hardware("x"))
+    write_run(runs, "last-boot", BOOT - 50, ok_p2pmark())
+    found = p2p.find_earlier(runs, p2p_hardware(), OVERRIDE, boot_proc)
+    assert found["run_id"] == "first" and found["measured"] == BOOT + 100
+    # A reused result points at the original measurement, never at the run that copied it.
+    write_run(runs, "second", BOOT + 900, {**ok_p2pmark(free_mib=[397, 437]), "reused": {
+        "run_id": "first", "measured_at": datetime_iso(BOOT + 100), "free_mib": [997, 1037]}})
+    found = p2p.find_earlier(runs, p2p_hardware(), OVERRIDE, boot_proc)
+    assert found["run_id"] == "first" and found["measured"] == BOOT + 100
+    assert p2p.reused_result(found, "no room", BOOT + 1000)["reused"]["free_mib"] == [997, 1037]
+    assert p2p.find_earlier(runs, p2p_hardware(), {"effective": True, "runtime": {}}, boot_proc) is None
+    (runs / "broken.json.gz").write_bytes(b"not gzip")
+    (runs / "truncated.json.gz").write_bytes(gzip.compress(b'{"results": {}}')[:12] + b"garbage" * 10)
+    (runs / "list.json.gz").write_bytes(gzip.compress(b"[1, 2]"))
+    write_run(runs, "foreign", BOOT + 950, ok_p2pmark(), hardware={"gpus": ["not a dict"]})
+    write_run(runs, "odd", BOOT + 960, {**ok_p2pmark(), "reused": True})
+    for name in ("broken", "truncated", "list"):
+        os.utime(runs / f"{name}.json.gz", (BOOT + 970, BOOT + 970))
+    assert p2p.find_earlier(runs, p2p_hardware(), OVERRIDE, boot_proc)["run_id"] == "first"
+    only_old = tmp_path / "old"
+    only_old.mkdir()
+    write_run(only_old, "last-boot", BOOT - 50, ok_p2pmark())
+    assert p2p.find_earlier(only_old, p2p_hardware(), OVERRIDE, boot_proc) is None
+
+
+def test_setup_difference():
+    earlier = {"hardware": p2p_hardware(), "results": {"p2pmark": {"nvidia_p2p_override": OVERRIDE}}}
+    assert p2p.setup_difference(p2p_hardware(), OVERRIDE, earlier) is None
+    assert p2p.setup_difference(p2p_hardware("y"), OVERRIDE, earlier) == "different GPUs"
+    newer_driver = {**p2p_hardware(), "nvml_system": {"driver_version": "610.60"}}
+    assert p2p.setup_difference(newer_driver, OVERRIDE, earlier) == "different driver"
+    changed = {"effective": False, "runtime": {"ForceP2P": "0x11", "EnableResizableBar": "0"}}
+    assert p2p.setup_difference(p2p_hardware(), changed, earlier) == "different NVIDIA P2P settings"
+    redirect = p2p_hardware()
+    redirect["pcie"]["acs"]["redirect"] = {"0000:00:01.1": ["ReqRedir"]}
+    assert p2p.setup_difference(redirect, OVERRIDE, earlier) == "different PCIe ACS settings"
+    unreadable = p2p_hardware()
+    unreadable["pcie"]["acs"] = {"readable": False, "unreadable": ["0000:00:01.1"]}
+    assert p2p.setup_difference(unreadable, OVERRIDE, earlier) is None
+
+
+class FakeBench:
+    """llm_decode_bench's p2pmark entry points; records every run."""
+
+    def __init__(self, replies=None, after_call=None):
+        self.calls = []
+        self.replies = replies or {}
+        self.after_call = after_call
+
+    def detect_nvidia_p2p_override(self):
+        return OVERRIDE
+
+    def run_p2pmark_diagnostic(self, args, console, abort=None, summary=True, extra_env=None):
+        assert callable(abort) and summary is False and extra_env["NCCL_DEBUG"]
+        self.calls.append((args.p2pmark_mode, args.p2pmark_size_mb))
+        if self.after_call:
+            self.after_call()
+        reply = self.replies.get(args.p2pmark_mode)
+        if reply is not None:
+            return dict(reply)
+        data = {**P2P_DATA, "mode": args.p2pmark_mode}
+        if args.p2pmark_mode == "bandwidth":
+            data["latency"] = {}
+        if args.p2pmark_mode == "latency":
+            data.update(bandwidth_gbps=[], bandwidth_summary={}, latency={"avg_sequential_us": 0.93})
+        return {"status": "ok", "mode": args.p2pmark_mode, "cmd": ["llm_p2pmark", "--mode", args.p2pmark_mode],
+                "returncode": 0, "stdout": json.dumps(data), "elapsed_seconds": 1.0, "data": data}
+
+    def print_p2pmark_summary(self, console, result):
+        pass
+
+
+class Lines(standard.Output):
+    def __init__(self):
+        super().__init__(stream=open(os.devnull, "w"))
+        self.lines = []
+
+    def line(self, text="", code=""):
+        self.lines.append(text)
+
+
+def measure(free, bench, directory=None, busy=None, proc=None, now=BOOT + 3600):
+    out = Lines()
+    result = p2p.measure(out, p2p_hardware(), bench, free_fn=lambda: list(free), busy_fn=busy, directory=directory,
+                         proc_root=proc or "/nonexistent", now=lambda: now)
+    return result, "\n".join(out.lines)
+
+
+def test_p2pmark_runs_copy_and_latency_tests_when_nccl_does_not_fit():
+    bench = FakeBench()
+    result, text = measure([997, 1037], bench, busy=lambda: 0.0)
+    assert bench.calls == [("bandwidth", 64), ("latency", 64)]
+    assert result["status"] == "ok" and result["ran"] and result["parts"] == ["bandwidth", "latency"]
+    assert result["data"]["bandwidth_gbps"] == P2P_DATA["bandwidth_gbps"]
+    assert result["data"]["latency"] == {"avg_sequential_us": 0.93} and result["mode"] == "bandwidth+latency"
+    assert "allreduce" in result["skipped_parts"] and result["buffer_mib"] == 64 and result["measured_at"]
+    assert result["memory"]["reserve_mib"] == p2p.RESERVE_MIB
+    assert "bandwidth + latency with 64 MiB buffers: 997 MiB free on the fullest GPU, 256 MiB stay free" in text
+    assert "p2pmark: 53.8 GB/s GPU↔GPU, 0.93 µs latency" in text
+
+
+def test_p2pmark_full_run_when_everything_fits():
+    bench = FakeBench()
+    result, _ = measure([4178] * 8, bench)
+    assert bench.calls == [("all", 256)] and result["status"] == "ok" and "skipped_parts" not in result
+
+
+def test_p2pmark_reuses_the_first_run_when_the_server_has_grown(tmp_path, boot_proc):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    write_run(runs, "first", BOOT + 100, ok_p2pmark())
+    bench = FakeBench()
+    result, text = measure([397, 437], bench, directory=runs, proc=boot_proc)
+    assert bench.calls == [] and result["ran"] is False
+    assert result["status"] == "ok" and result["data"] == P2P_DATA and result["buffer_mib"] == 64
+    assert result["reused"]["run_id"] == "first" and result["reused"]["age_s"] == 3500
+    assert result["reused"]["reason"].startswith("not enough free GPU memory: GPU 0 has 397 MiB free")
+    assert result["free_mib"] == [397, 437] and result["reused"]["free_mib"] == [997, 1037]
+    assert "p2pmark reused from" in text and "58 min ago" in text
+
+
+def test_p2pmark_skip_without_an_earlier_result_is_actionable(tmp_path, boot_proc):
+    result, text = measure([397, 437], FakeBench(), directory=tmp_path, proc=boot_proc)
+    assert result["status"] == "skipped"
+    assert "GPU 0 has 397 MiB free, p2pmark needs 864 MiB" in result["reason"]
+    assert "Run lil-bench right after the server starts" in result["reason"] and "p2pmark skipped" in text
+
+
+def unreadable_metrics():
+    raise TimeoutError("timed out")
+
+
+@pytest.mark.parametrize("busy,why", [
+    (lambda: 2.0, "the server has 2 running or waiting request(s)"),
+    (lambda: None, "the server does not report its running and waiting requests"),
+    (unreadable_metrics, "the server's request counts cannot be read (TimeoutError)"),
+])
+def test_p2pmark_never_starts_unless_the_server_is_known_to_be_idle(tmp_path, boot_proc, busy, why):
+    bench = FakeBench()
+    result, _ = measure([4000, 4000], bench, directory=tmp_path, busy=busy, proc=boot_proc)
+    assert bench.calls == [] and result["status"] == "skipped" and result["ran"] is False
+    assert result["reason"] == f"{why}; p2pmark only runs next to an idle server"
+
+
+def test_p2pmark_latency_run_is_not_started_after_the_server_got_work():
+    state = {"busy": 0.0}
+    bench = FakeBench(after_call=lambda: state.update(busy=1.0))
+    result, text = measure([997, 1037], bench, busy=lambda: state["busy"])
+    assert bench.calls == [("bandwidth", 64)] and result["status"] == "ok" and result["ran"]
+    assert result["latency_error"] == {"status": "aborted",
+                                       "reason": "not started: the server has 1 running or waiting request(s)"}
+    assert "p2pmark latency test aborted: not started" in text
+
+
+def test_p2pmark_that_never_started_records_no_phase(tmp_path, boot_proc):
+    bench = FakeBench({"all": {"status": "missing_binary", "error": "p2pmark binary not found"}})
+    result, _ = measure([4000, 4000], bench, directory=tmp_path, proc=boot_proc)
+    assert result["status"] == "missing_binary" and result["ran"] is False
+
+
+def test_p2pmark_failure_is_reported_not_replaced(tmp_path, boot_proc):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    write_run(runs, "first", BOOT + 100, ok_p2pmark())
+    bench = FakeBench({"all": {"status": "failed", "returncode": 1, "stderr": "NCCL error: unhandled system error"}})
+    result, _ = measure([4000, 4000], bench, directory=runs, proc=boot_proc)
+    assert result["status"] == "failed" and "reused" not in result and result["ran"]
+
+
+@pytest.mark.parametrize("attempt,why", [
+    ({"status": "aborted", "reason": "the server got 1 request(s) while p2pmark ran", "stdout": ""},
+     "stopped: the server got 1 request(s) while p2pmark ran"),
+    ({"status": "failed", "returncode": 1, "stderr": "CUDA error: out of memory"}, "p2pmark ran out of GPU memory"),
+])
+def test_p2pmark_stopped_for_the_server_falls_back_to_the_earlier_result(tmp_path, boot_proc, attempt, why):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    write_run(runs, "first", BOOT + 100, ok_p2pmark())
+    result, _ = measure([4000, 4000], FakeBench({"all": attempt}), directory=runs, proc=boot_proc)
+    assert result["status"] == "ok" and result["reused"]["reason"] == why and result["ran"]
+    assert result["attempt"]["status"] == attempt["status"]
+    alone, _ = measure([4000, 4000], FakeBench({"all": attempt}), directory=tmp_path / "none", proc=boot_proc)
+    assert alone["status"] == attempt["status"] and alone["reason"] == why
+
+
+def test_p2pmark_guard_stops_for_requests_unknown_state_and_full_gpus():
+    frees = iter([[900, 900], [900, 100]])
+    check = p2p.guard(lambda: next(frees), lambda: 0.0)
+    assert check() is None
+    assert check() == "GPU 1 fell to 100 MiB free while p2pmark ran"
+    assert p2p.guard(lambda: [900], lambda: 1.0)() == \
+        "the server has 1 running or waiting request(s) while p2pmark ran"
+    assert p2p.guard(lambda: [900, 900], unreadable_metrics)() == \
+        "the server's request counts cannot be read (TimeoutError) while p2pmark ran"
+
+
+def load_decode_bench():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("llm_decode_bench_p2p", standard.BENCH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fake_binary(tmp_path, body):
+    path = tmp_path / "llm_p2pmark"
+    path.write_text("#!/bin/sh\n" + body + "\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def p2pmark_args(binary, timeout=30.0):
+    import argparse
+    return argparse.Namespace(p2pmark_bin=binary, p2pmark_mode="all", p2pmark_size_mb=4, p2pmark_iters=1,
+                              p2pmark_warmup=0, p2pmark_latency_iters=1, p2pmark_allreduce_sizes_mb="full",
+                              p2pmark_max_gpus=0, p2pmark_timeout=timeout, p2pmark_detail=False)
+
+
+def test_p2pmark_diagnostic_is_killed_when_aborted(tmp_path):
+    import io
+    from rich.console import Console
+    bench = load_decode_bench()
+    console = Console(file=io.StringIO(), width=120)
+    ok = bench.run_p2pmark_diagnostic(p2pmark_args(fake_binary(tmp_path, "echo '{\"peer_access\": [[1]]}'")), console)
+    assert ok["status"] == "ok" and ok["data"] == {"peer_access": [[1]]}
+    calls = []
+
+    def abort():
+        calls.append(1)
+        return "the server got 1 request(s)" if len(calls) >= 2 else None
+    started = time.monotonic()
+    stopped = bench.run_p2pmark_diagnostic(p2pmark_args(fake_binary(tmp_path, "exec sleep 30")), console, abort=abort)
+    assert stopped["status"] == "aborted" and stopped["reason"] == "the server got 1 request(s)"
+    assert time.monotonic() - started < 5
+    late = bench.run_p2pmark_diagnostic(p2pmark_args(fake_binary(tmp_path, "exec sleep 30"), timeout=0.3), console)
+    assert late["status"] == "timeout" and late["timeout_seconds"] == 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +787,8 @@ print("stub bench done")
 '''
 
 
-def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_path):
+@pytest.mark.parametrize("p2pmark", ["disabled", "measured", "reused"])
+def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_path, p2pmark):
     stub = tmp_path / "llm_decode_bench.py"
     stub.write_text(STUB_BENCH)
     monkeypatch.setattr(standard, "BENCH", stub)
@@ -473,22 +798,38 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
     monkeypatch.setattr(server, "busy_requests", lambda url: 0.0)
     monkeypatch.setattr(server, "image_identity", lambda: {"alias": "ghcr.io/x:kk-beta", "assembly_sha256": "ab" * 32})
     monkeypatch.setattr(standard.time, "sleep", lambda s: None)
-    monkeypatch.setattr(telemetry, "open_source", lambda: FakeSource([[row(2800)] for _ in range(100000)]))
+    counters = {"pcie_replay": 0, "pcie_corr_err": 0, "pcie_recovery": 7}
+    monkeypatch.setattr(telemetry, "open_source", lambda: FakeSource([[{**row(2800), **counters}] for _ in range(100000)]))
     monkeypatch.setattr(inventory, "collect", lambda: {
         "gpus": [{"index": 0, "name": "GPU", "power": {"enforced_limit_w": 300.0}, "clocks": {}}],
         "tuning": [], "pcie": {"gpu_paths": {}}, "cpu": {"lscpu": {"Model name": "CPU"}}, "memory": {"mem_total_mib": 1024}})
-    code, out = run_main(["run", "--profile", "quick", "--site", site.url, "--no-p2pmark"], monkeypatch, capsys,
-                         {"LIL_BENCH_TOKEN": GOOD_TOKEN})
+    p2p_calls = []
+
+    def fake_p2pmark(out, hardware, base_url, directory):
+        p2p_calls.append((base_url, directory))
+        if p2pmark == "measured":
+            return {"status": "ok", "ran": True, "data": P2P_DATA}
+        return {"status": "ok", "ran": False, "data": P2P_DATA, "reused": {"run_id": "earlier"}}
+    monkeypatch.setattr(standard, "run_p2pmark", fake_p2pmark)
+    argv = ["run", "--profile", "quick", "--site", site.url] + (["--no-p2pmark"] if p2pmark == "disabled" else [])
+    code, out = run_main(argv, monkeypatch, capsys, {"LIL_BENCH_TOKEN": GOOD_TOKEN})
     assert code == 0, out
     assert "uploading as @tester" in out and "Plan: 5 measurements" in out
+    assert "PCIe links: no replays, errors or retraining under load" in out
     assert "prefill 8k" in out and "C1 @ 0: 100.0 tok/s" in out and "https://site/bench/runs/r1" in out
     document = site.uploads[0]
     assert document["schema"] == "lil-bench-result/1" and document["profile"] == "quick"
     assert document["status"] == "complete" and document["client"]["uploader"] == "tester"
     assert document["server"]["limits"]["max_num_seqs"] == 4
     assert document["summary"]["decode"][0]["tok_s"] == 100.0
-    assert [p["name"] for p in document["phases"]] == ["prefill 8k", "decode C1 @ 0"]
+    names = [p["name"] for p in document["phases"]]
+    assert names == (["p2pmark"] if p2pmark == "measured" else []) + ["prefill 8k", "decode C1 @ 0"]
     assert all("analysis" in p for p in document["phases"])
+    assert document["analysis"]["pcie"][0]["issues"] == []
+    measured = document["results"]["p2pmark"]
+    assert "ran" not in measured and p2p_calls == ([] if p2pmark == "disabled" else
+                                                   [("http://127.0.0.1:5091", tmp_path / "results")])
+    assert measured["status"] == ("skipped" if p2pmark == "disabled" else "ok")
     command = document["results"]["bench_command"]
     assert command[command.index("--concurrency") + 1] == "1,2"
     assert command[command.index("--prefill-contexts") + 1] == "8192"
@@ -512,6 +853,137 @@ def test_phase_pcie_errors():
     series = series_of(with_errors([row(2800) for _ in range(20)]))
     gpu = telemetry.analyze_phase(series, 1000.0, 1010.0, [{}])["gpus"][0]
     assert gpu["pcie_errors"] == {"pcie_replay": 3}
+
+
+# PCIe link states (gen, width, P-state): an idle link sits at Gen1 in P8.
+IDLE, LOAD, GEN4 = (1, 16, 8), (5, 16, 1), (4, 16, 1)
+GEN5_X16 = [{"max_gen": 5, "max_width": 16}]
+
+
+def link_series(states, recovery, replay=None):
+    """Synthetic telemetry: one GPU, 0.5 s samples, cumulative NVML counters."""
+    rows = []
+    for index, ((gen, width, pstate), recoveries) in enumerate(zip(states, recovery)):
+        sample = row(2800)
+        sample.update(pcie_gen=gen, pcie_width=width, pstate=pstate, util_pct=0 if pstate == 8 else 90,
+                      pcie_recovery=recoveries, pcie_replay=replay[index] if replay else 0, pcie_corr_err=0)
+        rows.append(sample)
+    return series_of(rows)
+
+
+def link_phase(series, links=GEN5_X16, start=1000.0, end=1010.0, errors_from=None):
+    return telemetry.analyze_phase(series, start, end, [{}], links=links, errors_from=errors_from)["gpus"][0]
+
+
+@pytest.mark.parametrize("ramp_at", [3, 4])
+def test_idle_link_ramping_up_under_load_is_not_a_recovery_error(ramp_at):
+    # The counter moves once when the idle Gen1 link trains up to Gen5 as load starts. NVML may report the
+    # increment one sample before the new speed (the counter is read after the link state).
+    series = link_series([IDLE] * 4 + [LOAD] * 16, [1253] * ramp_at + [1254] * (20 - ramp_at))
+    gpu = link_phase(series)
+    assert gpu["pcie_errors"] == {} and gpu["pcie_link_speed_changes"] == 1
+    health = telemetry.link_health(telemetry.link_events(series, GEN5_X16))
+    assert health[0]["issues"] == [] and health[0]["under_load"] == "Gen5 x16" and health[0]["link_speed_changes"] == 1
+
+
+def test_link_dropping_back_to_idle_is_not_an_error():
+    series = link_series([LOAD] * 10 + [IDLE] * 10, [7] * 10 + [8] * 10)
+    assert link_phase(series)["pcie_errors"] == {}
+
+
+def test_links_without_nvml_counters_are_not_called_healthy():
+    health = telemetry.link_health(telemetry.link_events(series_of([row(2800)] * 3)))
+    assert health[0]["error_counters"] is False and health[0]["issues"] == []
+
+
+def test_recoveries_on_a_steady_link_are_errors():
+    series = link_series([LOAD] * 20, [100] * 10 + [103] * 10, replay=[0] * 15 + [2] * 5)
+    assert link_phase(series)["pcie_errors"] == {"pcie_replay": 2, "pcie_recovery": 3}
+    issues = telemetry.link_health(telemetry.link_events(series, GEN5_X16))[0]["issues"]
+    assert issues == ["3 link recoveries (retraining) outside speed changes", "2 replayed PCIe packets"]
+
+
+def test_a_speed_change_explains_only_its_own_recovery():
+    # A marginal link retrains many times while it ramps up; only the change itself is power management.
+    series = link_series([IDLE] * 4 + [LOAD] * 16, [0] * 4 + [29] * 16)
+    gpu = link_phase(series)
+    assert gpu["pcie_errors"] == {"pcie_recovery": 27} and gpu["pcie_link_speed_changes"] == 2
+
+
+def test_recovery_counter_wraps_at_16_bits():
+    series = link_series([LOAD] * 6, [65381, 65440, 65513, 45, 123, 198])
+    assert link_phase(series)["pcie_errors"] == {"pcie_recovery": 353}
+    assert telemetry.increments([65530, 4], 16) == [0, 10]
+    assert telemetry.increments([None, 5, None, 7, 2**20, 3]) == [0, 0, 0, 2, 2**20 - 7, 3]  # a reset
+
+
+def test_link_downgrade_under_load_is_reported():
+    # Gen5 under load, then 3 s at Gen4 while still busy (P1): retraining at a steady P-state is not power
+    # management, so both retrains and the downgrade are findings.
+    series = link_series([LOAD] * 8 + [GEN4] * 6 + [LOAD] * 6, [0] * 8 + [1] * 6 + [2] * 6)
+    gpu = link_phase(series)
+    assert gpu["pcie_errors"] == {"pcie_recovery": 2, "pcie_downgrade": 1} and "pcie_link_speed_changes" not in gpu
+    health = telemetry.link_health(telemetry.link_events(series, GEN5_X16))[0]
+    assert health["downgrades"] == 1 and health["issues"] == [
+        "2 link recoveries (retraining) outside speed changes", "link dropped to Gen4 x16 under load"]
+
+
+def test_retraining_at_a_steady_pstate_is_not_excused():
+    # A one-sample dip to Gen4 under steady P1, and P0/P2 flapping without any link change.
+    dip = link_series([LOAD] * 8 + [GEN4] + [LOAD] * 11, [0] * 8 + [2] * 2 + [4] * 10)
+    assert link_phase(dip)["pcie_errors"] == {"pcie_recovery": 4}
+    flapping = [(5, 16, 0), (5, 16, 2)] * 10
+    series = link_series(flapping, [i // 2 for i in range(20)])
+    assert link_phase(series)["pcie_errors"] == {"pcie_recovery": 9}
+
+
+def test_error_counter_reset_is_not_a_wrap():
+    series = link_series([LOAD] * 6, [0] * 6, replay=[276, 276, 0, 0, 1, 1])
+    assert link_phase(series)["pcie_errors"] == {"pcie_replay": 1}
+
+
+def test_idle_gpu_in_a_performance_state_is_not_downgraded():
+    # P1 without load while the link sits at Gen1 (no utilization): nothing is running over it.
+    idle_p1 = link_series([LOAD] * 4 + [(1, 16, 1)] * 6 + [LOAD] * 4, [0] * 4 + [1] * 6 + [2] * 4)
+    for index in range(4, 10):
+        idle_p1["gpus"][0]["util_pct"][index] = 0
+    assert "pcie_downgrade" not in link_phase(idle_p1)["pcie_errors"]
+
+
+def test_link_limits_use_the_upstream_port():
+    # NVML reports x16 for a Gen4 x16 card in a slot wired x8.
+    hardware = {"gpus": [{"bdf": "0000:09:00.0", "pcie": {"max_gen": 4, "max_width": 16}}],
+                "pcie": {"gpu_paths": {"0000:09:00.0": {"chain": [
+                    {"bdf": "0000:00:03.1", "max_link_speed": "16.0 GT/s PCIe", "max_link_width": "8"},
+                    {"bdf": "0000:09:00.0", "max_link_speed": "32.0 GT/s PCIe", "max_link_width": "16"}]}}}}
+    assert telemetry.link_limits(hardware) == [{"max_gen": 4, "max_width": 8}]
+    assert telemetry.link_limits({"gpus": [{"pcie": {"max_gen": 5, "max_width": 16}}]}) == [
+        {"max_gen": 5, "max_width": 16}]
+
+
+def test_one_sample_below_full_speed_while_ramping_is_not_a_downgrade():
+    # P-state already P1 while the link still reads Gen1: values read on both sides of the ramp.
+    series = link_series([IDLE] * 3 + [(1, 16, 1)] + [LOAD] * 16, [0] * 3 + [1] * 17)
+    assert link_phase(series)["pcie_errors"] == {}
+
+
+def test_link_below_its_maximum_for_the_whole_run_is_reported_once():
+    # A Gen4 x16 link that trains to x8 under load: not a per-phase event, one finding for the run.
+    x8 = (4, 8, 1)
+    series = link_series([(1, 8, 8)] * 2 + [x8] * 18, [5] * 2 + [6] * 18)
+    links = [{"max_gen": 4, "max_width": 16}]  # e.g. a riser that trains only 8 of 16 lanes
+    assert link_phase(series, links)["pcie_errors"] == {}
+    assert telemetry.link_health(telemetry.link_events(series, links))[0]["issues"] == [
+        "Gen4 x8 under load; the link maximum is Gen4 x16"]
+
+
+def test_errors_count_from_the_cell_start_and_at_window_edges():
+    # A genuine retrain seen by the first sample of the window (increment between the samples at
+    # 2.0 s and 2.5 s) belongs to the phase; errors_from extends the window to the cell's warmup.
+    series = link_series([LOAD] * 20, [0] * 5 + [1] * 15)
+    assert link_phase(series, start=1002.2)["pcie_errors"] == {"pcie_recovery": 1}
+    assert link_phase(series, start=1004.0)["pcie_errors"] == {}
+    assert link_phase(series, start=1004.0, errors_from=1002.0)["pcie_errors"] == {"pcie_recovery": 1}
 
 
 def test_pcie_recorder_parses_dmon_rounds():

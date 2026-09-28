@@ -7,6 +7,7 @@ re-analyze them. ``analyze`` turns them into per-phase verdicts.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import threading
@@ -18,11 +19,24 @@ FIELDS = ("sm_mhz", "mem_mhz", "gr_mhz", "power_dw", "temp_c", "util_pct", "mem_
           "pcie_replay", "pcie_corr_err", "pcie_recovery")
 # Cumulative NVML link error counters. (The PCIe byte counters are 32-bit
 # and wrap within one sample at GB/s, so traffic comes from nvidia-smi dmon.)
+# The L0-to-recovery counter is 16 bits wide (seen wrapping 65,513 → 45).
 PCIE_FIELDS = (
     ("pcie_replay", "NVML_FI_DEV_PCIE_REPLAY_COUNTER"),
     ("pcie_corr_err", "NVML_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS"),
     ("pcie_recovery", "NVML_FI_DEV_PCIE_L0_TO_RECOVERY_COUNTER"),
 )
+RECOVERY_COUNTER_BITS = 16
+# Every change of link speed or width passes through the LTSSM Recovery
+# state, so the recovery counter also counts link power management: an idle
+# GPU drops to P8 with its link at Gen1 and trains it back to full speed with
+# the P-state when load starts. A speed change together with a P-state change
+# accounts for this many recoveries; retraining at a steady P-state does not.
+RECOVERIES_PER_LINK_CHANGE = 2
+# A link below its maximum while busy counts only when it lasts this many
+# samples; a single sample can mix values read just before and after a ramp.
+DOWNGRADE_MIN_SAMPLES = 2
+BUSY_PSTATE_MAX = 2  # P0–P2 is load; an idle GPU drops to P8 and trains its link down
+GT_TO_GEN = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
 # NVML clocks event (throttle) reason bits.
 REASONS = {
     "gpu_idle": 0x1,
@@ -232,9 +246,237 @@ def _share(values: list, mask: int) -> float:
     return round(sum(1 for v in known if v & mask) / len(known), 3) if known else 0.0
 
 
-def analyze_phase(series: dict, start: float, end: float, limits: list[dict]) -> dict:
-    """Clock, power and throttle summary of every GPU inside one phase."""
+# ---------------------------------------------------------------------------
+# PCIe link health: genuine errors versus link power management
+# ---------------------------------------------------------------------------
+
+def increments(values: list, wrap_bits: int | None = None) -> list[int]:
+    """Increase of a cumulative counter at every sample (0 where unknown).
+
+    A counter that goes down wrapped around when it is ``wrap_bits`` wide,
+    otherwise it was reset and counts from zero.
+    """
+    out = [0] * len(values)
+    last = None
+    for index, value in enumerate(values):
+        if value is None:
+            continue
+        if last is not None:
+            if value >= last:
+                out[index] = value - last
+            elif wrap_bits and last < 1 << wrap_bits:
+                out[index] = value + (1 << wrap_bits) - last
+            else:
+                out[index] = value
+        last = value
+    return out
+
+
+def _value(columns: dict, field: str, index: int):
+    values = columns.get(field) or []
+    return values[index] if 0 <= index < len(values) else None
+
+
+def _pstate(columns: dict, index: int) -> int | None:
+    pstate = _value(columns, "pstate", index)
+    return pstate if pstate is not None and 0 <= pstate <= 15 else None  # NVML reports 32 when unknown
+
+
+def _busy(columns: dict, index: int) -> bool:
+    pstate = _pstate(columns, index)
+    if pstate is not None:
+        return pstate <= BUSY_PSTATE_MAX
+    return bool(_value(columns, "util_pct", index))
+
+
+def _link(columns: dict, index: int) -> tuple:
+    return _value(columns, "pcie_gen", index), _value(columns, "pcie_width", index)
+
+
+def _differs(a, b) -> bool:
+    return a is not None and b is not None and a != b
+
+
+def _power_managed(columns: dict, j: int, count: int) -> bool:
+    """The link changed speed or width between samples j-1 and j together with the P-state.
+
+    That is link power management (idle Gen1 ↔ full speed under load). The
+    P-state may be read one sample before or after the link state; without
+    P-states an idle ↔ busy change of utilization takes its place.
+    """
+    if not any(_differs(a, b) for a, b in zip(_link(columns, j - 1), _link(columns, j))):
+        return False
+    near = [k for k in (j - 1, j, j + 1) if 1 <= k < count]
+    if any(_pstate(columns, k) is not None for k in range(j - 2, j + 2)):
+        return any(_differs(_pstate(columns, k - 1), _pstate(columns, k)) for k in near)
+    return any(_busy(columns, k - 1) != _busy(columns, k) for k in near)
+
+
+def _hop_gen(speed) -> int | None:
+    match = re.match(r"([\d.]+)", str(speed or ""))
+    return GT_TO_GEN.get(float(match.group(1))) if match else None
+
+
+def _hop_width(width) -> int | None:
+    return int(width) if str(width or "").isdigit() and int(width) > 0 else None
+
+
+def link_limits(hardware: dict) -> list[dict]:
+    """Per GPU: the fastest link it can get.
+
+    NVML's maximum is capped by the PCIe capability of the GPU and of the port
+    it is plugged into (NVML reports x16 for a card in an x8 slot).
+    """
+    paths = (hardware.get("pcie") or {}).get("gpu_paths") or {}
+    limits = []
+    for gpu in hardware.get("gpus") or []:
+        pcie = gpu.get("pcie") or {}
+        gens, widths = [pcie.get("max_gen")], [pcie.get("max_width")]
+        chain = (paths.get(gpu.get("bdf") or "") or {}).get("chain") or []
+        for hop in chain[-2:]:  # the GPU and its upstream port
+            gens.append(_hop_gen(hop.get("max_link_speed")))
+            widths.append(_hop_width(hop.get("max_link_width")))
+        limits.append({"max_gen": min((g for g in gens if g), default=None),
+                       "max_width": min((w for w in widths if w), default=None)})
+    return limits
+
+
+def link_events(series: dict, links: list[dict] | None = None) -> list[dict]:
+    """Per GPU and sample: genuine PCIe errors, separated from power management.
+
+    * Replays and correctable errors are always genuine.
+    * Recoveries within one sample of a link speed or width change that came
+      with a P-state change are link power management (idle Gen1 ramping to
+      full speed under load, or dropping back when idle): at most
+      ``RECOVERIES_PER_LINK_CHANGE`` per change. The rest, including
+      retraining at a steady P-state, are genuine.
+    * A downgrade is the link running below its maximum (``links``, see
+      ``link_limits``; else the fastest state seen under load) while the GPU is
+      busy (P0–P2) for ``DOWNGRADE_MIN_SAMPLES`` samples, with load on it. It
+      counts as a drop, at its first sample, when the link had been at full
+      speed under load before; a link that never got there is reported once
+      for the run.
+    """
+    events = []
+    for gpu_index, columns in enumerate(series.get("gpus") or []):
+        count = len(columns.get("sm_mhz") or [])
+        info = (links[gpu_index] if links and gpu_index < len(links) else None) or {}
+        busy = [_busy(columns, i) for i in range(count)]
+        states = [_link(columns, i) for i in range(count)]
+        loaded = [s for s, b in zip(states, busy) if b and None not in s]
+        max_gen = info.get("max_gen") or max((s[0] for s in loaded), default=None)
+        max_width = info.get("max_width") or max((s[1] for s in loaded), default=None)
+
+        raw = increments(columns.get("pcie_recovery") or [None] * count, RECOVERY_COUNTER_BITS)
+        budget = {j: RECOVERIES_PER_LINK_CHANGE for j in range(1, count) if _power_managed(columns, j, count)}
+        recovery, link_change = [0] * count, [0] * count
+        for i, value in enumerate(raw):
+            for j in (i, i + 1, i - 1):  # the change seen at this sample, the next one, or the previous one
+                take = min(value, budget.get(j, 0))
+                if take:
+                    budget[j] -= take
+                    value -= take
+                    link_change[i] += take
+            recovery[i] = value
+
+        downgrade = [0] * count
+        drops, below_runs, run, reached = [], [], [], False
+        for i in range(count + 1):
+            gen, width = states[i] if i < count else (None, None)
+            known = i < count and busy[i] and gen is not None and width is not None and max_gen and max_width
+            if known and (gen < max_gen or width < max_width):
+                run.append(i)
+                continue
+            if len(run) >= DOWNGRADE_MIN_SAMPLES and any(_value(columns, "util_pct", k) for k in run):
+                worst = min(states[k] for k in run)
+                episode = {"start": run[0], "end": run[-1], "gen": worst[0], "width": worst[1]}
+                if reached:
+                    downgrade[run[0]] = 1
+                    drops.append(episode)
+                else:
+                    below_runs.append(episode)
+            run = []
+            if known:
+                reached = True
+        common = max(set(loaded), key=loaded.count) if loaded else None
+        counters = any(v is not None for field in ("pcie_replay", "pcie_recovery") for v in columns.get(field) or [])
+        events.append({
+            "counters": counters,
+            "link_max": [max_gen, max_width],
+            "under_load": list(common) if common else None,
+            "busy_samples": sum(busy),
+            "replay": increments(columns.get("pcie_replay") or [None] * count),
+            "corr_err": increments(columns.get("pcie_corr_err") or [None] * count),
+            "recovery": recovery,
+            "link_change": link_change,
+            "downgrade": downgrade,
+            "drops": drops,
+            "below_max": below_runs,
+        })
+    return events
+
+
+PHASE_ERRORS = (("replay", "pcie_replay"), ("corr_err", "pcie_corr_err"), ("recovery", "pcie_recovery"),
+                ("downgrade", "pcie_downgrade"))
+
+
+def phase_link_errors(event: dict, indexes: list[int]) -> tuple[dict, int]:
+    """Genuine error counts of one GPU at these samples, and the link speed changes."""
+    errors = {}
+    for key, name in PHASE_ERRORS:
+        total = sum(event[key][i] for i in indexes if i < len(event[key]))
+        if total:
+            errors[name] = total
+    return errors, sum(event["link_change"][i] for i in indexes if i < len(event["link_change"]))
+
+
+def _gen_width(gen, width) -> str:
+    return f"Gen{gen or '?'} x{width or '?'}"
+
+
+def link_health(events: list[dict]) -> list[dict]:
+    """Run summary of every GPU's link; ``issues`` lists what is genuinely wrong."""
+    summary = []
+    for gpu_index, event in enumerate(events):
+        totals = {key: sum(event[key]) for key in ("replay", "corr_err", "recovery", "link_change")}
+        issues = []
+        if totals["recovery"]:
+            issues.append(f"{totals['recovery']:,} link recoveries (retraining) outside speed changes")
+        if totals["replay"]:
+            issues.append(f"{totals['replay']:,} replayed PCIe packets")
+        if totals["corr_err"]:
+            issues.append(f"{totals['corr_err']:,} correctable PCIe errors")
+        for drop in event["drops"]:
+            issues.append(f"link dropped to {_gen_width(drop['gen'], drop['width'])} under load")
+        max_gen, max_width = event["link_max"]
+        for below in event["below_max"][:1]:
+            issues.append(f"{_gen_width(below['gen'], below['width'])} under load; the link maximum is "
+                          f"{_gen_width(max_gen, max_width)}")
+        summary.append({
+            "gpu": gpu_index,
+            "link_max": _gen_width(max_gen, max_width) if max_gen else None,
+            "under_load": _gen_width(*event["under_load"]) if event["under_load"] else None,
+            "replays": totals["replay"],
+            "corr_errors": totals["corr_err"],
+            "recoveries": totals["recovery"],
+            "link_speed_changes": totals["link_change"],
+            "downgrades": len(event["drops"]),
+            "error_counters": event["counters"],
+            "issues": issues,
+        })
+    return summary
+
+
+def analyze_phase(series: dict, start: float, end: float, limits: list[dict], links: list[dict] | None = None,
+                  pcie: list[dict] | None = None, errors_from: float | None = None) -> dict:
+    """Clock, power and throttle summary of every GPU inside one phase.
+
+    PCIe errors count from ``errors_from`` (the start of the cell, warmup
+    included) when given; ``pcie`` are the run's ``link_events``.
+    """
     indexes = window(series, start, end)
+    events = pcie if pcie is not None else link_events(series, links)
+    error_indexes = window(series, start if errors_from is None else min(errors_from, start), end)
     result = {"samples": len(indexes), "gpus": []}
     verdicts = []
     for gpu_index, columns in enumerate(series["gpus"]):
@@ -265,9 +507,8 @@ def analyze_phase(series: dict, start: float, end: float, limits: list[dict]) ->
         else:
             verdict = "ok"
         verdicts.append(verdict)
-        def delta(field):
-            values = [v for v in (columns.get(field) or [])[indexes[0]: indexes[-1] + 1] if v is not None]
-            return values[-1] - values[0] if len(values) > 1 else None
+        errors, speed_changes = (phase_link_errors(events[gpu_index], error_indexes)
+                                 if gpu_index < len(events) else ({}, 0))
         result["gpus"].append({
             "gpu": gpu_index,
             "samples": len(sm),
@@ -281,8 +522,9 @@ def analyze_phase(series: dict, start: float, end: float, limits: list[dict]) ->
             "pcie": {"gen_min": min(pick("pcie_gen"), default=None), "width_min": min(pick("pcie_width"), default=None)},
             "energy_j": energy[-1] - energy[0] if len(energy) > 1 else None,
             "reason_share": {k: v for k, v in shares.items() if v},
-            "pcie_errors": {k: delta(k) for k in ("pcie_replay", "pcie_corr_err", "pcie_recovery")
-                            if delta(k)},
+            # Genuine errors only; link speed changes (power management) are counted apart.
+            "pcie_errors": errors,
+            **({"pcie_link_speed_changes": speed_changes} if speed_changes else {}),
             "verdict": verdict,
         })
     order = ["ok", "power_capped", "thermal", "hw_slowdown"]
