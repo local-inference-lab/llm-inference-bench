@@ -166,6 +166,14 @@ def metric_sum(samples, name: str) -> float:
 
 
 def kv_capacity(samples) -> dict:
+    """KV capacity from vllm:cache_config_info.
+
+    vLLM's own kv_cache_size_tokens is preferred (``kv_tokens_source`` "vllm"):
+    it counts every DCP rank, and a hybrid model's layer groups share one block
+    pool, so blocks × block size overstates it many times over (86M instead
+    of 4.8M tokens for Qwen3.8-Flash-Next TP2). Servers without it get
+    blocks × block size, one DCP rank's share (``kv_tokens_source`` "blocks").
+    """
     for metric, labels, _ in samples:
         if metric == "vllm:cache_config_info":
             try:
@@ -173,8 +181,12 @@ def kv_capacity(samples) -> dict:
                 size = int(labels.get("block_size") or 0)
             except ValueError:
                 continue
-            return {"num_gpu_blocks": blocks, "block_size": size, "kv_tokens": blocks * size,
-                    "cache_config": labels}
+            capacity = {"num_gpu_blocks": blocks, "block_size": size, "kv_tokens": blocks * size,
+                        "kv_tokens_source": "blocks", "cache_config": labels}
+            reported = labels.get("kv_cache_size_tokens") or ""
+            if reported.isdigit() and int(reported) > 0:
+                capacity.update(kv_tokens=int(reported), kv_tokens_source="vllm")
+            return capacity
     return {}
 
 

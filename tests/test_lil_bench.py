@@ -451,6 +451,24 @@ vllm:cache_config_info{block_size="64",num_gpu_blocks="1000",enable_prefix_cachi
     samples = server.parse_metrics(text)
     assert server.metric_sum(samples, "vllm:num_requests_running") == 2.0
     assert server.kv_capacity(samples)["kv_tokens"] == 64000
+    assert server.kv_capacity(samples)["kv_tokens_source"] == "blocks"
+
+
+def test_kv_capacity_is_vllms_own_for_a_hybrid_model():
+    """Qwen3.8-Flash-Next TP4: its layer groups share the block pool, so blocks
+    × block size (100M) is 15× what the server holds (vLLM logs 6,471,460)."""
+    text = ('vllm:cache_config_info{_block_size_resolved="True",block_size="1472",'
+            'kv_cache_size_tokens="6471460",mamba_block_size="64",num_gpu_blocks="68308",'
+            'num_gpu_blocks_override="None"} 1.0\n')
+    capacity = server.kv_capacity(server.parse_metrics(text))
+    assert capacity["kv_tokens"] == 6_471_460 and capacity["kv_tokens_source"] == "vllm"
+    assert capacity["num_gpu_blocks"] * capacity["block_size"] == 100_549_376
+
+
+@pytest.mark.parametrize("source,expected", [("vllm", 1_000_000), ("blocks", 4_000_000)])
+def test_server_kv_tokens_counts_dcp_once(source, expected):
+    state = {"kv_tokens": 1_000_000, "kv_tokens_source": source}
+    assert standard.server_kv_tokens(state, 4) == expected
 
 
 # ---------------------------------------------------------------------------
