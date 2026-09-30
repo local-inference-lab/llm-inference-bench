@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.5 - 2026-09-30
+
+### lil-bench 1.3.2: KV capacity of hybrid models
+
+- The KV capacity comes from vLLM's own `kv_cache_size_tokens` in
+  `vllm:cache_config_info` when the server exports it (vLLM #42206; current
+  Karmic Kraken images do). Hybrid models such as Qwen3.8-Flash-Next share one
+  block pool across their layer groups, so the old `num_gpu_blocks × block_size`
+  overstated the capacity many times over: a Qwen3.8-Flash-Next TP2
+  run showed 86M KV tokens where the server holds 4.8M, and TP4 100M instead
+  of 6.5M. That number is shown at the start of the run and decides which
+  decode cells are skipped for capacity.
+- `kv_cache_size_tokens` already counts every DCP rank, so it is not multiplied
+  by the DCP size again. Servers without it keep the old per-rank
+  `num_gpu_blocks × block_size × DCP` rule, in lil-bench and in
+  `llm_decode_bench.py`'s own KV budget.
+
 ## 0.7.4 - 2026-09-28
 
 ### lil-bench 1.3.1: p2pmark on every run, no false PCIe recovery warnings

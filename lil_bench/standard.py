@@ -132,6 +132,18 @@ def concurrency_skip(concurrency: int, max_num_seqs: int, source: str | None = N
             f"a queue, not {concurrency} concurrent users; expected with this configuration")
 
 
+def server_kv_tokens(state: dict, dcp: int | None) -> int:
+    """KV capacity of the whole server in tokens (see server.kv_capacity).
+
+    vLLM's kv_cache_size_tokens already counts every DCP rank; blocks × block
+    size is one rank's share and is multiplied by the DCP size.
+    """
+    tokens = state.get("kv_tokens") or 0
+    if state.get("kv_tokens_source") == "vllm":
+        return tokens
+    return tokens * (dcp or 1)
+
+
 def build_plan(profile: dict, limits: dict) -> list[dict]:
     """Every standard cell with its effective context or the reason it is skipped.
 
@@ -586,7 +598,7 @@ def command_run(out: Output, args) -> int:
         value = serve["options"].get(key)
         if isinstance(value, str) and value.isdigit():
             dcp = int(value)
-    kv_tokens = (state.get("kv_tokens") or 0) * (dcp or 1)
+    kv_tokens = server_kv_tokens(state, dcp)
     limits.update(max_model_len=state.get("max_model_len"), kv_tokens=kv_tokens or None)
     out.ok(f"model {state.get('model_id')} · max_model_len {state.get('max_model_len')} · "
            f"max-num-seqs {limits['max_num_seqs']} ({limits['max_num_seqs_source']}) · KV {kv_tokens:,} tokens")

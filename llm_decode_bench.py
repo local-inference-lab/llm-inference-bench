@@ -63,7 +63,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -14210,16 +14210,32 @@ async def run_benchmark(args):
                 console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
                 remember_startup(f"WARNING: {metrics_warning}")
 
-        # vLLM exposes cache_config_info with local num_gpu_blocks and block_size
-        # in current builds. With DCP, vLLM multiplies this local budget by the
-        # CP/DCP world size in the startup log. Current vLLM builds do not expose
-        # the multiplier in Prometheus, so --dcp-size supplies it for remote runs.
+        # vLLM exposes its KV capacity in cache_config_info as kv_cache_size_tokens
+        # (vllm-project/vllm#42206). It counts every CP/DCP rank, and a hybrid
+        # model's layer groups share one block pool, so it is preferred. Older
+        # builds expose only the local num_gpu_blocks and block_size. With DCP,
+        # vLLM multiplies that local budget by the CP/DCP world size in the
+        # startup log, but does not expose the multiplier in Prometheus, so
+        # --dcp-size supplies it for remote runs.
         if engine == ENGINE_VLLM and metrics_available and args.max_total_tokens == 0:
             metrics = await scrape_metrics(check_client, base_url)
             block_size = extract_label(metrics, "vllm:cache_config_info", "block_size")
             num_gpu_blocks = extract_label(metrics, "vllm:cache_config_info", "num_gpu_blocks")
+            reported_kv_tokens = _parse_metric_int(
+                metrics, "vllm:cache_config_info", "kv_cache_size_tokens"
+            )
             try:
-                if block_size and num_gpu_blocks:
+                if reported_kv_tokens > 0:
+                    args.max_total_tokens = reported_kv_tokens
+                    console.print(
+                        "[cyan]KV cache budget (vLLM metrics):[/cyan] "
+                        f"{reported_kv_tokens:,} tokens (kv_cache_size_tokens)"
+                    )
+                    remember_startup(
+                        f"KV cache budget from vLLM metrics: {reported_kv_tokens:,} tokens "
+                        "(kv_cache_size_tokens)"
+                    )
+                elif block_size and num_gpu_blocks:
                     local_kv_tokens = int(block_size) * int(num_gpu_blocks)
                     cp_size = int(args.dcp_size)
                     cp_source = "argument"
