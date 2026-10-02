@@ -167,7 +167,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--burst-request-count` | `0` | Measured requests per Burst / E2E cell. `0` means `concurrency × --burst-requests-per-concurrency` |
 | `--burst-warmup-request-count` | `0` | Warmup requests per Burst / E2E cell. `0` means `concurrency` |
 | `--burst-requests-per-concurrency` | `5` | Auto Burst / E2E measured request multiplier |
-| `--test-profile` | | Built-in task profile. `estonia` embeds the GLM long-context prompt inside the script and implies `--completion-stats` (`estonia-v1` is the legacy question tail, `estonia-long` adds a high-reasoning-effort wrapper); `hotel-lights` is a compact numeric reasoning test. `gsm8k`, `mmlu-pro` and `gpqa-diamond` are pinned multi-item accuracy benchmarks for quantization A/B tests |
+| `--test-profile` | | Built-in task profile. `estonia` embeds the GLM long-context prompt inside the script and implies `--completion-stats` (`estonia-v1` is the legacy question tail, `estonia-long` adds a high-reasoning-effort wrapper); `hotel-lights` is a compact numeric reasoning test; `needle-checksum` is a greedy numerical-stability probe (one 8K retrieval and arithmetic prompt, 500 identical temperature-0 requests answered through a tool call). `gsm8k`, `mmlu-pro` and `gpqa-diamond` are pinned multi-item accuracy benchmarks for quantization A/B tests |
 | `--compare-baseline` | | Path to a previous dataset-profile results JSON; after the run, a paired per-item comparison (accuracy delta, flips, exact McNemar p, per-category deltas, token inflation) is printed and embedded in the output JSON |
 | `--compare-candidate` | | Standalone mode: compare `--compare-baseline` against this results JSON and exit without contacting a server |
 | `--profile-concurrency` | `0` | Fixed task-profile concurrency. `0` keeps adaptive probing |
@@ -177,7 +177,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--completion-stats-concurrency-levels` | `1,2,4,8,16,30` | Candidate concurrency levels for the adaptive probe |
 | `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness for custom `--prompt`/`--prompt-file` runs; empty disables scoring. Built-in profiles use their own typed scorer instead |
 | `--completion-stats-save-text` | `false` | Store full streamed output/reasoning/content text in JSON instead of only final answer/excerpts |
-| `--completion-stats-temperature` | | Sampling temperature for profile requests. Dataset profiles default to `0`; `estonia*`, `hotel-lights` and custom prompts leave the server/model default unless set. The value used is recorded in result metadata |
+| `--completion-stats-temperature` | | Sampling temperature for profile requests. Dataset profiles and `needle-checksum` default to `0`; `estonia*`, `hotel-lights` and custom prompts leave the server/model default unless set. The value used is recorded in result metadata |
 | `--completion-stats-top-p` | | Sampling top_p for profile requests. Omitted unless set; recorded in result metadata |
 | `--completion-stats-seed` | | Base sampling seed; run *i* is sent with `seed = base + i`, so resamples differ from each other but are identical across engines/quants |
 | `--completion-stats-stall-timeout` | `600` | Stall watchdog (seconds without a token) for profile streams; the run is closed and scored `STALL`. `0` disables |
@@ -511,6 +511,12 @@ punctuation are stripped).
   finished runs only` and lists every label with a count
   (`PASS 19 / FAIL 0 / DECOY 4 / NOT_STATED 5 / TRUNC 2`). A cancelled run
   (`q`) is `CANCEL` and not scored.
+- `needle-checksum` uses the `needle_checksum` scorer on the streamed tool call:
+  exactly one `submit_context_check` call with integer `alpha`, `beta`,
+  `gamma` and `checksum`. Labels: `EXACT` (478, 788, 426, 3332), `NEAR_MISS`
+  (checksum 3330 with the right facts, the model's known last-digit slip),
+  `WRONG_SUM` (another checksum), `WRONG_FACTS` (a wrongly retrieved value) and
+  `FAIL` (no call, several calls or malformed arguments).
 - `--prompt` / `--prompt-file` runs fall back to `--completion-stats-correct-regex`
   on the extracted answer line.
 
@@ -553,6 +559,42 @@ If SGLang is running with DCP/CP and `/get_server_info` reports only the local K
 budget, pass `--dcp-size N` or set `LLM_BENCH_DCP_SIZE=N`. For example, a local
 `max_total_num_tokens=200000` with `--dcp-size 4` is displayed and treated as an
 effective `800000` token KV budget.
+
+#### needle-checksum: greedy numerical stability
+
+`--test-profile needle-checksum` (aliases `needle`, `checksum`, `checksum-3332`)
+is logprobz's GLM-5.3-Flash checksum probe, rebuilt exactly: the system and user
+messages plus the tool schema hash to the original `7349ff46…`. An 8K-token
+synthetic dataset of 291 inert `REC` lines hides three `CANONICAL FACT` values
+(ALPHA 478, BETA 788, GAMMA 426). The model must retrieve them, compute
+`ALPHA + 2*BETA + 3*GAMMA = 3332` and submit the result through one
+`submit_context_check` tool call, with thinking at `reasoning_effort: max`.
+
+The profile sends that one prompt 500 times at concurrency 8 with temperature 0,
+top_p 0.95, seed 275001 and a 4096-token cap. Greedy, identical requests should
+all agree, so every wrong answer measures the serving stack's numerics, not
+sampling. GLM-5.3-Flash has a near-tie on the last digit of `478 + 1576 + 1278`,
+and the typical wrong answer is `NEAR_MISS` (3330). It is a cheap canary for
+numerical changes such as MoE activation precision or kernel changes, not a
+general quality benchmark.
+
+The tool call is part of the test. With a plain answer line instead,
+GLM-5.3-Flash computes the sum step by step (`2054 + 1278`) and passed 500/500
+in every configuration below. The server must therefore have tool calling
+enabled (vLLM `--enable-auto-tool-choice` with the model's tool parser).
+
+Reference results on GLM-5.3-Flash TP4 with MTP, 4× RTX PRO 6000 Max-Q,
+Karmic Kraken beta, 500 requests per cell:
+
+| Checkpoint and MoE activations | wrong at C8 (default) | wrong at C30 |
+|---|---|---|
+| QAD (HF main), b12x W4A4 (profile default) | 6.0% | 9.0% |
+| QAD, b12x W4A16 + `B12X_W4A16_FP32_TOPK_WEIGHTS=1` | 0% | 0% |
+| pre-QAD `46aaae8a`, b12x W4A16 | 18.0% | 23.2% |
+
+Higher concurrency adds batch-composition noise, so compare runs at the same
+`--profile-concurrency`. logprobz reports DeepSeek V4 and V4.1 Flash at 500/500,
+so the probe mainly tells GLM-5.3-Flash configurations apart.
 
 ### Dataset Accuracy Profiles (gsm8k, mmlu-pro, gpqa-diamond)
 

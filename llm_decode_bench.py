@@ -63,7 +63,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.7.5"
+VERSION = "0.7.6"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -4310,6 +4310,71 @@ ESTONIA_V2_QUESTION_TAIL = (
     "\"Final answer: <country>\".\nAnswer:"
 )
 
+# needle-checksum: logprobz's GLM-5.3-Flash "3330/3332" context-check probe, rebuilt
+# exactly (messages and tool schema hash to the original 7349ff46...). 291 inert REC
+# lines hide three CANONICAL FACT needles; the model retrieves them, computes
+# ALPHA + 2*BETA + 3*GAMMA and submits the result through one submit_context_check
+# tool call. Requests are greedy (temperature 0) and identical, so every wrong answer
+# comes from the serving stack's numerics tipping the model's near-tie on the last
+# digit of 478 + 1576 + 1278 (3332 vs 3330), not from sampling. The tool call is part
+# of the test: with a plain answer line instead, GLM-5.3-Flash computes the sum step
+# by step and never meets the near-tie.
+NEEDLE_CHECKSUM_SALT = "deterministic-concurrency-20260827"
+NEEDLE_CHECKSUM_FACTS = {"ALPHA": 478, "BETA": 788, "GAMMA": 426}
+NEEDLE_CHECKSUM_EXPECTED = 478 + 2 * 788 + 3 * 426  # 3332
+NEEDLE_CHECKSUM_TOOL = "submit_context_check"
+NEEDLE_CHECKSUM_SYSTEM_PROMPT = (
+    "Follow the user's context-check instructions and use the supplied tool."
+)
+NEEDLE_CHECKSUM_TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": NEEDLE_CHECKSUM_TOOL,
+        "description": "Submit the three canonical fact values and their checksum.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                name: {"type": "integer"} for name in ("alpha", "beta", "gamma", "checksum")
+            },
+            "required": ["alpha", "beta", "gamma", "checksum"],
+            "additionalProperties": False,
+        },
+    },
+}]
+# sha256 of the original probe's canonical {"messages", "tools"} JSON.
+NEEDLE_CHECKSUM_PROBE_SHA256 = "7349ff46ec2e0359e2b3a3c1c51fa23eadb3496eba0d79f7c6fef909dd3c7159"
+
+
+def build_needle_checksum_prompt() -> str:
+    """Rebuild the user message of the original context-check probe."""
+    positions = {14: "ALPHA", 145: "BETA", 276: "GAMMA"}
+    lines = [
+        f"CONTEXT CHECK DATASET {NEEDLE_CHECKSUM_SALT}",
+        "Only lines beginning CANONICAL FACT contain values for the final task.",
+        "All REC lines are inert synthetic data.",
+    ]
+    for index in range(291):
+        digest = hashlib.sha256(
+            f"context-records-v1:{NEEDLE_CHECKSUM_SALT}:{index}".encode()
+        ).hexdigest()
+        metric = int(digest[16:24], 16) % 100000
+        lines.append(f"REC {index:06d} id={digest[:16]} metric={metric:05d} state=nominal")
+        if index in positions:
+            name = positions[index]
+            lines.append(f"CANONICAL FACT {name}={NEEDLE_CHECKSUM_FACTS[name]}")
+    lines.extend([
+        "CALIBRATION PAD:" + " ." * 14,
+        "END CONTEXT CHECK DATASET",
+        "Retrieve ALPHA, BETA, and GAMMA from the canonical fact lines.",
+        "Compute CHECKSUM = ALPHA + 2*BETA + 3*GAMMA.",
+        f"Call {NEEDLE_CHECKSUM_TOOL} exactly once with the three values and CHECKSUM.",
+        "Do not answer in prose.",
+    ])
+    return "\n".join(lines)
+
+
+NEEDLE_CHECKSUM_PROMPT = build_needle_checksum_prompt()
+
 BUILTIN_TEST_PROFILES = {
     "estonia": {
         "description": (
@@ -4477,6 +4542,38 @@ BUILTIN_TEST_PROFILES = {
         "default_runs": 0,
         "default_no_prefill_scout": True,
     },
+    "needle-checksum": {
+        "description": (
+            "Greedy numerical-stability probe (logprobz's GLM-5.3-Flash checksum test, "
+            "rebuilt exactly). An 8K-token synthetic dataset hides three CANONICAL FACT "
+            "values; the model must retrieve them and submit ALPHA + 2*BETA + 3*GAMMA = "
+            "3332 through one submit_context_check tool call. The same prompt is sent 500 "
+            "times at temperature 0, so wrong answers measure how often the serving "
+            "stack's numerics tip the model's near-tie on the last digit (NEAR_MISS = "
+            "3330) rather than sampling noise. Needs a server with tool calling enabled."
+        ),
+        "profile_version": 1,
+        "prompt_text": NEEDLE_CHECKSUM_PROMPT,
+        "system_prompt": NEEDLE_CHECKSUM_SYSTEM_PROMPT,
+        "prompt_sha256": "3a1eccf0ec1f204631e65b68eea5fee8b320332dd7f56231cc8c73ae29cf3685",
+        "scorer": "needle_checksum",
+        "score_source": "content",
+        "answer_tool": NEEDLE_CHECKSUM_TOOL,
+        "expected_values": {**NEEDLE_CHECKSUM_FACTS, "CHECKSUM": NEEDLE_CHECKSUM_EXPECTED},
+        "expected_answer": "alpha=478 beta=788 gamma=426 checksum=3332",
+        "near_miss_checksums": [3330],
+        "default_max_tokens": 4096,
+        "default_temperature": 0.0,
+        "default_top_p": 0.95,
+        "request_overrides": {
+            "tools": NEEDLE_CHECKSUM_TOOLS,
+            "tool_choice": "auto",
+            "seed": 275001,
+            "chat_template_kwargs": {"thinking": True, "reasoning_effort": "max"},
+        },
+        "default_concurrency": 8,
+        "default_runs": 500,
+    },
 }
 
 BUILTIN_TEST_PROFILE_ALIASES = {
@@ -4491,6 +4588,9 @@ BUILTIN_TEST_PROFILE_ALIASES = {
     "mmlu-pro-1000": "mmlu-pro",
     "gpqa": "gpqa-diamond",
     "gpqa_diamond": "gpqa-diamond",
+    "needle": "needle-checksum",
+    "checksum": "needle-checksum",
+    "checksum-3332": "needle-checksum",
 }
 
 METRIC_RE = re.compile(r'^((?:sglang|vllm):\w+)(?:\{([^}]*)\})?\s+([\d.eE+-]+)')
@@ -8058,6 +8158,93 @@ def _no_answer_result(finish_reason: str, *, detail: str = "") -> dict:
     }
 
 
+def score_needle_checksum(
+    *,
+    tool_calls: list,
+    expected: dict,
+    near_miss_checksums: list,
+    answer_tool: str,
+    finish_reason: str = "",
+) -> dict:
+    """Score the needle-checksum answer: exactly one ``answer_tool`` call with integer
+    ``alpha``, ``beta``, ``gamma`` and ``checksum`` arguments.
+
+    EXACT needs all four values. WRONG_FACTS means a retrieved value is wrong;
+    NEAR_MISS is a checksum from ``near_miss_checksums`` (the model's known
+    last-digit slip) with the right facts; WRONG_SUM any other checksum with the
+    right facts. A missing, repeated or malformed call is FAIL, or an incomplete
+    label when the stream never finished.
+    """
+    calls = list(tool_calls or [])
+    if not calls:
+        if is_incomplete_finish(finish_reason):
+            return _no_answer_result(finish_reason, detail=f"no {answer_tool} call")
+        return {
+            "correct": False,
+            "score_label": "fail",
+            "score_detail": f"unparseable: no {answer_tool} call",
+            "parsed_answer": "",
+        }
+
+    def invalid(detail: str) -> dict:
+        if is_incomplete_finish(finish_reason):
+            return _no_answer_result(finish_reason, detail=detail)
+        return {
+            "correct": False,
+            "score_label": "fail",
+            "score_detail": f"unparseable: {detail}",
+            "parsed_answer": "",
+        }
+
+    if len(calls) != 1:
+        return invalid(f"expected one {answer_tool} call, got {len(calls)}")
+    call = calls[0]
+    if str(call.get("name") or "") != answer_tool:
+        return invalid(f"unexpected tool {call.get('name')!r}")
+    try:
+        arguments = json.loads(call.get("arguments") or "")
+    except (TypeError, ValueError):
+        return invalid("tool arguments are not JSON")
+    names = ("alpha", "beta", "gamma", "checksum")
+    if not isinstance(arguments, dict) or set(arguments) != set(names):
+        return invalid("expected exactly alpha, beta, gamma and checksum")
+    if any(type(arguments[name]) is not int for name in names):
+        return invalid("tool arguments must be integers")
+    values = {name.upper(): arguments[name] for name in names}
+    parsed = " ".join(f"{name}={arguments[name]}" for name in names)
+    wrong_facts = [
+        f"{name} {values[name]} (expected {int(expected[name])})"
+        for name in ("ALPHA", "BETA", "GAMMA")
+        if values[name] != int(expected[name])
+    ]
+    if wrong_facts:
+        return {
+            "correct": False,
+            "score_label": "wrong_facts",
+            "score_detail": ", ".join(wrong_facts),
+            "parsed_answer": parsed,
+        }
+    expected_checksum = int(expected["CHECKSUM"])
+    if values["CHECKSUM"] == expected_checksum:
+        return {
+            "correct": True,
+            "score_label": "exact",
+            "score_detail": "exact",
+            "parsed_answer": parsed,
+        }
+    label = (
+        "near_miss"
+        if values["CHECKSUM"] in {int(value) for value in near_miss_checksums}
+        else "wrong_checksum"
+    )
+    return {
+        "correct": False,
+        "score_label": label,
+        "score_detail": f"checksum {values['CHECKSUM']}, expected {expected_checksum}",
+        "parsed_answer": parsed,
+    }
+
+
 def score_completion_profile(
     *,
     profile: Optional[dict],
@@ -8068,6 +8255,7 @@ def score_completion_profile(
     source: str,
     item: Optional[dict] = None,
     finish_reason: str = "",
+    tool_calls: Optional[list] = None,
 ) -> dict:
     profile = profile or {}
     scorer = str(profile.get("scorer") or "")
@@ -8124,6 +8312,15 @@ def score_completion_profile(
             "score_detail": "exact" if is_exact else f"expected {expected:g}, got {parsed}",
             "parsed_answer": parsed,
         }
+
+    if scorer == "needle_checksum":
+        return score_needle_checksum(
+            tool_calls=list(tool_calls or []),
+            expected=dict(profile.get("expected_values") or {}),
+            near_miss_checksums=list(profile.get("near_miss_checksums") or []),
+            answer_tool=str(profile.get("answer_tool") or ""),
+            finish_reason=finish_reason,
+        )
 
     if scorer == "country_exact":
         return score_country_answer(
@@ -9972,6 +10169,8 @@ async def stream_completion_stats_request(
     output_buffer = []
     content_buffer = []
     reasoning_buffer = []
+    # Streamed tool calls by index: {"name": str, "arguments": [str, ...]}.
+    tool_call_parts: dict[int, dict] = {}
     usage = {}
     chunks = 0
     live_chars = 0
@@ -10060,7 +10259,18 @@ async def stream_completion_stats_request(
                     delta = choice.get("delta", {})
                     reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
                     content = delta.get("content") or ""
-                    text = reasoning + content
+                    tool_text = ""
+                    for call in delta.get("tool_calls") or []:
+                        part = tool_call_parts.setdefault(
+                            int(call.get("index") or 0), {"name": "", "arguments": []}
+                        )
+                        function = call.get("function") or {}
+                        if function.get("name"):
+                            part["name"] += str(function["name"])
+                        if function.get("arguments"):
+                            part["arguments"].append(str(function["arguments"]))
+                            tool_text += str(function["arguments"])
+                    text = reasoning + content + tool_text
                     if not text:
                         continue
                     now = time.monotonic()
@@ -10107,6 +10317,12 @@ async def stream_completion_stats_request(
     if unclosed_think and not reasoning_text:
         reasoning_text = content_text
     final_answer = extract_answer_line(visible_text)
+    tool_calls = [
+        {"name": part["name"], "arguments": "".join(part["arguments"])}
+        for _index, part in sorted(tool_call_parts.items())
+    ]
+    if tool_calls and not final_answer:
+        final_answer = "; ".join(f"{call['name']}({call['arguments']})" for call in tool_calls)
     completion_tokens = int(usage.get("completion_tokens") or 0)
     estimated_tokens = False
     if completion_tokens <= 0 and chunks > 0:
@@ -10128,6 +10344,7 @@ async def stream_completion_stats_request(
         source=score_source,
         item=item,
         finish_reason=finish_reason,
+        tool_calls=tool_calls,
     )
     excerpt_source = output_text if save_text else (final_answer or extract_final_answer(visible_text))
     excerpt = (excerpt_source or "").replace("\n", " ")[:240]
@@ -12217,6 +12434,9 @@ def summarize_completion_stats_runs(runs: list[CompletionStatsRun]) -> dict:
         "decoy": int(score_counts.get("decoy", 0)),
         "not_stated": int(score_counts.get("not_stated", 0)),
         "ambiguous": int(score_counts.get("ambiguous", 0)),
+        "near_miss": int(score_counts.get("near_miss", 0)),
+        "wrong_checksum": int(score_counts.get("wrong_checksum", 0)),
+        "wrong_facts": int(score_counts.get("wrong_facts", 0)),
         "unparseable": len([
             r for r in ok
             if r.correct is False and str(r.score_detail or "").startswith("unparseable")
@@ -12255,6 +12475,9 @@ SCORE_LABEL_DISPLAY = {
     "decoy": "DECOY",
     "not_stated": "NOT_STATED",
     "ambiguous": "AMBIG",
+    "near_miss": "NEAR_MISS",
+    "wrong_checksum": "WRONG_SUM",
+    "wrong_facts": "WRONG_FACTS",
     "truncated": "TRUNC",
     "stalled": "STALL",
     "timeout": "TIMEOUT",
@@ -12262,11 +12485,18 @@ SCORE_LABEL_DISPLAY = {
 }
 SCORE_LABEL_ORDER = (
     "exact", "pass", "near", "fail", "decoy", "not_stated", "ambiguous",
+    "near_miss", "wrong_checksum", "wrong_facts",
     "truncated", "stalled", "timeout", "cancelled",
 )
 INCOMPLETE_SCORE_LABELS = ("truncated", "stalled", "timeout")
 CORRECT_SCORE_LABELS = ("exact", "pass")
-WRONG_SCORE_LABELS = ("fail", "decoy", "not_stated", "ambiguous")
+WRONG_SCORE_LABELS = (
+    "fail", "decoy", "not_stated", "ambiguous", "near_miss", "wrong_checksum", "wrong_facts",
+)
+# Wrong-answer labels that get their own row in the selected-level summary.
+DETAIL_WRONG_SCORE_LABELS = (
+    "decoy", "not_stated", "ambiguous", "near_miss", "wrong_checksum", "wrong_facts",
+)
 
 
 def format_completion_score_summary(summary: dict) -> str:
@@ -12572,6 +12802,7 @@ def render_completion_stats_display(state: dict) -> Panel:
     panel_title = (
         "LAVD Test" if state.get("profile") == "lavd-test" else
         "Hotel Lights Test" if state.get("profile") == "hotel-lights" else
+        "Needle Checksum" if state.get("profile") == "needle-checksum" else
         "GSM8K Accuracy" if state.get("profile") == "gsm8k" else
         "MMLU-Pro Accuracy" if state.get("profile") == "mmlu-pro" else
         "GPQA Diamond Accuracy" if state.get("profile") == "gpqa-diamond" else
@@ -12877,6 +13108,14 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
         "a long structured context consistent, finds human data-entry errors, applies "
         "the repair rule, and returns the final ticket count and hours. "
     ) if scorer == "ledger_lavd" else (
+        "[bold]Needle Checksum Stability Test[/bold]\n"
+        "The same 8K-token context-check prompt is sent N times at temperature 0. The "
+        "model must retrieve ALPHA, BETA and GAMMA from three CANONICAL FACT lines and "
+        "submit CHECKSUM = ALPHA + 2*BETA + 3*GAMMA = 3332 in one submit_context_check "
+        "tool call. Greedy identical requests should all agree; wrong answers show how "
+        "often the serving stack's numerics tip the model's near-tie on the last digit "
+        "(NEAR_MISS = 3330). "
+    ) if scorer == "needle_checksum" else (
         "[bold]Hotel Lights Reasoning Test[/bold]\n"
         "A compact reasoning profile with a known numeric answer. It checks whether "
         "the model handles repeated toggles plus the cat reset rule and returns 48. "
@@ -13007,7 +13246,7 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
                 f"[yellow]{finished_text}; {incomplete} incomplete "
                 f"(truncated/stalled/timeout) excluded[/yellow]",
             )
-        for label in ("decoy", "not_stated", "ambiguous"):
+        for label in DETAIL_WRONG_SCORE_LABELS:
             if counts.get(label):
                 selected_table.add_row(
                     SCORE_LABEL_DISPLAY[label].lower().replace("_", " "),
@@ -13096,7 +13335,7 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
                 score_cell = f"[yellow]{label_text}[/yellow]"
             elif label == "ambiguous":
                 score_cell = f"[magenta]{label_text}[/magenta]"
-            elif label in ("decoy", "not_stated"):
+            elif label in ("decoy", "not_stated", "near_miss"):
                 score_cell = f"[cyan]{label_text}[/cyan]"
             else:
                 score_cell = label_text
@@ -13130,6 +13369,16 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
             "or the wall-clock limit; they count as not-correct but are runtime artifacts, so the "
             "report also shows the pass rate over finished runs. The 10-slot quality bar is a "
             "rounded distribution: ★=EXACT, ✕=FAIL, ⊘=incomplete.[/dim]"
+        )
+    elif str(metadata.get("profile_scorer") or "") == "needle_checksum":
+        console.print(
+            "[dim]Interpretation: EXACT means the single submit_context_check call carries "
+            "alpha 478, beta 788, gamma 426 and checksum 3332. NEAR_MISS is the known last-digit "
+            "slip (3330) with the right facts; WRONG_SUM any other checksum with the right facts; "
+            "WRONG_FACTS a wrongly retrieved value; FAIL no call, several calls or malformed "
+            "arguments. Requests are greedy and identical, so any wrong answer is the serving "
+            "stack's numerics, not sampling. TRUNC/STALL/TIMEOUT (⊘) never produced an answer. "
+            "Private reasoning is never scored. Quality bar: ★=EXACT, ✕=wrong, ⊘=incomplete.[/dim]"
         )
     elif str(metadata.get("profile_scorer") or "") == "country_exact":
         console.print(
@@ -13936,6 +14185,7 @@ async def run_completion_stats_benchmark(args) -> dict:
                     "GPQA Diamond accuracy benchmark" if profile_name == "gpqa-diamond" else
                     "MMLU-Pro accuracy benchmark" if (profile or {}).get("scorer") == "dataset_mc_letter" else
                     "LAVD context consistency test" if (profile or {}).get("scorer") == "ledger_lavd" else
+                    "Needle checksum stability test" if (profile or {}).get("scorer") == "needle_checksum" else
                     "Completion-token statistics"
                 ),
                 "prefill": (
@@ -13992,6 +14242,13 @@ async def run_completion_stats_benchmark(args) -> dict:
                     "unparseable answer. The 10-slot quality bar is a rounded distribution: "
                     "★=EXACT, ✕=FAIL."
                     if (profile or {}).get("scorer") == "numeric_exact" else
+                    "The streamed submit_context_check tool call is parsed. EXACT needs exactly "
+                    "one call with integer alpha 478, beta 788, gamma 426 and checksum 3332; "
+                    "NEAR_MISS is checksum 3330 with the right facts, WRONG_SUM another checksum, "
+                    "WRONG_FACTS a wrong retrieved value and FAIL a missing, repeated or malformed "
+                    "call. Requests are greedy and identical, so the wrong-answer rate measures "
+                    "numerical stability of the serving stack, not sampling."
+                    if (profile or {}).get("scorer") == "needle_checksum" else
                     "By default correctness is scored by applying the regex to the final "
                     "non-empty answer line, matching the GLM dense-MLA vs NSA comparison."
                 ),
@@ -16780,6 +17037,9 @@ def parse_args():
         help=(
             f"Run a built-in long-answer test profile. Available: {', '.join(builtin_test_profile_names())}. "
             "hotel-lights is a compact reasoning test with expected answer 48. "
+            "needle-checksum sends one 8K-token retrieval+arithmetic prompt 500 times at temperature 0 "
+            "and counts how often identical greedy requests submit a wrong checksum through its tool call "
+            "(numerical stability of the serving stack; needs tool calling enabled on the server). "
             "lavd-test is a context consistency test: arithmetic any model can do, but the model must "
             "find human errors in long structured data and understand how to repair them before computing "
             "ticket count and hours. "
@@ -17505,6 +17765,7 @@ def main():
         config_title = (
             "LAVD Context Consistency Test" if args.test_profile == "lavd-test" else
             "Hotel Lights Reasoning Test" if args.test_profile == "hotel-lights" else
+            "Needle Checksum Stability Test" if args.test_profile == "needle-checksum" else
             "Estonia Long-Context Chain Test" if profile_config.get("scorer") == "country_exact" else
             "GSM8K Accuracy Benchmark" if args.test_profile == "gsm8k" else
             "MMLU-Pro Accuracy Benchmark" if args.test_profile == "mmlu-pro" else
@@ -17516,6 +17777,8 @@ def main():
             if profile_config.get("scorer") == "ledger_lavd" else
             "EXACT / FAIL asserted final number (strict; reasoning never scored)"
             if profile_config.get("scorer") == "numeric_exact" else
+            "EXACT / NEAR_MISS (3330) / WRONG_SUM / WRONG_FACTS / FAIL submit_context_check call (expected checksum 3332)"
+            if profile_config.get("scorer") == "needle_checksum" else
             f"PASS / DECOY / NOT_STATED / FAIL asserted country (expected {profile_config.get('expected_answer')})"
             if profile_config.get("scorer") == "country_exact" else
             "per-item final number vs GSM8K reference"

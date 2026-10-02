@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.6 - 2026-10-02
+
+### needle-checksum profile
+
+- New built-in profile `needle-checksum` (aliases `needle`, `checksum`,
+  `checksum-3332`): logprobz's GLM-5.3-Flash checksum probe, rebuilt exactly.
+  One 8K-token prompt (three `CANONICAL FACT` values among 291 inert records)
+  is sent 500 times at concurrency 8 and temperature 0. The answer is
+  `ALPHA + 2*BETA + 3*GAMMA = 3332`, submitted through one `submit_context_check`
+  tool call. Identical greedy requests should all agree, so the wrong-answer
+  rate measures the serving stack's numerical stability.
+- New scorer `needle_checksum` with labels `NEAR_MISS` (3330, the model's known
+  last-digit slip), `WRONG_SUM`, `WRONG_FACTS` and `FAIL`.
+- Completion-stats requests now collect streamed `tool_calls` deltas and pass the
+  joined calls to the scorer. Tool-call tokens count toward TTFT and streaming
+  progress.
+- Reference results on GLM-5.3-Flash TP4 (4× RTX PRO 6000 Max-Q), at C8:
+  QAD with b12x W4A4 has 6.0% wrong answers, QAD with W4A16 and FP32 router
+  weights 0%, and the pre-QAD checkpoint with W4A16 18.0%.
+
 ## 0.7.5 - 2026-09-30
 
 ### lil-bench 1.3.2: KV capacity of hybrid models
