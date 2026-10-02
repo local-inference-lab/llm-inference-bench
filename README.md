@@ -589,8 +589,9 @@ Karmic Kraken beta, 500 requests per cell:
 | Checkpoint and MoE activations | wrong at C8 (default) | wrong at C30 |
 |---|---|---|
 | QAD (HF main), b12x W4A4 (profile default) | 6.0% | 9.0% |
+| QAD, b12x W4A16 (BF16 router weights) | 0% | 0% |
 | QAD, b12x W4A16 + `B12X_W4A16_FP32_TOPK_WEIGHTS=1` | 0% | 0% |
-| pre-QAD `46aaae8a`, b12x W4A16 | 18.0% | 23.2% |
+| pre-QAD `46aaae8a`, b12x W4A16 (BF16 router weights) | 18.0% | 23.2% |
 
 Higher concurrency adds batch-composition noise, so compare runs at the same
 `--profile-concurrency`. logprobz reports DeepSeek V4 and V4.1 Flash at 500/500,

@@ -17,8 +17,8 @@
   joined calls to the scorer. Tool-call tokens count toward TTFT and streaming
   progress.
 - Reference results on GLM-5.3-Flash TP4 (4× RTX PRO 6000 Max-Q), at C8:
-  QAD with b12x W4A4 has 6.0% wrong answers, QAD with W4A16 and FP32 router
-  weights 0%, and the pre-QAD checkpoint with W4A16 18.0%.
+  QAD with b12x W4A4 has 6.0% wrong answers, QAD with W4A16 0% (with BF16 or
+  FP32 router weights), and the pre-QAD checkpoint with W4A16 18.0%.
 
 ## 0.7.5 - 2026-09-30
 
