@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.7 - 2026-10-04
+
+### tool-eval-bench: tool-calling quality with the leaderboard settings
+
+- New mode `--tool-eval` runs
+  [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (MIT)
+  against the server the bench targets, with the community leaderboard
+  settings: `--hardmode --seed 42 --temperature 0 --parallel 4 --max-turns 30
+  --timeout 600`, backend label `vllm`. `--host`/`--port` become `--base-url
+  http://<host>:<port>/`, `--model` (or the first served model) its `--model`,
+  and `--api-key` travels in its environment. `--tool-eval-seed`,
+  `--tool-eval-temperature`, `--tool-eval-parallel`, `--tool-eval-max-turns`,
+  `--tool-eval-timeout` and `--[no-]tool-eval-hardmode` change single settings;
+  `--tool-eval-args` appends other tool-eval-bench options, such as
+  `--scenarios` for a short subset. A run with changed settings is reported as
+  custom, not as leaderboard settings.
+- tool-eval-bench stays an external program. The first run installs the pinned
+  commit `570951a7` (version `2.7.1.dev14+g570951a77`, 69 + 23 Hard Mode
+  scenarios) from GitHub into its own venv under
+  `~/.cache/llm_decode_bench/tool-eval-bench/<commit>/` (or
+  `LLM_BENCH_CACHE_DIR`); the environment that runs the bench, in the serving
+  images the server's venv, is never modified. `--tool-eval-ref` /
+  `LLM_BENCH_TOOL_EVAL_REF` select another commit, tag or branch,
+  `LLM_BENCH_TOOL_EVAL_REPO` a mirror, and `--tool-eval-bin` an existing
+  install. Without network access the run stops with an error that says so.
+- The report shows one line per finished scenario, then the score and rating,
+  pass/partial/fail counts, pass rate, completion rate, safety warnings, the
+  per-category table, the Hard Mode capabilities and the scenarios that did
+  not pass. `--output` holds the summary (`tool_eval`) and tool-eval-bench's
+  JSON as written (`tool_eval_raw`); `<output>.tool-eval/` keeps its
+  `run.json`, progress events, Markdown report and SQLite database. A failed
+  run still writes `--output` with `tool_eval.error` and exits with code 1.
+- Validated on GLM-5.3-Flash NVFP4 TP4 (4× RTX PRO 6000 Blackwell): 91/100
+  median over 12 runs (86–93), about 85 s per run. `--tool-eval` and the
+  leaderboard command run directly give the same config fingerprint, and their
+  scores differ less than the run-to-run noise of `--parallel 4`.
+
 ## 0.7.6 - 2026-10-02
 
 ### needle-checksum profile

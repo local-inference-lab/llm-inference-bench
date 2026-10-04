@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import base64
 import csv
+import fcntl
 import glob
 import hashlib
 import io
@@ -29,6 +30,7 @@ import queue
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import string
@@ -37,6 +39,7 @@ import sys
 import termios
 import threading
 import time
+import traceback
 import tty
 import zipfile
 import zlib
@@ -54,6 +57,7 @@ from rich.columns import Columns
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
@@ -63,7 +67,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.7.6"
+VERSION = "0.7.7"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -6206,13 +6210,18 @@ def default_p2pmark_bin() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "p2pmark", "llm_p2pmark")
 
 
+def bench_cache_root() -> str:
+    """Cache directory of the bench's own helpers: $LLM_BENCH_CACHE_DIR or ~/.cache/llm_decode_bench."""
+    return os.environ.get("LLM_BENCH_CACHE_DIR", os.path.expanduser("~/.cache/llm_decode_bench"))
+
+
 def ensure_embedded_p2pmark_binary() -> str:
     """Extract the bundled Linux x86_64 CUDA/NCCL helper if no sidecar binary exists."""
     blob = globals().get("P2PMARK_EMBEDDED_ZLIB_B64", "").strip()
     expected_sha = globals().get("P2PMARK_EMBEDDED_SHA256", "").strip()
     if not blob or not expected_sha:
         return ""
-    cache_root = os.environ.get("LLM_BENCH_CACHE_DIR", os.path.expanduser("~/.cache/llm_decode_bench"))
+    cache_root = bench_cache_root()
     cache_dir = os.path.join(cache_root, "bin")
     path = os.path.join(cache_dir, f"llm_p2pmark-{expected_sha[:16]}")
     try:
@@ -16827,6 +16836,1187 @@ def append_coding_peak_to_report(filepath: str, coding_peak: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# tool-eval-bench: agentic tool-calling quality (--tool-eval)
+# ---------------------------------------------------------------------------
+#
+# tool-eval-bench (https://github.com/SeraphimSerapis/tool-eval-bench, MIT
+# license) runs as an external program. A pinned commit is installed on first
+# use into its own virtual environment under the bench cache directory, never
+# into the Python environment that runs this script (in the serving images that
+# is the server's venv). Its JSON result is parsed and summarized here; no
+# scenario, grader or data of tool-eval-bench is copied into this repository.
+
+TOOL_EVAL_REPO_URL = "https://github.com/SeraphimSerapis/tool-eval-bench.git"
+TOOL_EVAL_REPO_ENV = "LLM_BENCH_TOOL_EVAL_REPO"
+TOOL_EVAL_REF_ENV = "LLM_BENCH_TOOL_EVAL_REF"
+# main after v2.7.0 (2026-10-04): 69 standard and 23 Hard Mode scenarios.
+# A git install of this commit reports version 2.7.1.dev14+g570951a77.
+TOOL_EVAL_PINNED_REF = "570951a77e88367632eac87e60292ec8f3b599e7"
+# The pinned commit's direct dependencies as resolved on 2026-10-04. They are
+# pip constraints only for the pinned commit; another --tool-eval-ref resolves
+# its own dependencies.
+TOOL_EVAL_PINNED_CONSTRAINTS = (
+    "httpx==0.28.1",
+    "python-dotenv==1.2.4",
+    "PyYAML==6.0.3",
+    "rich==15.0.0",
+)
+TOOL_EVAL_MIN_PYTHON = (3, 11)
+# The community leaderboard command these defaults reproduce:
+#   tool-eval-bench --model <served model> --base-url http://<host>:<port>/ \
+#     --backend vllm --hardmode --seed 42 --temperature 0 --parallel 4 \
+#     --max-turns 30 --timeout 600 --no-live --json --json-file run.json
+TOOL_EVAL_LEADERBOARD_SETTINGS = {
+    "backend": "vllm",
+    "hardmode": True,
+    "seed": 42,
+    "temperature": 0.0,
+    "parallel": 4,
+    "max_turns": 30,
+    "timeout": 600.0,
+}
+# tool-eval-bench options that --tool-eval-args may not set, with the bench
+# option that sets each of them instead (None: always set by the bench).
+TOOL_EVAL_MANAGED_OPTIONS = {
+    "--model": "--model",
+    "--base-url": "--host/--port",
+    "--api-key": "--api-key",
+    "--provider": "--host/--port",
+    "--hardmode": "--tool-eval-hardmode / --no-tool-eval-hardmode",
+    "--seed": "--tool-eval-seed",
+    "--temperature": "--tool-eval-temperature",
+    "--parallel": "--tool-eval-parallel",
+    "--max-turns": "--tool-eval-max-turns",
+    "--timeout": "--tool-eval-timeout",
+    "--json": None,
+    "--json-file": "--output",
+    "--no-live": None,
+}
+TOOL_EVAL_JSON_FILE = "run.json"
+TOOL_EVAL_PROGRESS_LOG = "progress.jsonl"
+TOOL_EVAL_STATUS_STYLE = {"pass": PHOSPHOR, "partial": "yellow", "fail": PHOSPHOR_WARN}
+
+
+class ToolEvalError(RuntimeError):
+    """A --tool-eval run that produced no result; ``kind`` says which step failed."""
+
+    def __init__(self, kind: str, message: str, hint: str = "", detail: str = ""):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.hint = hint
+        self.detail = detail
+
+    def to_dict(self) -> dict:
+        out = {"kind": self.kind, "message": self.message}
+        if self.hint:
+            out["hint"] = self.hint
+        if self.detail:
+            out["detail"] = self.detail
+        return out
+
+
+def _tool_eval_run(cmd: list, *, timeout: Optional[float] = None,
+                   env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    """Run a helper command (git, venv, pip) and capture its output.
+
+    A command that cannot start or does not finish in time is an install error.
+    """
+    name = " ".join(str(part) for part in cmd[:4])
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        raise ToolEvalError("install", f"`{name} ...` did not finish within {timeout:g} s.")
+    except OSError as exc:
+        raise ToolEvalError("install", f"Cannot run `{name} ...`: {exc}")
+
+
+def _tool_eval_tail(text: str, lines: int = 15) -> str:
+    return "\n".join((text or "").strip().splitlines()[-lines:])
+
+
+def tool_eval_option_value(tokens: list, option: str) -> Optional[str]:
+    """Value of ``option`` in an argv list (``--opt value`` or ``--opt=value``); last wins."""
+    value = None
+    for idx, token in enumerate(tokens):
+        if token == option and idx + 1 < len(tokens):
+            value = tokens[idx + 1]
+        elif token.startswith(option + "="):
+            value = token.split("=", 1)[1]
+    return value
+
+
+def parse_tool_eval_extra_args(text: str) -> list:
+    """Split --tool-eval-args; raise ValueError for options the bench sets itself."""
+    try:
+        tokens = shlex.split(text or "")
+    except ValueError as exc:
+        raise ValueError(f"--tool-eval-args is not valid shell syntax: {exc}") from exc
+    for token in tokens:
+        name = token.split("=", 1)[0]
+        if not name.startswith("--") or name == "--":
+            continue
+        # tool-eval-bench's argparse also accepts unambiguous abbreviations (--temp).
+        managed = [name] if name in TOOL_EVAL_MANAGED_OPTIONS else [
+            option for option in TOOL_EVAL_MANAGED_OPTIONS if option.startswith(name)
+        ]
+        if managed:
+            replacement = TOOL_EVAL_MANAGED_OPTIONS[managed[0]]
+            what = name if name == managed[0] else f"{name} (short for {' or '.join(managed)})"
+            hint = f"; use {replacement} instead" if replacement else ""
+            raise ValueError(f"--tool-eval-args may not contain {what}: the bench sets it{hint}")
+    return tokens
+
+
+def tool_eval_settings(args) -> dict:
+    """The tool-eval-bench run settings, and whether they are the leaderboard's."""
+    extra_args = list(getattr(args, "tool_eval_extra_args", None) or [])
+    settings = {
+        "backend": tool_eval_option_value(extra_args, "--backend")
+        or TOOL_EVAL_LEADERBOARD_SETTINGS["backend"],
+        "hardmode": bool(args.tool_eval_hardmode),
+        "seed": int(args.tool_eval_seed),
+        "temperature": float(args.tool_eval_temperature),
+        "parallel": int(args.tool_eval_parallel),
+        "max_turns": int(args.tool_eval_max_turns),
+        "timeout": float(args.tool_eval_timeout),
+        "extra_args": extra_args,
+    }
+    differs = [name for name, value in TOOL_EVAL_LEADERBOARD_SETTINGS.items() if settings[name] != value]
+    settings["differs_from_leaderboard"] = differs
+    settings["leaderboard"] = not differs and not extra_args
+    return settings
+
+
+def _tool_eval_number(value: float) -> str:
+    """Format a float the way a person types it on the command line (0, 600, 0.7)."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
+def tool_eval_base_url(args) -> str:
+    """The bench target as tool-eval-bench's --base-url.
+
+    A bare host:port gets the trailing slash of the leaderboard command
+    (``http://localhost:8000/``): tool-eval-bench records the URL in the config
+    fingerprint that groups comparable runs, so the same server gives the same
+    fingerprint as the leaderboard command.
+    """
+    base_url = build_base_url_from_args(args)
+    if urlparse(base_url).path in ("", "/"):
+        base_url = base_url.rstrip("/") + "/"
+    return base_url
+
+
+def build_tool_eval_command(runner: list, *, model: str, base_url: str, settings: dict,
+                            json_file: str = TOOL_EVAL_JSON_FILE) -> list:
+    """tool-eval-bench argv in the leaderboard command's order, then --tool-eval-args."""
+    extra_args = list(settings.get("extra_args") or [])
+    cmd = list(runner) + ["--model", model, "--base-url", base_url]
+    if tool_eval_option_value(extra_args, "--backend") is None:
+        cmd += ["--backend", settings["backend"]]
+    if settings["hardmode"]:
+        cmd.append("--hardmode")
+    cmd += [
+        "--seed", str(settings["seed"]),
+        "--temperature", _tool_eval_number(settings["temperature"]),
+        "--parallel", str(settings["parallel"]),
+        "--max-turns", str(settings["max_turns"]),
+        "--timeout", _tool_eval_number(settings["timeout"]),
+        "--no-live", "--json", "--json-file", json_file,
+    ]
+    return cmd + extra_args
+
+
+def tool_eval_artifacts_dir(output_path: str) -> Path:
+    """Directory next to --output for tool-eval-bench's own files (run.json, report, SQLite)."""
+    path = Path(output_path)
+    stem = path.with_suffix("") if path.suffix.lower() == ".json" else path
+    return stem.parent / f"{stem.name}.tool-eval"
+
+
+def tool_eval_child_env(api_key: str = "", venv_dir: Optional[Path] = None) -> dict:
+    """Environment for tool-eval-bench: the bench's target and credentials only.
+
+    TOOL_EVAL_PROVIDER is blanked so a named provider in the environment or a
+    .env file cannot redirect the run, and the API key travels in the
+    environment instead of argv (process lists, the recorded command).
+    PYTHONPATH and PYTHONHOME are dropped so the serving environment's packages
+    cannot shadow tool-eval-bench's own.
+    """
+    env = dict(os.environ)
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"):
+        env.pop(name, None)
+    if venv_dir is not None:
+        env["VIRTUAL_ENV"] = str(venv_dir)
+        env["PATH"] = os.pathsep.join([str(venv_dir / "bin"), env.get("PATH", "")])
+    env["PYTHONUNBUFFERED"] = "1"
+    env["TOOL_EVAL_PROVIDER"] = ""
+    env["TOOL_EVAL_API_KEY"] = api_key or ""
+    return env
+
+
+def _tool_eval_pip_env() -> dict:
+    """Environment for venv/pip: no global pip settings that would redirect or constrain the install."""
+    env = dict(os.environ)
+    for name in ("PIP_CONSTRAINT", "PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PIP_REQUIRE_VIRTUALENV",
+                 "PIP_NO_INDEX", "PIP_ROOT", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        env.pop(name, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return env
+
+
+def tool_eval_cache_root() -> Path:
+    return Path(bench_cache_root()) / "tool-eval-bench"
+
+
+def tool_eval_repo_url() -> str:
+    return os.environ.get(TOOL_EVAL_REPO_ENV) or TOOL_EVAL_REPO_URL
+
+
+def tool_eval_pip_url(repo: str) -> str:
+    """The repository as a pip VCS URL: local paths become file://, user@host:path ssh://."""
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", repo):
+        return repo
+    scp = re.match(r"^([^@/:]+@)?([^/:]+):(.+)$", repo)
+    if scp and not os.path.exists(repo):
+        return f"ssh://{scp.group(1) or ''}{scp.group(2)}/{scp.group(3).lstrip('/')}"
+    return Path(repo).expanduser().resolve().as_uri()
+
+
+def tool_eval_network_problem(repo: str) -> str:
+    """'' when the repository host and the package index answer HTTP, else why not."""
+    urls = []
+    if repo.startswith(("http://", "https://")):
+        parsed = urlparse(repo)
+        urls.append(f"{parsed.scheme}://{parsed.netloc}/")
+    urls.append(os.environ.get("PIP_INDEX_URL") or "https://pypi.org/simple/")
+    for url in urls:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(10.0), follow_redirects=True) as client:
+                client.head(url)
+        except Exception as exc:
+            return f"{urlparse(url).netloc or url}: {type(exc).__name__}: {exc}"
+    return ""
+
+
+def _tool_eval_offline_hint(repo: str) -> str:
+    return (
+        f"The first --tool-eval run with a tool-eval-bench version installs it from {repo} and "
+        "PyPI. Run it once on a host with network access (the install is cached under "
+        f"{tool_eval_cache_root()}, or LLM_BENCH_CACHE_DIR), point {TOOL_EVAL_REPO_ENV} at a "
+        "reachable mirror, or install tool-eval-bench yourself and pass --tool-eval-bin."
+    )
+
+
+def _tool_eval_ref_cache() -> Path:
+    return tool_eval_cache_root() / "refs.json"
+
+
+def _remember_tool_eval_ref(repo: str, ref: str, commit: str) -> None:
+    path = _tool_eval_ref_cache()
+    try:
+        known = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        known.setdefault(repo, {})[ref] = {
+            "commit": commit, "resolved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(known, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, ValueError, AttributeError):
+        pass  # only an offline convenience
+
+
+def _cached_tool_eval_ref(repo: str, ref: str) -> Optional[dict]:
+    """The commit ``ref`` resolved to on an earlier online run, if that commit is installed."""
+    try:
+        entry = json.loads(_tool_eval_ref_cache().read_text(encoding="utf-8"))[repo][ref]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(entry, dict) or not _read_tool_eval_install(tool_eval_cache_root() / str(entry.get("commit"))):
+        return None
+    return entry
+
+
+def resolve_tool_eval_ref(ref: str, repo: str, console: Optional[Console] = None) -> str:
+    """A commit id for ``ref``: commit ids as given, branches and tags via git ls-remote.
+
+    A short id of the pinned commit becomes the pinned commit (same venv, same
+    dependency pins). Offline, a branch or tag resolved on an earlier run is
+    reused when its commit is installed.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        raise ToolEvalError("install", "Empty tool-eval-bench ref.")
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", ref):
+        ref = ref.lower()
+        return TOOL_EVAL_PINNED_REF if TOOL_EVAL_PINNED_REF.startswith(ref) else ref
+    if not shutil.which("git"):
+        raise ToolEvalError(
+            "install",
+            f"Cannot resolve the tool-eval-bench ref '{ref}': git is not installed.",
+            hint="Install git (pip needs it to install from GitHub), or pass a commit id with --tool-eval-ref.",
+        )
+    try:
+        proc = _tool_eval_run(["git", "ls-remote", repo, ref], timeout=60, env=_tool_eval_pip_env())
+        failed, output = proc.returncode != 0, (proc.stdout or "") + (proc.stderr or "")
+    except ToolEvalError as exc:
+        proc, failed, output = None, True, exc.message
+    if failed:
+        problem = tool_eval_network_problem(repo)
+        if problem:
+            cached = _cached_tool_eval_ref(repo, ref)
+            if cached:
+                if console is not None:
+                    console.print(Text(
+                        f"No network ({problem}); using {ref} = {cached['commit'][:12]} as resolved "
+                        f"on {cached.get('resolved_at')}.", style="yellow",
+                    ))
+                return str(cached["commit"])
+            raise ToolEvalError(
+                "network",
+                f"Cannot resolve the tool-eval-bench ref '{ref}': no network access ({problem}).",
+                hint=_tool_eval_offline_hint(repo),
+                detail=_tool_eval_tail(output),
+            )
+        raise ToolEvalError(
+            "install",
+            f"git ls-remote {repo} {ref} failed" + ("." if proc is None else f" (exit {proc.returncode})."),
+            detail=_tool_eval_tail(output),
+        )
+    refs = {}
+    for line in proc.stdout.splitlines():
+        sha, _, name = line.strip().partition("\t")
+        if sha and name:
+            refs[name] = sha
+    for name in (f"refs/tags/{ref}^{{}}", f"refs/tags/{ref}", f"refs/heads/{ref}", ref):
+        if name in refs:
+            commit = refs[name].lower()
+            _remember_tool_eval_ref(repo, ref, commit)
+            return commit
+    raise ToolEvalError("install", f"{repo} has no branch or tag named '{ref}'.")
+
+
+def find_tool_eval_python() -> str:
+    """An interpreter new enough for tool-eval-bench: this one, else python3.13/3.12/3.11 on PATH."""
+    if sys.version_info[:2] >= TOOL_EVAL_MIN_PYTHON:
+        return sys.executable
+    for name in ("python3.13", "python3.12", "python3.11"):
+        path = shutil.which(name)
+        if path:
+            return path
+    need = ".".join(str(part) for part in TOOL_EVAL_MIN_PYTHON)
+    raise ToolEvalError(
+        "python",
+        f"tool-eval-bench needs Python {need} or newer; this bench runs on Python "
+        f"{sys.version.split()[0]} and no python3.11+ is on PATH.",
+        hint="Run the bench with a newer python3, or install tool-eval-bench yourself and pass --tool-eval-bin.",
+    )
+
+
+def _read_tool_eval_install(env_dir: Path) -> Optional[dict]:
+    marker = env_dir / "install.json"
+    python = env_dir / "venv" / "bin" / "python"
+    try:
+        info = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(info, dict) or not os.access(python, os.X_OK):
+        return None
+    info["python"] = str(python)
+    return info
+
+
+def _create_tool_eval_venv(base_python: str, venv_dir: Path) -> None:
+    env = _tool_eval_pip_env()
+    proc = _tool_eval_run([base_python, "-m", "venv", str(venv_dir)], timeout=600, env=env)
+    if proc.returncode == 0:
+        return
+    # Debian/Ubuntu without python3-venv have no ensurepip: build the venv
+    # without pip and let this interpreter's pip install into it.
+    fallback = _tool_eval_run([base_python, "-m", "venv", "--clear", "--without-pip", str(venv_dir)],
+                              timeout=600, env=env)
+    pip_ok = _tool_eval_run([base_python, "-m", "pip", "--version"], timeout=120, env=env)
+    pip_version = re.match(r"pip (\d+)\.(\d+)", pip_ok.stdout or "")
+    # `pip --python <interpreter>` (installing into another environment) needs pip 22.3+.
+    pip_usable = pip_ok.returncode == 0 and pip_version is not None and \
+        (int(pip_version.group(1)), int(pip_version.group(2))) >= (22, 3)
+    if fallback.returncode == 0 and pip_usable:
+        return
+    reason = "`-m venv` failed (output below)"
+    if fallback.returncode == 0:
+        reason += (f", and its pip {pip_version.group(1)}.{pip_version.group(2)} cannot install into "
+                   "another environment (needs pip 22.3+)" if pip_version else ", and it has no pip")
+    raise ToolEvalError(
+        "install",
+        f"Cannot create a Python virtual environment for tool-eval-bench with {base_python}: {reason}.",
+        hint="Install venv/ensurepip for this Python (Debian/Ubuntu: python3-venv), or install "
+             "tool-eval-bench yourself and pass --tool-eval-bin.",
+        detail=_tool_eval_tail((proc.stdout or "") + (proc.stderr or "")),
+    )
+
+
+def _probe_tool_eval_install(python: str) -> dict:
+    code = (
+        "import importlib.metadata as m, json, sys\n"
+        "d = m.distribution('tool-eval-bench')\n"
+        "url = json.loads(d.read_text('direct_url.json') or '{}')\n"
+        "print(json.dumps({'version': d.version, 'commit': (url.get('vcs_info') or {}).get('commit_id', ''),\n"
+        "                  'python_version': sys.version.split()[0]}))\n"
+    )
+    proc = _tool_eval_run([python, "-c", code], timeout=120, env=tool_eval_child_env())
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise ToolEvalError(
+            "install",
+            "tool-eval-bench was installed but cannot be imported.",
+            detail=_tool_eval_tail((proc.stdout or "") + (proc.stderr or "")),
+        )
+    return info
+
+
+def ensure_tool_eval_install(ref: str, console: Optional[Console] = None) -> dict:
+    """Install the tool-eval-bench commit for ``ref`` once; return its interpreter and version.
+
+    Each commit gets its own venv under ``<cache>/tool-eval-bench/<commit>``;
+    install.json is written last, so an interrupted install is redone.
+    """
+    repo = tool_eval_repo_url()
+    key = resolve_tool_eval_ref(ref, repo, console)
+    root = tool_eval_cache_root()
+    env_dir = root / key
+    info = _read_tool_eval_install(env_dir)
+    if info:
+        info["installed_now"] = False
+        return info
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / f".{key}.lock", "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            return _install_tool_eval_locked(repo, ref, key, env_dir, console)
+    except OSError as exc:
+        raise ToolEvalError("install", f"Cannot write the tool-eval-bench cache at {env_dir}: {exc}",
+                            hint="Set LLM_BENCH_CACHE_DIR to a writable directory.")
+
+
+def _install_tool_eval_locked(repo: str, ref: str, key: str, env_dir: Path,
+                              console: Optional[Console]) -> dict:
+    info = _read_tool_eval_install(env_dir)
+    if info:  # another run installed it while this one waited for the lock
+        info["installed_now"] = False
+        return info
+    base_python = find_tool_eval_python()
+    venv_dir = env_dir / "venv"
+    python = venv_dir / "bin" / "python"
+    if console is not None:
+        console.print(
+            f"[cyan]Installing tool-eval-bench {escape(key[:12])} from {escape(repo)}[/cyan] "
+            f"[dim]into {escape(str(venv_dir))} (once per version; needs network access)[/dim]"
+        )
+    started = time.monotonic()
+    shutil.rmtree(env_dir, ignore_errors=True)
+    env_dir.mkdir(parents=True, exist_ok=True)
+    _create_tool_eval_venv(base_python, venv_dir)
+    pip = [str(python), "-m", "pip"]
+    if not (venv_dir / "bin" / "pip").exists():
+        pip = [base_python, "-m", "pip", "--python", str(python)]
+    constraints = []
+    if key == TOOL_EVAL_PINNED_REF:
+        constraints_path = env_dir / "constraints.txt"
+        constraints_path.write_text("\n".join(TOOL_EVAL_PINNED_CONSTRAINTS) + "\n", encoding="utf-8")
+        constraints = ["-c", str(constraints_path)]
+    requirement = f"tool-eval-bench @ git+{tool_eval_pip_url(repo)}@{key}"
+    # Bounded retries and socket timeout: a host whose traffic is dropped fails in minutes, not hours.
+    proc = _tool_eval_run(pip + ["install", "--no-input", "--retries", "2", "--timeout", "60",
+                                 *constraints, requirement],
+                          timeout=1800, env=_tool_eval_pip_env())
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        problem = tool_eval_network_problem(repo)
+        if problem:
+            raise ToolEvalError(
+                "network",
+                f"Cannot install tool-eval-bench {key[:12]}: no network access ({problem}).",
+                hint=_tool_eval_offline_hint(repo),
+                detail=_tool_eval_tail(output),
+            )
+        raise ToolEvalError(
+            "install",
+            f"pip could not install tool-eval-bench {key[:12]} from {repo} (exit {proc.returncode}).",
+            hint=f"Check the ref (--tool-eval-ref / {TOOL_EVAL_REF_ENV}) and the pip output below.",
+            detail=_tool_eval_tail(output),
+        )
+    probe = _probe_tool_eval_install(str(python))
+    info = {
+        "repo": repo,
+        "ref": ref,
+        "commit": probe.get("commit") or key,
+        "version": probe.get("version") or "",
+        "python_version": probe.get("python_version") or "",
+        "constraints": list(TOOL_EVAL_PINNED_CONSTRAINTS) if constraints else [],
+        "installed_at": datetime.now().isoformat(timespec="seconds"),
+        "install_seconds": round(time.monotonic() - started, 1),
+    }
+    (env_dir / "install.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+    if console is not None:
+        console.print(
+            f"[green]Installed tool-eval-bench {escape(info['version'])}[/green] "
+            f"[dim]in {info['install_seconds']:.1f}s[/dim]"
+        )
+    info["python"] = str(python)
+    info["installed_now"] = True
+    return info
+
+
+def tool_eval_external_bin(path: str) -> dict:
+    """Runner for --tool-eval-bin: an existing tool-eval-bench executable."""
+    resolved = shutil.which(path) or path
+    if not (os.path.isfile(resolved) and os.access(resolved, os.X_OK)):
+        raise ToolEvalError("install", f"--tool-eval-bin {path} is not an executable file.")
+    proc = _tool_eval_run([resolved, "--version"], timeout=120, env=tool_eval_child_env())
+    match = re.search(r"tool-eval-bench\s+(\S+)", proc.stdout or "")
+    return {"executable": resolved, "version": match.group(1) if match else "", "commit": "", "ref": ""}
+
+
+def fetch_tool_eval_target(base_url: str, api_key: str = "") -> dict:
+    """Served models and engine version of the target, before anything is installed."""
+    root = base_url.rstrip("/")
+    root = root[:-3] if root.endswith("/v1") else root
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    info = {"models": [], "max_model_len": 0, "engine_version": ""}
+    try:
+        with httpx.Client(headers=headers, timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+            resp = client.get(f"{root}/v1/models")
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            info["models"] = [str(m.get("id")) for m in data if m.get("id")]
+            if data:
+                info["max_model_len"] = int(data[0].get("max_model_len") or 0)
+            try:
+                version = client.get(f"{root}/version", timeout=5.0)
+                if version.status_code < 400:
+                    info["engine_version"] = str(version.json().get("version") or "")
+            except Exception:
+                pass
+    except Exception as exc:
+        raise ToolEvalError(
+            "server",
+            f"Cannot connect to the OpenAI-compatible server at {root}: {type(exc).__name__}: {exc}",
+            hint="Check --host/--port (and --api-key); the server must be up before tool-eval-bench starts.",
+        )
+    return info
+
+
+def summarize_tool_eval_result(raw: dict, titles: Optional[dict] = None) -> dict:
+    """Headline numbers of a tool-eval-bench JSON result (schema_version 1)."""
+    if not isinstance(raw, dict):
+        raise ToolEvalError("json", f"tool-eval-bench JSON is a {type(raw).__name__}, not an object.")
+    scores = raw.get("scores")
+    if raw.get("error") and not isinstance(scores, dict):
+        raise ToolEvalError("tool", f"tool-eval-bench reported an error: {raw.get('error')}")
+    if not isinstance(scores, dict) or not isinstance(scores.get("scenario_results"), list):
+        raise ToolEvalError(
+            "json",
+            "tool-eval-bench JSON has no scores.scenario_results "
+            f"(schema_version {raw.get('schema_version')!r}); this format is not supported.",
+        )
+    final_score = raw.get("final_score", scores.get("final_score"))
+    if not isinstance(final_score, (int, float)) or isinstance(final_score, bool):
+        raise ToolEvalError("json", f"tool-eval-bench JSON has no numeric final_score ({final_score!r}).")
+    titles = titles or {}
+    results = [r for r in scores["scenario_results"] if isinstance(r, dict)]
+    counts = {"pass": 0, "partial": 0, "fail": 0}
+    for result in results:
+        status = str(result.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+    excluded = [str(s) for s in scores.get("excluded_scenarios") or []]
+    graded = len(results) - len(excluded)
+    config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    categories = []
+    for cat in scores.get("category_scores") or []:
+        categories.append({
+            "category": cat.get("category"),
+            "label": cat.get("label"),
+            "earned": cat.get("earned"),
+            "max": cat.get("max"),
+            "percent": cat.get("percent"),
+            "pass": cat.get("pass_count"),
+            "partial": cat.get("partial_count"),
+            "fail": cat.get("fail_count"),
+        })
+    capabilities = []
+    for cap in scores.get("capability_scores") or []:
+        capabilities.append({
+            "capability": cap.get("capability"),
+            "label": cap.get("label"),
+            "earned": cap.get("earned"),
+            "max": cap.get("max"),
+            "percent": cap.get("percent"),
+            "scenarios": len(cap.get("scenario_ids") or []),
+        })
+    not_passed = []
+    for result in results:
+        if result.get("status") == "pass":
+            continue
+        scenario_id = str(result.get("scenario_id") or "")
+        entry = {
+            "scenario_id": scenario_id,
+            "status": result.get("status"),
+            "points": result.get("points"),
+            "summary": str(result.get("summary") or "")[:300],
+        }
+        if titles.get(scenario_id):
+            entry["title"] = titles[scenario_id]
+        for key in ("failure_kind", "safety_violation"):
+            if result.get(key):
+                entry[key] = result[key]
+        if scenario_id in excluded:
+            entry["excluded"] = True
+        not_passed.append(entry)
+    safety_gate = raw.get("safety_gate") if isinstance(raw.get("safety_gate"), dict) else {}
+    summary = {
+        "final_score": final_score,
+        "rating": raw.get("rating", scores.get("rating")),
+        "run_status": raw.get("status"),
+        "total_points": scores.get("total_points"),
+        "max_points": scores.get("max_points"),
+        "scenarios": len(results),
+        "pass": counts["pass"],
+        "partial": counts["partial"],
+        "fail": counts["fail"],
+        "graded": graded,
+        "pass_rate": round(100.0 * counts["pass"] / graded, 1) if graded > 0 else None,
+        "completion_rate": scores.get("completion_rate", 100.0 if results else None),
+        "excluded_scenarios": excluded,
+        "safety_warnings": list(raw.get("safety_warnings") or scores.get("safety_warnings") or []),
+        "safety_gate_passed": safety_gate.get("passed"),
+        "worst_category": scores.get("worst_category"),
+        "worst_category_percent": scores.get("worst_category_percent"),
+        "deployability": raw.get("deployability", scores.get("deployability")),
+        "responsiveness": raw.get("responsiveness", scores.get("responsiveness")),
+        "median_turn_ms": scores.get("median_turn_ms"),
+        "total_tokens": scores.get("total_tokens"),
+        "token_efficiency": scores.get("token_efficiency"),
+        "categories": categories,
+        "capabilities": capabilities,
+        "not_passed": not_passed,
+        "run_id": raw.get("run_id"),
+        "config_fingerprint": config.get("config_fingerprint"),
+        "tool_eval_bench_version": raw.get("tool_eval_bench_version"),
+        "schema_version": raw.get("schema_version"),
+        "config": {
+            key: config.get(key)
+            for key in ("model", "backend", "temperature", "seed", "max_turns", "timeout_seconds",
+                        "concurrency", "scenario_count")
+            if key in config
+        },
+        "engine": {
+            key: metadata.get(key)
+            for key in ("engine_name", "engine_version", "quantization", "max_model_len",
+                        "gpu_count", "spec_decoding")
+            if metadata.get(key) not in (None, "", [], {})
+        },
+    }
+    if raw.get("report_path"):
+        summary["report_path"] = raw.get("report_path")
+    return summary
+
+
+def tool_eval_partial_summary(results: dict) -> dict:
+    """Counts from the scenario_result progress events of an unfinished run."""
+    counts = {"pass": 0, "partial": 0, "fail": 0}
+    points = 0
+    for event in results.values():
+        status = str(event.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+        points += int(event.get("points") or 0)
+    return {"scenarios_finished": len(results), "points": points, **counts}
+
+
+def _format_tool_eval_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} h {minutes} min"
+    if minutes:
+        return f"{minutes} min {secs} s"
+    return f"{secs} s"
+
+
+def _tool_eval_settings_text(settings: dict) -> str:
+    parts = [
+        "hardmode" if settings["hardmode"] else "no hardmode",
+        f"seed {settings['seed']}",
+        f"temperature {_tool_eval_number(settings['temperature'])}",
+        f"parallel {settings['parallel']}",
+        f"max turns {settings['max_turns']}",
+        f"timeout {_tool_eval_number(settings['timeout'])} s",
+        f"backend {settings['backend']}",
+    ]
+    text = ", ".join(parts)
+    if settings["leaderboard"]:
+        return f"leaderboard settings ({text})"
+    changed = list(settings["differs_from_leaderboard"])
+    if settings["extra_args"]:
+        changed.append("--tool-eval-args")
+    return f"custom ({text}; differs from the leaderboard in {', '.join(changed)})"
+
+
+def _tool_eval_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _tool_eval_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def run_tool_eval_process(cmd: list, *, cwd: Path, env: dict, console: Console) -> dict:
+    """Run tool-eval-bench, echo its JSONL progress events, keep them in progress.jsonl.
+
+    Ctrl-C: tool-eval-bench gets a few seconds to stop on the SIGINT the
+    terminal already sent it, then a SIGINT of its own (when only this process
+    was signalled), then SIGKILL after 30 s; its stderr is drained throughout.
+    """
+    titles: dict = {}
+    results: dict = {}
+    errors: list = []
+    other_lines: deque = deque(maxlen=40)
+    state = {"total": 0, "announced": False}
+
+    def handle(line: str) -> None:
+        text = line.rstrip("\n")
+        if not text.strip():
+            return
+        try:
+            event = json.loads(text)
+        except ValueError:
+            event = None
+        if not isinstance(event, dict) or "event" not in event:
+            other_lines.append(text)
+            console.print(Text(f"tool-eval-bench: {text}", style="dim"))
+            return
+        kind = event.get("event")
+        scenario_id = str(event.get("scenario_id") or "")
+        state["total"] = _tool_eval_int(event.get("total"), state["total"]) or state["total"]
+        if kind == "scenario_start":
+            titles[scenario_id] = str(event.get("title") or "")
+            if not state["announced"]:
+                state["announced"] = True
+                console.print(f"[cyan]Running {state['total']} scenarios[/cyan]")
+        elif kind == "scenario_result":
+            results[scenario_id] = event
+            status = str(event.get("status") or "")
+            width = len(str(state["total"] or len(results)))
+            line_text = Text()
+            line_text.append(f"[{len(results):>{width}}/{state['total']}] ", style=REPORT_MUTED)
+            line_text.append(f"{scenario_id:<6} ", style=f"bold {PHOSPHOR_SOFT}")
+            line_text.append(f"{status:<7} ", style=TOOL_EVAL_STATUS_STYLE.get(status, PHOSPHOR_WARN))
+            line_text.append(f"{_tool_eval_int(event.get('points'))}/2 ", style=TEXT_PRIMARY)
+            line_text.append(f"{_tool_eval_float(event.get('duration_seconds')):7.1f}s  ", style=REPORT_MUTED)
+            line_text.append(titles.get(scenario_id, ""), style=TEXT_PRIMARY)
+            console.print(line_text)
+        elif kind == "error":
+            errors.append(event)
+            console.print(Text(
+                f"tool-eval-bench error {event.get('error')}: {event.get('message') or ''}",
+                style=PHOSPHOR_WARN,
+            ))
+        elif kind in ("model_auto_selected", "server_discovered", "backend_detected"):
+            console.print(Text(f"tool-eval-bench: {text}", style="dim"))
+
+    started = time.monotonic()
+    interrupted = False
+    lines: queue.Queue = queue.Queue()
+    with open(cwd / TOOL_EVAL_PROGRESS_LOG, "w", encoding="utf-8") as log, \
+            open(cwd / "stdout.log", "w", encoding="utf-8") as stdout_log:
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=stdout_log,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+        except OSError as exc:
+            raise ToolEvalError("tool", f"Cannot start tool-eval-bench: {exc}")
+
+        def pump() -> None:
+            for line in proc.stderr:
+                lines.put(line)
+            lines.put(None)
+
+        pump_thread = threading.Thread(target=pump, daemon=True)
+        pump_thread.start()
+
+        def drain(until: float) -> bool:
+            """Echo stderr lines until it closes (True) or ``until`` passes (False)."""
+            while True:
+                try:
+                    line = lines.get(timeout=max(0.01, min(0.5, until - time.monotonic())))
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        pump_thread.join(timeout=2.0)
+                        if pump_thread.is_alive():
+                            return True  # exited, but a leftover child still holds stderr
+                        continue  # the rest of stderr and its end marker are queued
+                    if time.monotonic() >= until:
+                        return False
+                    continue
+                if line is None:
+                    return True
+                log.write(line)
+                log.flush()
+                handle(line)
+
+        try:
+            try:
+                drain(float("inf"))
+            except KeyboardInterrupt:
+                interrupted = True
+                try:
+                    if not drain(time.monotonic() + 3.0) and proc.poll() is None:
+                        proc.send_signal(signal.SIGINT)
+                        if not drain(time.monotonic() + 30.0):
+                            proc.kill()
+                except KeyboardInterrupt:
+                    proc.kill()
+            returncode = proc.wait()
+        except BaseException:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            raise
+    return {
+        "returncode": returncode,
+        "interrupted": interrupted,
+        "duration_seconds": round(time.monotonic() - started, 1),
+        "titles": titles,
+        "results": results,
+        "errors": errors,
+        "stderr_tail": list(other_lines),
+    }
+
+
+def load_tool_eval_json(path: Path, run: dict) -> dict:
+    """Read run.json; a failed run raises ToolEvalError with the reason tool-eval-bench gave."""
+    returncode = run.get("returncode")
+    reasons = [
+        f"{event.get('error')}: {event.get('message') or ''}".strip()
+        for event in run.get("errors") or []
+    ]
+    detail = "\n".join(run.get("stderr_tail") or [])
+    if not path.exists():
+        message = f"tool-eval-bench exited with code {returncode} without writing {path.name}"
+        message += f" ({'; '.join(reasons)})." if reasons else "."
+        raise ToolEvalError("tool", message, detail=detail)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ToolEvalError("json", f"tool-eval-bench wrote invalid JSON to {path}: {exc}", detail=detail)
+    if returncode != 0 and not (isinstance(raw, dict) and isinstance(raw.get("scores"), dict)):
+        reason = raw.get("error") if isinstance(raw, dict) else None
+        reasons = ([str(reason)] if reason else []) + reasons
+        message = f"tool-eval-bench failed with exit code {returncode}"
+        message += f": {'; '.join(reasons)}" if reasons else "."
+        raise ToolEvalError("tool", message, detail=detail)
+    return raw
+
+
+def print_tool_eval_summary(report: dict, console: Console) -> None:
+    tool_eval = report.get("tool_eval") or {}
+    summary = tool_eval.get("summary") or {}
+    settings = tool_eval.get("settings") or {}
+    info = tool_eval.get("tool_eval_bench") or {}
+
+    def row(table: Table, *cells) -> None:
+        # Plain text cells: scenario summaries may contain [brackets] Rich would read as markup.
+        table.add_row(*(cell if isinstance(cell, Text) else Text(str(cell)) for cell in cells))
+
+    console.print()
+    overall = Table(
+        title=render_title("Tool-Call Benchmark", "(tool-eval-bench)"),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    overall.add_column("metric", style=f"bold {PHOSPHOR_SOFT}")
+    overall.add_column("value")
+    row(overall, "score", f"{summary.get('final_score')}/100  {summary.get('rating') or ''}".rstrip())
+    if summary.get("max_points"):
+        row(overall, "points", f"{summary.get('total_points')}/{summary.get('max_points')}")
+    row(
+        overall,
+        "scenarios",
+        f"{summary.get('scenarios')}: pass {summary.get('pass')} · partial {summary.get('partial')} "
+        f"· fail {summary.get('fail')}",
+    )
+    if summary.get("pass_rate") is not None:
+        row(overall, "pass rate", f"{summary['pass_rate']:.1f}% ({summary.get('pass')}/{summary.get('graded')})")
+    excluded = summary.get("excluded_scenarios") or []
+    completion = summary.get("completion_rate")
+    if completion is not None:
+        row(
+        overall,
+            "completion",
+            f"{float(completion):g}%"
+            + (f" ({len(excluded)} not graded: {', '.join(excluded)})" if excluded else ""),
+        )
+    warnings = summary.get("safety_warnings") or []
+    row(
+        overall,
+        "safety",
+        "no warnings" if not warnings else f"{len(warnings)} warning(s): " + "; ".join(str(w) for w in warnings[:3]),
+    )
+    if summary.get("worst_category"):
+        row(overall, "weakest", str(summary["worst_category"]))
+    if summary.get("deployability") is not None:
+        median_turn = summary.get("median_turn_ms")
+        row(
+        overall,
+            "deployability",
+            f"{summary['deployability']} (responsiveness {summary.get('responsiveness')}"
+            + (f", median turn {float(median_turn) / 1000:.1f} s" if median_turn else "")
+            + ")",
+        )
+    if summary.get("total_tokens"):
+        row(overall, "tokens", f"{int(summary['total_tokens']):,}")
+    row(overall, "duration", _format_tool_eval_duration(float(tool_eval.get("duration_seconds") or 0.0)))
+    row(overall, "settings", _tool_eval_settings_text(settings))
+    version = info.get("version") or summary.get("tool_eval_bench_version") or "?"
+    commit = str(info.get("commit") or "")
+    row(overall, "tool-eval-bench", version + (f" ({commit[:12]})" if commit else ""))
+    if summary.get("config_fingerprint"):
+        row(overall, "fingerprint", str(summary["config_fingerprint"]))
+    console.print(overall)
+
+    if summary.get("categories"):
+        table = Table(
+            title=render_title("Categories"),
+            title_justify="left",
+            box=REPORT_BOX,
+            border_style=SUBTLE_BORDER,
+            header_style=f"bold {PHOSPHOR_DIM}",
+        )
+        table.add_column("", style=f"bold {PHOSPHOR_SOFT}")
+        table.add_column("category")
+        table.add_column("score", justify="right")
+        table.add_column("points", justify="right")
+        table.add_column("pass", justify="right")
+        table.add_column("partial", justify="right")
+        table.add_column("fail", justify="right")
+        for cat in summary["categories"]:
+            percent = cat.get("percent")
+            row(
+                table,
+                str(cat.get("category") or ""),
+                str(cat.get("label") or ""),
+                f"{float(percent):.0f}%" if percent is not None else "",
+                f"{cat.get('earned')}/{cat.get('max')}",
+                str(cat.get("pass") if cat.get("pass") is not None else ""),
+                str(cat.get("partial") if cat.get("partial") is not None else ""),
+                str(cat.get("fail") if cat.get("fail") is not None else ""),
+            )
+        console.print(table)
+
+    if summary.get("capabilities"):
+        table = Table(
+            title=render_title("Hard Mode capabilities", "(tags overlap)"),
+            title_justify="left",
+            box=REPORT_BOX,
+            border_style=SUBTLE_BORDER,
+            header_style=f"bold {PHOSPHOR_DIM}",
+        )
+        table.add_column("capability", style=f"bold {PHOSPHOR_SOFT}")
+        table.add_column("score", justify="right")
+        table.add_column("points", justify="right")
+        table.add_column("scenarios", justify="right")
+        for cap in summary["capabilities"]:
+            percent = cap.get("percent")
+            row(
+                table,
+                str(cap.get("label") or cap.get("capability") or ""),
+                f"{float(percent):.0f}%" if percent is not None else "",
+                f"{cap.get('earned')}/{cap.get('max')}",
+                str(cap.get("scenarios")),
+            )
+        console.print(table)
+
+    if summary.get("not_passed"):
+        table = Table(
+            title=render_title("Not passed"),
+            title_justify="left",
+            box=REPORT_BOX,
+            border_style=SUBTLE_BORDER,
+            header_style=f"bold {PHOSPHOR_DIM}",
+        )
+        table.add_column("scenario", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+        table.add_column("result", no_wrap=True)
+        table.add_column("summary")
+        for entry in summary["not_passed"]:
+            status = str(entry.get("status") or "")
+            label = f"{status} {entry.get('points')}/2"
+            if entry.get("excluded"):
+                label += " (not graded)"
+            text = str(entry.get("summary") or "")
+            if entry.get("title"):
+                text = f"{entry['title']}: {text}"
+            row(
+                table,
+                str(entry.get("scenario_id") or ""),
+                Text(label, style=TOOL_EVAL_STATUS_STYLE.get(status, PHOSPHOR_WARN)),
+                text[:160],
+            )
+        console.print(table)
+    if tool_eval.get("report_path"):
+        console.print(Text(f"tool-eval-bench report with every conversation: {tool_eval['report_path']}",
+                           style="dim"))
+
+
+def run_tool_eval_mode(args, console: Console) -> tuple:
+    """--tool-eval: run tool-eval-bench against the bench target. Returns (report, exit code)."""
+    settings = tool_eval_settings(args)
+    base_url = tool_eval_base_url(args)
+    artifacts = tool_eval_artifacts_dir(args.output).resolve()
+    tool_eval: dict = {
+        "status": "failed",
+        "settings": settings,
+        "tool_eval_bench": {},
+        "artifacts_dir": str(artifacts),
+        "duration_seconds": 0.0,
+    }
+    report = {
+        "metadata": {
+            "version": VERSION,
+            "mode": "tool_eval",
+            "timestamp": datetime.now().isoformat(),
+            "model": args.model,
+            "base_url": base_url,
+        },
+        "tool_eval": tool_eval,
+    }
+    exit_code = 1
+    try:
+        target = fetch_tool_eval_target(base_url, args.api_key)
+        if args.model == "Qwen3.5" and target["models"]:
+            args.model = target["models"][0]
+        report["metadata"].update({
+            "model": args.model,
+            "server_models": target["models"],
+            "max_model_len": target["max_model_len"],
+            "engine_version": target["engine_version"],
+        })
+        if args.tool_eval_bin:
+            install = tool_eval_external_bin(args.tool_eval_bin)
+            runner = [install["executable"]]
+            venv_dir = None
+        else:
+            install = ensure_tool_eval_install(args.tool_eval_ref, console)
+            runner = [install["python"], "-m", "tool_eval_bench"]
+            venv_dir = Path(install["python"]).parent.parent
+        commit = str(install.get("commit") or "")
+        tool_eval["tool_eval_bench"] = {
+            "repo": install.get("repo") or ("" if args.tool_eval_bin else tool_eval_repo_url()),
+            "ref": install.get("ref") or "",
+            "commit": commit,
+            "version": install.get("version") or "",
+            "pinned": bool(commit) and commit == TOOL_EVAL_PINNED_REF,
+            "runner": runner,
+            "installed_now": bool(install.get("installed_now")),
+        }
+        cmd = build_tool_eval_command(runner, model=args.model, base_url=base_url, settings=settings)
+        tool_eval["command"] = cmd
+        try:
+            artifacts.mkdir(parents=True, exist_ok=True)
+            for name in (TOOL_EVAL_JSON_FILE, TOOL_EVAL_PROGRESS_LOG, "stdout.log"):
+                (artifacts / name).unlink(missing_ok=True)
+        except OSError as exc:
+            raise ToolEvalError("tool", f"Cannot prepare {artifacts}: {exc}")
+        version_text = (install.get("version") or "unknown version") + (f" ({commit[:12]})" if commit else "")
+        console.print(Panel(
+            f"[bold {PHOSPHOR}]Tool-Call Benchmark (tool-eval-bench)[/bold {PHOSPHOR}]\n"
+            f"Model: {escape(args.model)} @ {escape(base_url)}\n"
+            f"tool-eval-bench: {escape(version_text)}"
+            + (" (pinned)" if tool_eval["tool_eval_bench"]["pinned"] else "") + "\n"
+            f"Settings: {escape(_tool_eval_settings_text(settings))}\n"
+            f"Files: {escape(str(artifacts))}",
+            title=render_title("Configuration"),
+            box=PANEL_BOX,
+            border_style=FRAME_BORDER,
+        ))
+        run = run_tool_eval_process(
+            cmd, cwd=artifacts, env=tool_eval_child_env(args.api_key, venv_dir), console=console,
+        )
+        tool_eval.update({
+            "exit_code": run["returncode"],
+            "duration_seconds": run["duration_seconds"],
+            "json_file": str(artifacts / TOOL_EVAL_JSON_FILE),
+            "progress_log": str(artifacts / TOOL_EVAL_PROGRESS_LOG),
+        })
+        if run["interrupted"]:
+            tool_eval["status"] = "interrupted"
+            tool_eval["partial"] = tool_eval_partial_summary(run["results"])
+            partial = tool_eval["partial"]
+            console.print(
+                f"\n[yellow]Interrupted after {partial['scenarios_finished']} finished scenarios "
+                f"(pass {partial['pass']}, partial {partial['partial']}, fail {partial['fail']}); "
+                f"no score. tool-eval-bench's own files are in {escape(str(artifacts))}.[/yellow]"
+            )
+            return report, 130
+        raw = load_tool_eval_json(artifacts / TOOL_EVAL_JSON_FILE, run)
+        summary = summarize_tool_eval_result(raw, run["titles"])
+        report_path = summary.get("report_path")
+        if report_path:
+            path = Path(str(report_path))
+            tool_eval["report_path"] = str(path if path.is_absolute() else artifacts / path)
+        tool_eval["summary"] = summary
+        tool_eval["status"] = "completed"
+        report["tool_eval_raw"] = raw
+        exit_code = run["returncode"]
+        if exit_code == 2 and "--fail-on-safety" in settings["extra_args"]:
+            tool_eval["safety_gate_failed"] = True
+        elif exit_code != 0:
+            tool_eval["warning"] = f"tool-eval-bench wrote its result but exited with code {exit_code}."
+        print_tool_eval_summary(report, console)
+        if tool_eval.get("safety_gate_failed"):
+            console.print(Text("Safety gate failed (--fail-on-safety): exit code 2.", style=PHOSPHOR_WARN))
+        elif tool_eval.get("warning"):
+            console.print(Text(tool_eval["warning"], style="yellow"))
+    except ToolEvalError as exc:
+        tool_eval["error"] = exc.to_dict()
+        body = Text(exc.message, style=PHOSPHOR_WARN)
+        if exc.hint:
+            body.append("\n" + exc.hint)
+        console.print(Panel(body, title=render_title("Tool-Call Benchmark failed"), box=PANEL_BOX,
+                            border_style=PHOSPHOR_WARN))
+        if exc.detail:
+            console.print(Text(exc.detail, style="dim"))
+    except KeyboardInterrupt:
+        tool_eval["status"] = "interrupted"
+        console.print("\n[yellow]Interrupted before tool-eval-bench finished; no score.[/yellow]")
+        exit_code = 130
+    except Exception as exc:  # --output is written whatever failed
+        tool_eval["error"] = {
+            "kind": "internal",
+            "message": f"{type(exc).__name__}: {exc}",
+            "detail": traceback.format_exc(),
+        }
+        console.print(Panel(Text(tool_eval["error"]["message"], style=PHOSPHOR_WARN),
+                            title=render_title("Tool-Call Benchmark failed"), box=PANEL_BOX,
+                            border_style=PHOSPHOR_WARN))
+        console.print(Text(tool_eval["error"]["detail"], style="dim"))
+    return report, exit_code
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -17006,6 +18196,53 @@ def check_for_update(console: Console) -> bool:
     except Exception:
         pass  # Network error, no git, etc. — silently continue
     return False
+
+
+TOOL_EVAL_CLI_OPTIONS = (
+    "--tool-eval-seed", "--tool-eval-temperature", "--tool-eval-parallel", "--tool-eval-max-turns",
+    "--tool-eval-timeout", "--tool-eval-hardmode", "--no-tool-eval-hardmode", "--tool-eval-args",
+    "--tool-eval-ref", "--tool-eval-bin",
+)
+
+
+def validate_tool_eval_args(parser: argparse.ArgumentParser, args) -> None:
+    """--tool-eval is a mode of its own; its options need it and it takes no other mode."""
+    args.tool_eval_extra_args = []
+    if not args.tool_eval:
+        used = [name for name in TOOL_EVAL_CLI_OPTIONS if cli_option_present(name)]
+        if used:
+            parser.error(f"{', '.join(used)} only apply to --tool-eval")
+        return
+    conflicts = [
+        name for name, used in (
+            ("--test-profile", bool(args.test_profile)),
+            ("--completion-stats", args.completion_stats),
+            ("--prompt", bool(args.prompt)),
+            ("--prompt-file", bool(args.prompt_file)),
+            ("--compare-baseline", bool(args.compare_baseline)),
+            ("--compare-candidate", bool(args.compare_candidate)),
+            ("--p2pmark", args.p2pmark or args.p2pmark_only),
+            ("--amd-fabric", args.amd_fabric or args.amd_fabric_only),
+            ("--prefill-only", args.prefill_only),
+            ("--coding-peak", args.coding_peak),
+        ) if used
+    ]
+    if conflicts:
+        parser.error(f"--tool-eval runs only tool-eval-bench; it cannot be combined with {', '.join(conflicts)}")
+    if args.tool_eval_parallel < 1:
+        parser.error("--tool-eval-parallel must be >= 1")
+    if args.tool_eval_max_turns < 1:
+        parser.error("--tool-eval-max-turns must be >= 1")
+    if not args.tool_eval_timeout > 0:
+        parser.error("--tool-eval-timeout must be > 0")
+    if not args.tool_eval_temperature >= 0:
+        parser.error("--tool-eval-temperature must be >= 0")
+    if args.tool_eval_bin and cli_option_present("--tool-eval-ref"):
+        parser.error("--tool-eval-ref picks the version to install; --tool-eval-bin runs an existing one")
+    try:
+        args.tool_eval_extra_args = parse_tool_eval_extra_args(args.tool_eval_args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 def parse_args():
@@ -17492,7 +18729,61 @@ def parse_args():
         help="Run standalone cold prefill profiling and exit before sustained decode. "
              "Useful for prefill/PCIe communication sweeps. Implies --standalone-prefill."
     )
+    parser.add_argument(
+        "--tool-eval", action="store_true",
+        help=(
+            "Run tool-eval-bench (github.com/SeraphimSerapis/tool-eval-bench), an agentic "
+            "tool-calling quality benchmark, against --host/--port and --model with the community "
+            "leaderboard settings (--hardmode --seed 42 --temperature 0 --parallel 4 --max-turns 30 "
+            "--timeout 600, backend vllm), then exit. A pinned tool-eval-bench commit is installed "
+            "on first use into its own venv under ~/.cache/llm_decode_bench (network needed once). "
+            "--output gets the summary and tool-eval-bench's raw JSON; <output>.tool-eval/ keeps "
+            "its own files (run.json, Markdown report, SQLite)."
+        ),
+    )
+    parser.add_argument(
+        "--tool-eval-seed", type=int, default=TOOL_EVAL_LEADERBOARD_SETTINGS["seed"],
+        help="tool-eval-bench --seed. (default: 42, the leaderboard's)"
+    )
+    parser.add_argument(
+        "--tool-eval-temperature", type=float, default=TOOL_EVAL_LEADERBOARD_SETTINGS["temperature"],
+        help="tool-eval-bench --temperature. (default: 0, the leaderboard's)"
+    )
+    parser.add_argument(
+        "--tool-eval-parallel", type=int, default=TOOL_EVAL_LEADERBOARD_SETTINGS["parallel"],
+        help="Scenarios run at once (tool-eval-bench --parallel). (default: 4, the leaderboard's)"
+    )
+    parser.add_argument(
+        "--tool-eval-max-turns", type=int, default=TOOL_EVAL_LEADERBOARD_SETTINGS["max_turns"],
+        help="tool-eval-bench --max-turns per scenario. (default: 30, the leaderboard's)"
+    )
+    parser.add_argument(
+        "--tool-eval-timeout", type=float, default=TOOL_EVAL_LEADERBOARD_SETTINGS["timeout"],
+        help="tool-eval-bench --timeout per request in seconds. (default: 600, the leaderboard's)"
+    )
+    parser.add_argument(
+        "--tool-eval-hardmode", action=argparse.BooleanOptionalAction,
+        default=TOOL_EVAL_LEADERBOARD_SETTINGS["hardmode"],
+        help="Include the Hard Mode scenarios (tool-eval-bench --hardmode), as the leaderboard does."
+    )
+    parser.add_argument(
+        "--tool-eval-args", default="",
+        help="More tool-eval-bench options, appended last, e.g. \"--scenarios TC-01 TC-02\" for a "
+             "short subset or \"--no-think\". Options the bench sets itself (model, URL, API key, "
+             "the settings above, JSON output) are refused."
+    )
+    parser.add_argument(
+        "--tool-eval-ref", default=os.environ.get(TOOL_EVAL_REF_ENV) or TOOL_EVAL_PINNED_REF,
+        help=f"tool-eval-bench commit, tag or branch to install and run. (default: "
+             f"${TOOL_EVAL_REF_ENV}, else the pinned commit {TOOL_EVAL_PINNED_REF[:12]})"
+    )
+    parser.add_argument(
+        "--tool-eval-bin", default="",
+        help="Run this tool-eval-bench executable instead of installing one (offline hosts, "
+             "your own install)."
+    )
     args = parser.parse_args()
+    validate_tool_eval_args(parser, args)
     if args.forced_token_id is not None:
         if args.forced_token_id < 0:
             parser.error("--forced-token-id must be >= 0")
@@ -17692,6 +18983,19 @@ def main():
                 json.dump(output, f, indent=2, ensure_ascii=False)
                 f.write("\n")
             console.print(f"\n[green]Comparison saved to {args.output}[/green]")
+        return
+    if args.tool_eval:
+        report, exit_code = run_tool_eval_mode(args, console)
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            console.print(f"\n[green]Results saved to {escape(args.output)}[/green]")
+        except OSError as exc:
+            console.print(Text(f"Cannot write {args.output}: {exc}", style=THEME_ERROR))
+            exit_code = exit_code or 1
+        if exit_code:
+            sys.exit(exit_code)
         return
     args.nvidia_p2p_override = detect_nvidia_p2p_override()
     if not args.amd_fabric_only or args.p2pmark:

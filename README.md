@@ -27,6 +27,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
 - **Dataset accuracy profiles** — pinned GSM8K (1319 items), stratified MMLU-Pro (1000 items), and GPQA Diamond (198 items) benchmarks with per-item scoring, Wilson confidence intervals, and per-category accuracy, designed to measure quantization degradation (e.g. NVFP4 w4a16 vs w4a4)
 - **Paired A/B comparison** — `--compare-baseline` pairs two runs per item and reports accuracy delta, correct/wrong flips, exact McNemar significance, per-category deltas, and completion-token inflation
+- **Tool-calling quality** — `--tool-eval` runs [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) against the same server with the community leaderboard settings and reports its score, per-category results and Hard Mode capabilities
 - **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
 - **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
 - **JSON output** — structured results saved to `benchmark_results.json` for further analysis
@@ -140,6 +141,14 @@ python3 llm_decode_bench.py --p2pmark-only
 
 # AMD CPU socket fabric / NUMA diagnostic only
 python3 llm_decode_bench.py --amd-fabric-only
+
+# Tool-calling quality: tool-eval-bench with the community leaderboard settings
+# (a pinned tool-eval-bench is installed into its own cached venv on first use)
+python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval
+
+# Same, first a short subset of five scenarios
+python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval \
+    --tool-eval-args="--scenarios TC-01 TC-02 TC-03 TC-45 TC-85"
 ```
 
 ### Arguments
@@ -198,6 +207,16 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--amd-fabric-size-mb` | `512` | Buffer size per NUMA bandwidth measurement |
 | `--amd-fabric-latency-mb` | `256` | Pointer-chase latency working-set size per NUMA node |
 | `--amd-fabric-threads` | `0` | Threads per NUMA node for bandwidth tests; `0` auto-selects up to 64 CPUs per node |
+| `--tool-eval` | `false` | Run tool-eval-bench against `--host`/`--port` and `--model` with the community leaderboard settings, then exit. See [Tool-calling quality](#tool-calling-quality-tool-eval-bench) |
+| `--tool-eval-seed` | `42` | tool-eval-bench `--seed` |
+| `--tool-eval-temperature` | `0` | tool-eval-bench `--temperature` |
+| `--tool-eval-parallel` | `4` | Scenarios run at once (tool-eval-bench `--parallel`) |
+| `--tool-eval-max-turns` | `30` | tool-eval-bench `--max-turns` per scenario |
+| `--tool-eval-timeout` | `600` | tool-eval-bench `--timeout` per request, in seconds |
+| `--tool-eval-hardmode` / `--no-tool-eval-hardmode` | on | Include the Hard Mode scenarios (tool-eval-bench `--hardmode`) |
+| `--tool-eval-args` | | More tool-eval-bench options, appended last, e.g. `--tool-eval-args="--scenarios TC-01 TC-02"` or `--tool-eval-args=--no-think`. Options the bench sets itself are refused |
+| `--tool-eval-ref` | pinned commit | tool-eval-bench commit, tag or branch to install and run; also `LLM_BENCH_TOOL_EVAL_REF` |
+| `--tool-eval-bin` | | Run an existing tool-eval-bench executable instead of installing one |
 | `--output` | `benchmark_results.json` | Output file path |
 | `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
 | `--skip-prefill` | | Skip prefill reporting entirely |
@@ -688,6 +707,98 @@ endpoint first — that self-flip rate is the noise floor (temperature 0 does no
 guarantee bitwise determinism under batching) that a real degradation must
 exceed. Paired McNemar statistics resolve roughly 1–2 pp differences on the
 full GSM8K set; a 30-run single-prompt profile cannot.
+
+### Tool-calling quality (tool-eval-bench)
+
+`--tool-eval` runs [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench)
+by SeraphimSerapis (MIT license) against the server the bench targets.
+tool-eval-bench sends 69 deterministic scenarios, plus 23 Hard Mode ones,
+through `/v1/chat/completions` with mock tools: tool selection, parameter
+precision, multi-step chains, refusal, error recovery, safety and prompt
+injection, large toolsets, planning and structured output. Each scenario
+scores pass (2 points), partial (1) or fail (0); the score is
+`points / max points × 100`. Scenarios the endpoint failed (timeout,
+connection error, 5xx) are left out of the score and lower the completion
+rate instead.
+
+The defaults are the community leaderboard settings, so
+
+```bash
+python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval
+```
+
+runs tool-eval-bench with exactly the arguments of
+
+```bash
+tool-eval-bench --model glm-5.3-flash --base-url http://localhost:8000/ --backend vllm \
+  --hardmode --seed 42 --temperature 0 \
+  --parallel 4 --max-turns 30 --timeout 600 \
+  --no-live --json --json-file run.json
+```
+
+| Bench option | tool-eval-bench option |
+|---|---|
+| `--host`, `--port` | `--base-url http://<host>:<port>/` (a URL `--host` is used as given) |
+| `--model` (or the first served model, as in the other modes) | `--model` |
+| `--api-key` | `TOOL_EVAL_API_KEY` in its environment, so the key is not in the process list |
+| `--tool-eval-seed`, `--tool-eval-temperature`, `--tool-eval-parallel`, `--tool-eval-max-turns`, `--tool-eval-timeout`, `--[no-]tool-eval-hardmode` | `--seed`, `--temperature`, `--parallel`, `--max-turns`, `--timeout`, `--hardmode` |
+| `--tool-eval-args` | appended last; may not repeat the options above |
+
+`--backend vllm` is only a report label in tool-eval-bench; use
+`--tool-eval-args="--backend sglang"` for an SGLang server. Any changed
+setting or extra option is reported as custom settings instead of leaderboard
+settings. tool-eval-bench records the model name, the base URL (host
+masked), the settings, its own version and the server's deployment facts in
+the `config_fingerprint` that decides which runs are comparable. The trailing
+slash of `http://localhost:8000/` is kept so a run gets the same fingerprint as
+the leaderboard command on the same server.
+
+The server must have tool calling enabled (vLLM `--enable-auto-tool-choice`
+with the model's `--tool-call-parser`) and a context window that holds
+30-turn conversations.
+
+Reference: GLM-5.3-Flash NVFP4 (QAD checkpoint, W4A16 experts, MTP 3) on vLLM
+TP4, 4× RTX PRO 6000 Blackwell, Karmic Kraken beta of 2026-10-04, scores
+91/100 ★★★★★ (median of 12 runs, range 86–93), about 85 s per run. At
+`--parallel 4` identical runs are not identical: 17 of the 92 scenarios changed
+result between those runs, because batching changes the numerics even at
+temperature 0. Compare the mean of several runs; tool-eval-bench recommends
+`--parallel 1` for reproducible scores, which is not the leaderboard setting.
+Six of the runs went through `--tool-eval` and six ran the leaderboard command
+directly; all twelve have the same `config_fingerprint`, and their means (91.5
+and 90.2) differ less than that run-to-run noise.
+
+**Installation.** tool-eval-bench stays an external program; none of its code
+or scenarios is in this repository. The first `--tool-eval` run installs the
+pinned commit (`570951a7`, version `2.7.1.dev14+g570951a77`) with
+`pip install git+https://github.com/SeraphimSerapis/tool-eval-bench.git@<commit>`
+into its own virtual environment,
+`~/.cache/llm_decode_bench/tool-eval-bench/<commit>/venv` (or under
+`LLM_BENCH_CACHE_DIR`), and later runs reuse it. It needs Python 3.11+, git,
+`venv` and network access to GitHub and PyPI once; the pinned commit's direct
+dependencies are pinned too. The Python environment that runs the bench is
+never modified, which matters in the serving images, where `python3` is the
+server's own venv. Without network the run stops with a clear error before
+anything is benchmarked. To run another version, pass a commit, tag or branch
+with `--tool-eval-ref` (or `LLM_BENCH_TOOL_EVAL_REF`); branches and tags are
+resolved to a commit with `git ls-remote`, and offline the commit they resolved
+to on an earlier run is reused. `LLM_BENCH_TOOL_EVAL_REPO` points at a mirror
+(URL, `user@host:path` or local path), and `--tool-eval-bin` runs a
+tool-eval-bench you installed yourself.
+
+**Output.** The terminal shows one line per finished scenario, then the score
+and rating, pass/partial/fail counts and pass rate, completion rate, safety
+warnings, responsiveness/deployability, the per-category table, the Hard Mode
+capability table and the scenarios that did not pass. `--output` gets
+`metadata` (`mode: tool_eval`), `tool_eval` (status, settings, tool-eval-bench
+version and commit, the exact command, duration and the summary) and
+`tool_eval_raw`, tool-eval-bench's JSON as it wrote it. Its own files go to
+`<output>.tool-eval/` next to `--output`: `run.json`, `progress.jsonl` (its
+progress events), and `runs/YYYY/MM/<run_id>.md` (the Markdown report with every
+conversation) plus `data/benchmarks.sqlite`, the files it keeps in the
+directory it runs in. A failed run (server unreachable, install failure,
+tool-eval-bench error, unreadable JSON) still writes `--output` with
+`tool_eval.status: failed` and `tool_eval.error`, and exits with code 1.
 
 ### Client Latency Metrics
 
