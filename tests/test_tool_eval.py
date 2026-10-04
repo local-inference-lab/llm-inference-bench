@@ -17,6 +17,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import threading
@@ -563,16 +564,39 @@ def test_helper_commands_that_hang_or_cannot_start_are_install_errors(monkeypatc
     assert exc.value.kind == "install" and "Cannot run" in exc.value.message
 
 
+def closed_local_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def test_unreachable_repository_fails_fast_for_real(monkeypatch, cache):
-    """Real venv + pip against a repository and index nobody listens on (port 9)."""
-    monkeypatch.setenv(BENCH.TOOL_EVAL_REPO_ENV, "http://127.0.0.1:9/tool-eval-bench.git")
-    monkeypatch.setenv("PIP_INDEX_URL", "http://127.0.0.1:9/simple/")
+    """Real venv + pip + git against a repository and index on a closed local port.
+
+    Hermetic: no proxy, pip or git configuration of the host applies, and every helper
+    command is capped at 120 s, so it stays a quick refused connection (about 2 s).
+    """
     if subprocess.run([sys.executable, "-m", "ensurepip", "--version"], capture_output=True).returncode:
         pytest.skip("this Python has no ensurepip")
+    port = closed_local_port()
+    monkeypatch.setenv(BENCH.TOOL_EVAL_REPO_ENV, f"http://127.0.0.1:{port}/tool-eval-bench.git")
+    monkeypatch.setenv("PIP_INDEX_URL", f"http://127.0.0.1:{port}/simple/")
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "PIP_PROXY", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    real_run = BENCH._tool_eval_run
+    monkeypatch.setattr(BENCH, "_tool_eval_run",
+                        lambda cmd, timeout=None, env=None: real_run(cmd, timeout=min(timeout or 120, 120), env=env))
+    started = time.monotonic()
     with pytest.raises(BENCH.ToolEvalError) as exc:
         BENCH.ensure_tool_eval_install(BENCH.TOOL_EVAL_PINNED_REF)
     assert exc.value.kind == "network"
-    assert "127.0.0.1:9" in exc.value.message
+    assert f"127.0.0.1:{port}" in exc.value.message
+    assert time.monotonic() - started < 120
 
 
 # ---------------------------------------------------------------------------

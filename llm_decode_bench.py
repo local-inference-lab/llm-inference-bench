@@ -17329,7 +17329,9 @@ def _install_tool_eval_locked(repo: str, ref: str, key: str, env_dir: Path,
         constraints_path.write_text("\n".join(TOOL_EVAL_PINNED_CONSTRAINTS) + "\n", encoding="utf-8")
         constraints = ["-c", str(constraints_path)]
     requirement = f"tool-eval-bench @ git+{tool_eval_pip_url(repo)}@{key}"
-    proc = _tool_eval_run(pip + ["install", "--no-input", *constraints, requirement],
+    # Bounded retries and socket timeout: a host whose traffic is dropped fails in minutes, not hours.
+    proc = _tool_eval_run(pip + ["install", "--no-input", "--retries", "2", "--timeout", "60",
+                                 *constraints, requirement],
                           timeout=1800, env=_tool_eval_pip_env())
     output = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
