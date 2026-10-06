@@ -258,6 +258,12 @@ are link power management, not errors. Replays, correctable errors, other link
 retraining, and a link that falls below its maximum generation or width under
 load are reported per phase and summarized per GPU.
 
+On a DGX Spark the GB10 GPU is integrated and shares the host's memory: it is
+recorded with `integrated` and `unified_memory`, its memory size is the host's
+`MemTotal`, and it has no PCIe link to check. A server that spans several
+machines (`--nnodes`) is measured from the container of node rank 0, which
+serves the API; the result records the node count in `server.nodes`.
+
 ```bash
 lil-bench --no-upload          # measure and save only
 lil-bench --profile quick      # a few minutes, to test the setup

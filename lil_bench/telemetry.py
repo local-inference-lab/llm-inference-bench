@@ -336,6 +336,10 @@ def link_limits(hardware: dict) -> list[dict]:
         for hop in chain[-2:]:  # the GPU and its upstream port
             gens.append(_hop_gen(hop.get("max_link_speed")))
             widths.append(_hop_width(hop.get("max_link_width")))
+        if gpu.get("integrated"):
+            # GB10 has no PCIe slot: whatever link NVML samples cannot be downgraded.
+            limits.append({"max_gen": None, "max_width": None, "integrated": True})
+            continue
         limits.append({"max_gen": min((g for g in gens if g), default=None),
                        "max_width": min((w for w in widths if w), default=None)})
     return limits
@@ -366,6 +370,8 @@ def link_events(series: dict, links: list[dict] | None = None) -> list[dict]:
         loaded = [s for s, b in zip(states, busy) if b and None not in s]
         max_gen = info.get("max_gen") or max((s[0] for s in loaded), default=None)
         max_width = info.get("max_width") or max((s[1] for s in loaded), default=None)
+        if info.get("integrated"):
+            max_gen = max_width = None  # no link maximum, so never a downgrade
 
         raw = increments(columns.get("pcie_recovery") or [None] * count, RECOVERY_COUNTER_BITS)
         budget = {j: RECOVERIES_PER_LINK_CHANGE for j in range(1, count) if _power_managed(columns, j, count)}

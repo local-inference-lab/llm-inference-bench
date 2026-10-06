@@ -113,6 +113,25 @@ def serve_limits(options: dict) -> dict:
     }
 
 
+def serve_nodes(options: dict) -> dict | None:
+    """The machines of a server whose tensor-parallel group spans several (``--nnodes`` > 1).
+
+    vLLM runs one process per machine with the same options and its own
+    ``--node-rank``; rank 0 serves the API (the others run ``--headless``),
+    so lil-bench measures rank 0. None for a single-machine server.
+    """
+    def number(name, default):
+        value = options.get(name)
+        try:
+            return int(value) if value not in (None, True) else default
+        except (TypeError, ValueError):
+            return default
+    nnodes = number("nnodes", 1)
+    if nnodes <= 1:
+        return None
+    return {"nnodes": nnodes, "node_rank": number("node-rank", 0), "headless": options.get("headless") is True}
+
+
 def read_json(path: str) -> dict | None:
     try:
         return json.loads(Path(path).read_text())

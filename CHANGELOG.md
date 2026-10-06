@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.8 - 2026-10-06
+
+### lil-bench 1.4: DGX Spark (GB10) and servers across several machines
+
+- A GB10 GPU (DGX Spark) is recorded with `"integrated": true` and
+  `"unified_memory": true`. NVML reports no memory of its own for it, so
+  `memory_total_mib` is the host's `MemTotal`, which the CPU and the GPU share.
+  Its PCIe fields (`pcie.max_gen`, `max_width`, `current_gen`, ...) are null,
+  it gets no entry in `pcie.gpu_paths`, and its link is never reported as a
+  PCIe downgrade: the GPU sits on the CPU package, not in a slot. Discrete
+  GPUs are recorded exactly as before.
+- p2pmark on one GPU whose free memory NVML cannot read is skipped as a single
+  GPU ("single GPU: nothing to measure between GPUs"), not as "free GPU memory
+  is unknown". `--no-p2pmark` is unchanged.
+- A server whose tensor-parallel group spans several machines (`--nnodes` > 1
+  in its command line) adds `server.nodes` to the result:
+  `{"nnodes": 2, "node_rank": 0, "headless": false}`. The field is absent
+  for a single-machine server. lil-bench measures node rank 0, which serves
+  the API; on a worker rank (`--node-rank` > 0 or `--headless`) it stops and
+  says to run it in the rank-0 container.
+
 ## 0.7.7 - 2026-10-04
 
 ### tool-eval-bench: tool-calling quality with the leaderboard settings
