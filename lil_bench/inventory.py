@@ -25,6 +25,7 @@ EDAC_FIELDS = ("dimm_mem_type", "size", "dimm_label", "dimm_location", "dimm_dev
 LSPCI_KEEP = re.compile(r"^\s*(LnkCap|LnkSta|LnkCtl2|LnkSta2|ACSCap|ACSCtl|ATSCap|ATSCtl|DevCap2|DevCtl2|Capabilities: \[[0-9a-f]+\] (Access Control|Address Translation|Resizable BAR))")
 KNOWN_SWITCH_VENDORS = {"0x10b5": "Broadcom/PLX", "0x1000": "Broadcom", "0x11f8": "Microchip", "0x1d9b": "Microchip"}
 SALT = "lil-bench/1:"
+PCIE_KEYS = ("max_gen", "gpu_max_gen", "max_width", "current_gen", "current_width", "replay_counter")
 
 
 def identity_hash(value: str | None) -> str | None:
@@ -169,7 +170,18 @@ def iommu_group(bdf: str, sys_root: str = "/sys") -> str | None:
     return os.path.basename(os.path.realpath(link)) if link.exists() else None
 
 
-def nvml_gpus() -> dict:
+def integrated_gpu(name: str | None) -> bool:
+    """GB10 (DGX Spark) sits on the CPU package and shares the host's memory."""
+    return "GB10" in (name or "")
+
+
+def host_memory_mib(proc_root: str = "/proc") -> int | None:
+    meminfo = read(Path(proc_root, "meminfo"), 20000) or ""
+    match = re.search(r"^MemTotal:\s+(\d+) kB", meminfo, re.M)
+    return int(match.group(1)) // 1024 if match else None
+
+
+def nvml_gpus(proc_root: str = "/proc") -> dict:
     try:
         import pynvml
     except ImportError:
@@ -202,11 +214,13 @@ def nvml_gpus() -> dict:
         ecc = call("nvmlDeviceGetEccMode", handle)
         mig = call("nvmlDeviceGetMigMode", handle)
         capability = call("nvmlDeviceGetCudaComputeCapability", handle)
+        name = call("nvmlDeviceGetName", handle)
+        integrated = integrated_gpu(name)
         power_constraints = call("nvmlDeviceGetPowerManagementLimitConstraints", handle)
         clock = pynvml.NVML_CLOCK_SM, pynvml.NVML_CLOCK_MEM, pynvml.NVML_CLOCK_GRAPHICS
         gpu = {
             "index": index,
-            "name": call("nvmlDeviceGetName", handle),
+            "name": name,
             "uuid_hash": identity_hash(call("nvmlDeviceGetUUID", handle)),
             "bdf": normalize_bdf(bus_id) if bus_id else None,
             "pci_device_id": f"0x{pci.pciDeviceId:08x}" if pci is not None else None,
@@ -223,7 +237,8 @@ def nvml_gpus() -> dict:
             "persistence_mode": call("nvmlDeviceGetPersistenceMode", handle),
             "compute_mode": call("nvmlDeviceGetComputeMode", handle),
             "numa_node": call("nvmlDeviceGetNumaNodeId", handle),
-            "pcie": {
+            # An integrated GPU has no PCIe link of its own: NVML's link values are not a slot.
+            "pcie": dict.fromkeys(PCIE_KEYS) if integrated else {
                 "max_gen": call("nvmlDeviceGetMaxPcieLinkGeneration", handle),
                 "gpu_max_gen": call("nvmlDeviceGetGpuMaxPcieLinkGeneration", handle),
                 "max_width": call("nvmlDeviceGetMaxPcieLinkWidth", handle),
@@ -261,6 +276,13 @@ def nvml_gpus() -> dict:
                 if hasattr(pynvml, const)
             },
         }
+        if integrated:
+            gpu["integrated"] = True
+            # The GPU allocates from the host's memory; NVML reports no
+            # framebuffer of its own (Not Supported or 0).
+            gpu["unified_memory"] = True
+            if not gpu["memory_total_mib"]:
+                gpu["memory_total_mib"] = host_memory_mib(proc_root)
         gpus.append(gpu)
     return {"system": system, "gpus": gpus}
 
@@ -363,12 +385,12 @@ def host_inventory(proc_root: str = "/proc", sys_root: str = "/sys") -> dict:
 
 
 def collect(sys_root: str = "/sys", proc_root: str = "/proc") -> dict:
-    nvml = nvml_gpus()
+    nvml = nvml_gpus(proc_root)
     gpus = nvml.get("gpus", [])
     topology = {}
     all_hops = []
     for gpu in gpus:
-        if not gpu.get("bdf"):
+        if not gpu.get("bdf") or gpu.get("integrated"):
             continue
         chain = pci_chain(gpu["bdf"], sys_root)
         topology[gpu["bdf"]] = {"gpu": gpu["index"], "chain": chain, "summary": link_summary(chain)}

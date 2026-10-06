@@ -811,7 +811,9 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
     stub.write_text(STUB_BENCH)
     monkeypatch.setattr(standard, "BENCH", stub)
     monkeypatch.setattr(standard, "RESULT_DIRS", (str(tmp_path / "results"),))
-    monkeypatch.setattr(server, "find_server", lambda: {"pid": os.getpid(), "argv": ["vllm", "serve", "org/M", "--port", "5091", "--max-num-seqs", "4"]})
+    # The reused case also stands for rank 0 of a server that spans two machines.
+    nodes = ["--nnodes", "2", "--master-addr", "10.200.0.11"] if p2pmark == "reused" else []
+    monkeypatch.setattr(server, "find_server", lambda: {"pid": os.getpid(), "argv": ["vllm", "serve", "org/M", "--port", "5091", "--max-num-seqs", "4", *nodes]})
     monkeypatch.setattr(server, "server_state", lambda url: {"model_id": "org/M", "max_model_len": 32768, "kv_tokens": 100000})
     monkeypatch.setattr(server, "busy_requests", lambda url: 0.0)
     monkeypatch.setattr(server, "image_identity", lambda: {"alias": "ghcr.io/x:kk-beta", "assembly_sha256": "ab" * 32})
@@ -839,6 +841,11 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
     assert document["schema"] == "lil-bench-result/1" and document["profile"] == "quick"
     assert document["status"] == "complete" and document["client"]["uploader"] == "tester"
     assert document["server"]["limits"]["max_num_seqs"] == 4
+    if nodes:
+        assert document["server"]["nodes"] == {"nnodes": 2, "node_rank": 0, "headless": False}
+        assert "one tensor-parallel group across 2 machines; this is node rank 0" in out
+    else:
+        assert "nodes" not in document["server"]
     assert document["summary"]["decode"][0]["tok_s"] == 100.0
     names = [p["name"] for p in document["phases"]]
     assert names == (["p2pmark"] if p2pmark == "measured" else []) + ["prefill 8k", "decode C1 @ 0"]
@@ -1155,3 +1162,129 @@ def test_acs_parsing_and_summary(monkeypatch):
     assert summary == {"readable": False, "unreadable": ["0000:d6:00.0"],
                        "hops_with_acs": ["0000:ce:01.1", "0000:d5:00.0"],
                        "redirect": {"0000:d5:00.0": ["ReqRedir", "CmpltRedir"]}}
+
+
+# ---------------------------------------------------------------------------
+# GB10 (DGX Spark): integrated GPU, unified memory, several machines
+# ---------------------------------------------------------------------------
+
+class NVMLError(Exception):
+    pass
+
+
+class FakeNVML:
+    """pynvml with a GB10 (no memory info) and an RTX PRO 6000; unknown calls are not supported."""
+
+    NVML_CLOCK_SM, NVML_CLOCK_MEM, NVML_CLOCK_GRAPHICS = 1, 2, 0
+
+    def __init__(self, gb10_memory=None):
+        self.gb10_memory = gb10_memory
+        self.devices = [{"name": "NVIDIA GB10", "bus": "0000000F:01:00.0", "memory": gb10_memory},
+                        {"name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "bus": "00000000:41:00.0",
+                         "memory": type("Memory", (), {"total": 97887 * 2**20, "free": 1000 * 2**20})()}]
+
+    def __getattr__(self, name):
+        def unsupported(*args):
+            raise NVMLError("Not Supported")
+        return unsupported
+
+    def nvmlInit(self):
+        pass
+
+    def nvmlDeviceGetCount(self):
+        return len(self.devices)
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        return self.devices[index]
+
+    def nvmlDeviceGetName(self, handle):
+        return handle["name"]
+
+    def nvmlDeviceGetPciInfo_v3(self, handle):
+        return type("Pci", (), {"busId": handle["bus"].encode(), "pciDeviceId": 0x2B8510DE, "pciSubSystemId": 0})()
+
+    def nvmlDeviceGetMemoryInfo(self, handle):
+        if handle["memory"] is None:
+            raise NVMLError("Not Supported")
+        return handle["memory"]
+
+    def nvmlDeviceGetMaxPcieLinkGeneration(self, handle):
+        return 5
+
+    def nvmlDeviceGetMaxPcieLinkWidth(self, handle):
+        return 16
+
+    def nvmlDeviceGetCurrPcieLinkGeneration(self, handle):
+        return 1
+
+    def nvmlDeviceGetCurrPcieLinkWidth(self, handle):
+        return 1
+
+
+def meminfo_proc(tmp_path):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "meminfo").write_text("MemTotal:       125751720 kB\nMemAvailable:   98000000 kB\n")
+    return str(proc)
+
+
+@pytest.mark.parametrize("gb10_memory", [None, type("Memory", (), {"total": 0, "free": 0})()])
+def test_gb10_reports_unified_memory_and_no_pcie_link(monkeypatch, tmp_path, gb10_memory):
+    monkeypatch.setitem(sys.modules, "pynvml", FakeNVML(gb10_memory))
+    gb10, rtx = inventory.nvml_gpus(meminfo_proc(tmp_path))["gpus"]
+    assert gb10["integrated"] is True and gb10["unified_memory"] is True
+    assert gb10["memory_total_mib"] == 125751720 // 1024 and gb10["bdf"] == "000f:01:00.0"
+    assert gb10["pcie"] == dict.fromkeys(inventory.PCIE_KEYS)
+    # Discrete GPUs keep exactly what they reported before.
+    assert "integrated" not in rtx and "unified_memory" not in rtx
+    assert rtx["memory_total_mib"] == 97887
+    assert rtx["pcie"] == {"max_gen": 5, "gpu_max_gen": None, "max_width": 16, "current_gen": 1,
+                           "current_width": 1, "replay_counter": None}
+
+
+def test_gb10_has_no_pcie_path(monkeypatch, tmp_path):
+    gpus = [{"index": 0, "name": "NVIDIA GB10", "bdf": "000f:01:00.0", "integrated": True}]
+    monkeypatch.setattr(inventory, "nvml_gpus", lambda proc_root: {"gpus": gpus})
+    monkeypatch.setattr(inventory, "run", lambda cmd, **kwargs: {"cmd": cmd, "error": "not installed"})
+    hardware = inventory.collect(str(fake_sysfs(tmp_path)), meminfo_proc(tmp_path))
+    assert hardware["pcie"]["gpu_paths"] == {} and hardware["pcie"]["lspci_detail"] == {}
+
+
+def test_gb10_link_is_never_a_downgrade():
+    hardware = {"gpus": [{"bdf": "000f:01:00.0", "integrated": True, "pcie": dict.fromkeys(inventory.PCIE_KEYS)}]}
+    links = telemetry.link_limits(hardware)
+    assert links == [{"max_gen": None, "max_width": None, "integrated": True}]
+    # Whatever NVML samples for the integrated GPU's link, falling from it is not reported.
+    series = link_series([LOAD] * 8 + [GEN4] * 12, [0] * 20)
+    health = telemetry.link_health(telemetry.link_events(series, links))[0]
+    assert health["downgrades"] == 0 and health["issues"] == [] and health["link_max"] is None
+
+
+def test_p2pmark_on_one_gpu_without_memory_info_is_the_single_gpu_skip():
+    out = Lines()
+    hardware = {"gpus": [{"index": 0, "name": "NVIDIA GB10", "integrated": True}]}
+    result = p2p.measure(out, hardware, FakeBench(), free_fn=lambda: [])
+    assert result == {"status": "skipped", "reason": "single GPU: nothing to measure between GPUs",
+                      "free_mib": [], "ran": False}
+    # Without NVML the number of GPUs is unknown, and so is the reason.
+    unknown = p2p.measure(Lines(), {"gpus": []}, FakeBench(), free_fn=lambda: [], proc_root="/nonexistent")
+    assert unknown["status"] == "skipped" and unknown["reason"] == "free GPU memory is unknown (NVML unavailable)"
+
+
+@pytest.mark.parametrize("args, nodes", [
+    (["--tensor-parallel-size", "2"], None),
+    (["--nnodes", "1"], None),
+    (["--nnodes", "2", "--master-addr", "10.200.0.11"], {"nnodes": 2, "node_rank": 0, "headless": False}),
+    (["--nnodes=2", "--node-rank=1", "--headless"], {"nnodes": 2, "node_rank": 1, "headless": True}),
+    (["--nnodes", "x"], None),
+])
+def test_serve_nodes_from_argv(args, nodes):
+    options = server.parse_serve_args(["vllm", "serve", "org/M", *args])["options"]
+    assert server.serve_nodes(options) == nodes
+
+
+def test_a_worker_rank_is_refused_with_directions(monkeypatch, capsys):
+    monkeypatch.setattr(server, "find_server", lambda: {"pid": 1, "argv": [
+        "vllm", "serve", "m", "--nnodes", "2", "--node-rank", "1", "--headless"]})
+    code, out = run_main(["run", "--no-upload"], monkeypatch, capsys)
+    assert code == standard.EXIT_SERVER and "node rank 1" in out and "node rank 0, which serves the API" in out

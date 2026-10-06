@@ -586,6 +586,13 @@ def command_run(out: Output, args) -> int:
         return EXIT_SERVER
     serve = server.parse_serve_args(process["argv"]) if process else {"model": None, "options": {}}
     limits = server.serve_limits(serve["options"])
+    nodes = server.serve_nodes(serve["options"])
+    if nodes and (nodes["node_rank"] or nodes["headless"]) and not args.url:
+        out.error_panel("This machine runs a worker rank without an API", [
+            f"The server spans {nodes['nnodes']} machines; this one is node rank {nodes['node_rank']}.",
+            "Run lil-bench in the container of node rank 0, which serves the API.",
+        ])
+        return EXIT_SERVER
     base_url = args.url.rstrip("/") or f"http://127.0.0.1:{limits['port']}"
     try:
         state = server.server_state(base_url)
@@ -602,6 +609,8 @@ def command_run(out: Output, args) -> int:
     limits.update(max_model_len=state.get("max_model_len"), kv_tokens=kv_tokens or None)
     out.ok(f"model {state.get('model_id')} · max_model_len {state.get('max_model_len')} · "
            f"max-num-seqs {limits['max_num_seqs']} ({limits['max_num_seqs_source']}) · KV {kv_tokens:,} tokens")
+    if nodes:
+        out.ok(f"one tensor-parallel group across {nodes['nnodes']} machines; this is node rank {nodes['node_rank']}")
     image = server.image_identity()
     out.ok(f"image {image.get('alias') or 'unknown'} · assembly {(image.get('assembly_sha256') or '?')[:16]}")
     code = integrity.check(process["pid"] if process else None)
@@ -667,6 +676,11 @@ def command_run(out: Output, args) -> int:
                f"{hardware['cpu'].get('lscpu', {}).get('Model name', '?')} · "
                f"{(hardware['memory'].get('mem_total_mib') or 0) // 1024} GiB RAM")
         for gpu in gpus:
+            if gpu.get("integrated"):
+                memory = gpu.get("memory_total_mib")
+                out.info(f"GPU {gpu['index']} {gpu.get('bdf')}: integrated, "
+                         f"{memory // 1024 if memory else '?'} GiB memory shared with the CPU")
+                continue
             path = hardware["pcie"]["gpu_paths"].get(gpu.get("bdf") or "", {})
             s, pcie = path.get("summary") or {}, gpu.get("pcie") or {}
             switch = f", {s['switches']}" if s.get("switches") else ""
@@ -758,7 +772,7 @@ def command_run(out: Output, args) -> int:
         "server": {"pid": process and process["pid"], "argv": process and process["argv"],
                    "environment": server.filtered_environment(process["pid"]) if process else {},
                    "model": serve.get("model"), "options": serve["options"], "limits": limits, "api": state,
-                   "url": base_url},
+                   "url": base_url, **({"nodes": nodes} if nodes else {})},
         "hardware": hardware,
         "plan": plan,
         "results": {"p2pmark": p2p_result, "bench": bench_json, "bench_command": cmd,

@@ -56,10 +56,13 @@ def footprint_mib(gpus: int, size_mib: int, allreduce: bool = True) -> int:
     return CONTEXT_MIB + max(n * size_mib, NCCL_MIB if allreduce else 0)
 
 
+SINGLE_GPU = {"run": False, "why": "single_gpu", "reason": "single GPU: nothing to measure between GPUs"}
+
+
 def plan(free_mib: list[int], reserve_mib: int = RESERVE_MIB) -> dict:
     """The largest p2pmark that leaves ``reserve_mib`` free on every GPU."""
     if len(free_mib) < 2:
-        return {"run": False, "why": "single_gpu", "reason": "single GPU: nothing to measure between GPUs"}
+        return dict(SINGLE_GPU)
     gpus = min(len(free_mib), MAX_GPUS)
     fullest = min(range(len(free_mib)), key=lambda i: free_mib[i])
     lowest = free_mib[fullest]
@@ -297,8 +300,13 @@ def measure(out, hardware: dict, bench, *, free_fn, busy_fn=None, directory: Pat
     caller records a telemetry phase for it and removes the key).
     """
     free = free_fn()
-    chosen = plan(free) if free else {"run": False, "why": "unknown",
-                                       "reason": "free GPU memory is unknown (NVML unavailable)"}
+    if free:
+        chosen = plan(free)
+    elif len(hardware.get("gpus") or []) == 1:
+        # One GPU whose free memory NVML cannot report (GB10's unified memory).
+        chosen = dict(SINGLE_GPU)
+    else:
+        chosen = {"run": False, "why": "unknown", "reason": "free GPU memory is unknown (NVML unavailable)"}
     if chosen.get("why") == "single_gpu":
         out.warn(f"p2pmark skipped: {chosen['reason']}")
         return {"status": "skipped", "reason": chosen["reason"], "free_mib": free, "ran": False}
