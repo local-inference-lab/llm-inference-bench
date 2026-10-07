@@ -24,6 +24,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Fabric diagnostics** — bundled CUDA/NCCL P2P diagnostic plus AMD CPU NUMA/xGMI bandwidth and latency diagnostic
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
+- **Mixed prefill + decode** — `--mixed-prefill-contexts` measures the TTFT of a long prompt that arrives while other streams decode, against the same length alone, and what its prefill costs the running streams' decode throughput
 - **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
 - **Dataset accuracy profiles** — pinned GSM8K (1319 items), stratified MMLU-Pro (1000 items), and GPQA Diamond (198 items) benchmarks with per-item scoring, Wilson confidence intervals, and per-category accuracy, designed to measure quantization degradation (e.g. NVFP4 w4a16 vs w4a4)
 - **Paired A/B comparison** — `--compare-baseline` pairs two runs per item and reports accuracy delta, correct/wrong flips, exact McNemar significance, per-category deltas, and completion-token inflation
@@ -67,6 +68,11 @@ python3 llm_decode_bench.py --port 5001 \
 python3 llm_decode_bench.py --port 5001 \
     --prefill-only --prefill-contexts 8k,64k,128k \
     --display-mode plain --hw-monitor-interval 0.5
+
+# Mixed prefill + decode only: a 32k and a 128k prompt arriving while
+# 8 streams decode (TTFT alone vs under load, background tok/s around it)
+python3 llm_decode_bench.py --port 8000 --mixed-only \
+    --mixed-prefill-contexts 32k,128k --display-mode plain
 
 # Burst / E2E-only mode: exactly N measured requests per cell
 python3 llm_decode_bench.py --port 5001 --skip-prefill \
@@ -170,6 +176,14 @@ python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval \
 | `--prefill-metric` | `client` | Prefill headline source: `client`, `auto`, or `prometheus`. `auto` adds Prometheus validation when available |
 | `--standalone-prefill` | `false` | Run the old repeated cold-prefill profile before decode |
 | `--prefill-only` | `false` | Run standalone cold-prefill profiling and exit before sustained decode; JSON and final table include hardware/PCIe summaries when hardware sampling is enabled |
+| `--mixed-prefill-contexts` | | Prompt lengths (k suffix) for the mixed prefill + decode phase, which runs after the other phases. Empty disables it. See [Mixed Prefill + Decode](#mixed-prefill--decode) |
+| `--mixed-decode-streams` | `8` | Background decode streams; each restarts with a fresh prompt when its request finishes |
+| `--mixed-decode-prompt-tokens` | `2048` | Prompt length of every background request (unique prompt per request) |
+| `--mixed-decode-max-tokens` | `1024` | `max_tokens` of every background request (`ignore_eos` unless `--respect-eos`) |
+| `--mixed-warmup-seconds` | `20` | Background decode time before the long prompt is sent (it also waits until every stream decodes) |
+| `--mixed-window-seconds` | `10` | Background throughput window before the prompt and after its first token; the background keeps running this long after the first token |
+| `--mixed-arrival-max-tokens` | `16` | `max_tokens` of the long prompt, alone and under load |
+| `--mixed-only` | `false` | Run only the mixed phase: no prefill rows, no sustained decode matrix (implies `--skip-prefill`) |
 | `--request-count` | `0` | Burst / E2E-only mode: measured requests per cell. `0` keeps Sustained Decode as the primary mode |
 | `--warmup-request-count` | `0` | Warmup requests to discard before each `--request-count` cell |
 | `--run-burst` | `false` | After sustained decode, run an additional short Burst / E2E matrix |
@@ -445,6 +459,85 @@ Sustained Decode and Burst / E2E Decode are present and labeled separately.
 If `--run-burst` is not set, the final report prints an explicit Phase 3 note:
 `Burst / E2E Decode: Not run`. This is the default to avoid doubling the runtime
 of a full matrix accidentally.
+
+### Mixed Prefill + Decode
+
+Prefill and decode share the GPU: a long prompt that arrives while other users
+decode waits longer for its first token than on an idle server, and the running
+streams slow down while it is prefilled. `--mixed-prefill-contexts 32k,128k`
+measures both sides, one context at a time, after the other phases
+(`--mixed-only` runs only this phase):
+
+1. **Alone.** A prompt of C tokens is streamed on an idle server
+   (`max_tokens` `--mixed-arrival-max-tokens`, 16); its TTFT is `ttft_alone_s`.
+2. **Background.** `--mixed-decode-streams` (8) streams decode prompts of
+   `--mixed-decode-prompt-tokens` (2048) tokens with `max_tokens`
+   `--mixed-decode-max-tokens` (1024, `ignore_eos`). A stream whose request
+   finishes starts the next one at once. They stream with
+   `"stream_options": {"include_usage": true, "continuous_usage_stats": true}`,
+   and their tokens are counted from the increase of `usage.completion_tokens`
+   per chunk, not from chunks: with MTP / speculative decoding one chunk can
+   carry several tokens.
+3. **Arrival.** After `--mixed-warmup-seconds` (20 s), and once every stream has
+   produced a token, a second prompt of C tokens is sent; its TTFT is
+   `ttft_under_load_s`.
+4. The background keeps running `--mixed-window-seconds` (10 s) after the
+   arrival's first token, then stops.
+
+The report gives per context: `ttft_alone_s`, `ttft_under_load_s`, `slowdown`
+(under load / alone), the prompt tokens from `usage.prompt_tokens`, prefill
+tok/s of both requests, and the background decode tok/s in three windows: the
+10 s before the arrival is sent (`bg_tok_s_before`; shorter only when the warmup
+after the last stream started decoding was shorter), from its send to its first
+token, i.e. during its prefill (`bg_tok_s_during`), and the 10 s after its first
+token (`bg_tok_s_after`). `bg kept` is during / before. Errors of the reference,
+the arrival and every background stream are listed per context; a context that
+does not fit `max_model_len` or the KV budget (`streams × (prompt + max_tokens)
++ C`) is skipped with the reason.
+
+Every prompt is the bench's calibrated filler text with a unique leading tag
+(reference, arrival, each background request), so none is served from the
+prefix cache. In the default `--token-targeting estimate` mode, long prompts
+land within about 2% of C, and short ones such as the 2048-token background
+prompts come out roughly 100–150 tokens longer (chat template and question);
+`--token-targeting exact` builds every length through `/tokenize`. The JSON
+records the actual counts. Before the first context, one prefill of
+`min(8k, smallest C)` tokens warms the server up outside the measurement.
+`--temperature`, `--forced-token-id`, `--respect-eos`, `--no-loop-detection`,
+`--api-key` and `--cell-warmup-timeout-seconds` (how long to wait for every
+background stream to decode) apply to the phase as to decode cells. A confirmed
+decode loop in a background stream is reported as `ERROR: loop` next to its
+tok/s. Press `s` to skip the running context.
+
+`--output` gets a `mixed_prefill` section keyed by C (and the settings under
+`metadata.mixed_prefill`):
+
+```json
+"mixed_prefill": {
+  "32768": {
+    "context": 32768, "status": "ok",
+    "ttft_alone_s": 1.292, "ttft_under_load_s": 2.326, "slowdown": 1.8,
+    "prompt_tokens_alone": 32274, "prompt_tokens_under_load": 32274,
+    "prefill_tok_s_alone": 24971.9, "prefill_tok_s_under_load": 13874.5,
+    "bg_tok_s_before": 1181.0, "bg_tok_s_during": 469.9, "bg_tok_s_after": 1175.1,
+    "bg_during_vs_before": 0.398,
+    "windows": {
+      "before": {"start_s": -10.0, "end_s": 0.0, "seconds": 10.0, "tokens": 11810, "tok_s": 1181.0},
+      "during": {"start_s": 0.0, "end_s": 2.326, "seconds": 2.326, "tokens": 1093, "tok_s": 469.9},
+      "after": {"start_s": 2.326, "end_s": 12.326, "seconds": 10.0, "tokens": 11751, "tok_s": 1175.1}
+    },
+    "background": {"streams": 8, "streams_decoding_at_arrival": 8, "prompt_tokens": 2176,
+                   "max_tokens": 1024, "warmup_s": 20.081, "requests_started": 40,
+                   "requests_completed": 32, "errors": 0, "token_source": "usage"},
+    "timeline": {"bin_seconds": 1.0, "first_bin_start_s": -20.0, "tok_s": [987.0, 1188.0, 1200.0]},
+    "errors": [], "warnings": [], "loop_detected": false
+  }
+}
+```
+
+(Abridged; numbers from a stub server, not a GPU.) Window times are seconds
+relative to the arrival's send. `timeline` holds the background tok/s in 1 s
+bins over the whole background run, for plotting the dip.
 
 ### Completion-Token Statistics
 
@@ -951,6 +1044,7 @@ Results are saved as JSON with metadata and per-cell throughput data:
   "summary_table": { ... },
   "burst_results": [ ... ],
   "burst_summary_table": { ... },
+  "mixed_prefill": { ... },
   "methodology": { ... }
 }
 ```

@@ -13,11 +13,13 @@ Usage:
     python3 llm_decode_bench.py --port 5001 --max-tokens 4096
     python3 llm_decode_bench.py --host https://openrouter.ai --api-key sk-or-... --model meta-llama/llama-3-70b
     python3 llm_decode_bench.py --skip-prefill --concurrency 1,2,4 --contexts 0
+    python3 llm_decode_bench.py --port 8000 --mixed-only --mixed-prefill-contexts 32k,128k
 """
 
 import argparse
 import asyncio
 import base64
+import bisect
 import csv
 import fcntl
 import glob
@@ -67,7 +69,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.7.8"
+VERSION = "0.7.9"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -4984,6 +4986,12 @@ class TUIState:
     prefill_last_tokens: int = 0
     prefill_last_seconds: float = 0.0
     prefill_method: str = ""
+    # Mixed prefill + decode phase
+    mixed_phase: bool = False
+    mixed_step: str = ""
+    mixed_bg_tps: float = 0.0
+    mixed_bg_decoding: int = 0
+    mixed_last: str = ""
     # Server limits
     kv_cache_budget: int = 0
     max_running_requests: int = 0
@@ -7510,6 +7518,8 @@ def collect_startup_diagnostics(args, base_url: str) -> dict:
             "skip_prefill": getattr(args, "skip_prefill", False),
             "prefill_contexts": getattr(args, "prefill_contexts", ""),
             "prefill_metric": getattr(args, "prefill_metric", ""),
+            "mixed_prefill_contexts": getattr(args, "mixed_prefill_contexts", ""),
+            "mixed_only": getattr(args, "mixed_only", False),
             "dcp_size": getattr(args, "dcp_size", 0),
             "kv_budget": getattr(args, "kv_budget", 0),
         },
@@ -11930,7 +11940,20 @@ def build_display(state: TUIState) -> Layout:
     # Current test panel
     if state.cell_running:
         elapsed = time.monotonic() - state.cell_start
-        if state.prefill_phase:
+        if state.mixed_phase:
+            last = f"\n  [dim]{escape(state.mixed_last)}[/dim]" if state.mixed_last else ""
+            cell_text = (
+                f"[bold {PHOSPHOR_SOFT}]MIXED PREFILL+DECODE[/bold {PHOSPHOR_SOFT}]  "
+                f"[dim]ctx=[/dim][{TEXT_PRIMARY}]{format_context(state.current_context)}[/{TEXT_PRIMARY}]  "
+                f"[dim]background C=[/dim]{state.current_concurrency}\n"
+                f"  Elapsed: {format_time(elapsed)}\n"
+                f"  {escape(state.mixed_step or 'starting')}\n"
+                f"  Background: [bold {PHOSPHOR}]{state.mixed_bg_tps:,.0f}[/bold {PHOSPHOR}] tok/s  "
+                f"decoding {state.mixed_bg_decoding}/{state.current_concurrency}"
+                f"{last}\n"
+                f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
+            )
+        elif state.prefill_phase:
             last_sample = "last sample: pending"
             if state.prefill_last_tps > 0:
                 last_sample = f"last sample: {state.prefill_last_tps:,.0f} tok/s ({state.prefill_method})"
@@ -14266,12 +14289,1024 @@ async def run_completion_stats_benchmark(args) -> dict:
         return report
 
 
+# ---------------------------------------------------------------------------
+# Mixed prefill + decode
+# ---------------------------------------------------------------------------
+#
+# One long prompt arrives while other streams decode. The phase measures what
+# each side pays: the prompt's TTFT against the same-length prompt on an idle
+# server, and the background decode throughput before, during and after the
+# prompt's prefill. Background tokens come from usage.completion_tokens deltas,
+# so a chunk that carries several tokens (MTP / speculative decoding) counts
+# every one of them.
+
+MIXED_PREFILL_WARMUP_CONTEXT = 8192
+MIXED_TIMELINE_BIN_SECONDS = 1.0
+MIXED_STOP_GRACE_SECONDS = 10.0
+MIXED_REQUEST_TIMEOUT_SECONDS = 600.0
+MIXED_STREAM_OPTIONS = {"include_usage": True, "continuous_usage_stats": True}
+
+
+@dataclass
+class MixedPrefillSettings:
+    """Settings of the mixed prefill + decode phase (--mixed-prefill-contexts)."""
+    contexts: list = field(default_factory=list)
+    decode_streams: int = 8
+    decode_prompt_tokens: int = 2048
+    decode_max_tokens: int = 1024
+    warmup_seconds: float = 20.0
+    window_seconds: float = 10.0
+    arrival_max_tokens: int = 16
+    ready_timeout_seconds: float = 0.0
+    ignore_eos: bool = True
+    temperature: Optional[float] = None
+    forced_token_id: Optional[int] = None
+    loop_detection: bool = True
+
+    @classmethod
+    def from_args(cls, args) -> "MixedPrefillSettings":
+        return cls(
+            contexts=list(getattr(args, "mixed_prefill_context_list", None) or []),
+            decode_streams=int(getattr(args, "mixed_decode_streams", 8)),
+            decode_prompt_tokens=int(getattr(args, "mixed_decode_prompt_tokens", 2048)),
+            decode_max_tokens=int(getattr(args, "mixed_decode_max_tokens", 1024)),
+            warmup_seconds=float(getattr(args, "mixed_warmup_seconds", 20.0)),
+            window_seconds=float(getattr(args, "mixed_window_seconds", 10.0)),
+            arrival_max_tokens=int(getattr(args, "mixed_arrival_max_tokens", 16)),
+            ready_timeout_seconds=float(getattr(args, "cell_warmup_timeout_seconds", 0.0) or 0.0),
+            ignore_eos=not getattr(args, "respect_eos", False),
+            temperature=getattr(args, "temperature", None),
+            forced_token_id=getattr(args, "forced_token_id", None),
+            loop_detection=getattr(args, "loop_detection", True),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.contexts)
+
+    def warmup_context(self) -> int:
+        """Prompt length of the one-time prefill warmup before the first reference."""
+        return min([MIXED_PREFILL_WARMUP_CONTEXT, *self.contexts])
+
+    def prompt_sizes(self) -> list:
+        """Every prompt length the phase sends; the bench calibrates text for each."""
+        if not self.enabled:
+            return []
+        return sorted({*self.contexts, self.decode_prompt_tokens, self.warmup_context()})
+
+    def ready_timeout(self) -> float:
+        """Longest wait for every background stream to produce its first token."""
+        return self.ready_timeout_seconds or default_cell_warmup_timeout_seconds(self.decode_prompt_tokens)
+
+    def kv_tokens_needed(self, context_tokens: int) -> int:
+        return (
+            self.decode_streams * (self.decode_prompt_tokens + self.decode_max_tokens)
+            + context_tokens + self.arrival_max_tokens
+        )
+
+    def metadata(self) -> dict:
+        return {
+            "contexts": list(self.contexts),
+            "decode_streams": self.decode_streams,
+            "decode_prompt_tokens": self.decode_prompt_tokens,
+            "decode_max_tokens": self.decode_max_tokens,
+            "warmup_seconds": self.warmup_seconds,
+            "window_seconds": self.window_seconds,
+            "arrival_max_tokens": self.arrival_max_tokens,
+            "ignore_eos": self.ignore_eos,
+            "temperature": self.temperature,
+            "forced_token_id": self.forced_token_id,
+            "loop_detection": self.loop_detection,
+            "stream_options": dict(MIXED_STREAM_OPTIONS),
+        }
+
+
+def stream_chunk_channels(data: dict) -> list:
+    """(channel, text) pairs of the generated text in one OpenAI stream chunk."""
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return []
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+    channels = []
+    reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+    if reasoning:
+        channels.append(("reasoning", str(reasoning)))
+    content = delta.get("content") or choice.get("text")
+    if content:
+        channels.append(("content", str(content)))
+    return channels
+
+
+def stream_chunk_has_text(data: dict) -> bool:
+    """True when a stream chunk carries generated text or a tool call."""
+    if stream_chunk_channels(data):
+        return True
+    return any(
+        isinstance(choice, dict) and (choice.get("delta") or {}).get("tool_calls")
+        for choice in data.get("choices") or []
+    )
+
+
+def stream_chunk_has_output(data: dict) -> bool:
+    """First-token test for TTFT: text, a completion_tokens count above zero, or a finish reason."""
+    usage = data.get("usage")
+    if isinstance(usage, dict) and (usage.get("completion_tokens") or 0) > 0:
+        return True
+    if stream_chunk_has_text(data):
+        return True
+    return any(
+        isinstance(choice, dict) and choice.get("finish_reason") is not None
+        for choice in data.get("choices") or []
+    )
+
+
+class UsageTokenCounter:
+    """Generated tokens of one streamed request, counted from usage.completion_tokens.
+
+    With stream_options.continuous_usage_stats every chunk carries the cumulative
+    completion_tokens, and the increase over the previous chunk is what this chunk
+    delivered: a chunk with several tokens (MTP / speculative decoding) counts all
+    of them. A chunk with text but no usage counts as one token; a later usage
+    total (the final usage chunk) adds whatever such chunks missed.
+    """
+
+    def __init__(self):
+        self.tokens = 0
+        self.usage_chunks = 0
+        self.fallback_chunks = 0
+
+    def observe(self, data: dict) -> int:
+        """Count one parsed stream chunk and return the tokens it delivered."""
+        usage = data.get("usage")
+        completion = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        if completion is not None:
+            try:
+                total = int(completion)
+            except (TypeError, ValueError):
+                total = self.tokens
+            self.usage_chunks += 1
+            delta = total - self.tokens
+            if delta <= 0:
+                return 0
+            self.tokens = total
+            return delta
+        if stream_chunk_has_text(data):
+            self.fallback_chunks += 1
+            self.tokens += 1
+            return 1
+        return 0
+
+
+def mixed_window(samples: list, start: float, end: float) -> dict:
+    """Tokens and tok/s of time-ordered (time, tokens) samples with start <= time < end."""
+    seconds = end - start
+    if seconds <= 0:
+        return {"tokens": 0, "seconds": 0.0, "tok_s": None}
+    lo = bisect.bisect_left(samples, start, key=lambda item: item[0])
+    hi = bisect.bisect_left(samples, end, key=lambda item: item[0])
+    tokens = sum(delta for _, delta in samples[lo:hi])
+    return {"tokens": tokens, "seconds": seconds, "tok_s": tokens / seconds}
+
+
+def mixed_timeline(samples: list, origin: float, start: float, end: float,
+                   bin_seconds: float = MIXED_TIMELINE_BIN_SECONDS) -> dict:
+    """Background tok/s in whole bins aligned to origin (the arrival's send time)."""
+    first = math.ceil((start - origin) / bin_seconds - 1e-9) if end > start else 0
+    last = math.floor((end - origin) / bin_seconds + 1e-9) if end > start else 0
+    rates = []
+    for k in range(first, last):
+        lo = origin + k * bin_seconds
+        rates.append(round(mixed_window(samples, lo, lo + bin_seconds)["tok_s"], 1))
+    return {
+        "bin_seconds": bin_seconds,
+        "first_bin_start_s": round(first * bin_seconds, 3) if rates else None,
+        "tok_s": rates,
+    }
+
+
+def mixed_request_payload(model: str, context_tokens: int, text: str, max_tokens: int,
+                          settings: MixedPrefillSettings) -> dict:
+    payload = {
+        "model": model,
+        "messages": build_messages(context_tokens, text),
+        "stream": True,
+        "max_tokens": max_tokens,
+        "stream_options": dict(MIXED_STREAM_OPTIONS),
+    }
+    if settings.ignore_eos:
+        payload["ignore_eos"] = True
+    if settings.temperature is not None:
+        payload["temperature"] = settings.temperature
+    _apply_fixed_token_route(payload, settings.forced_token_id)
+    return payload
+
+
+def new_mixed_request_result() -> dict:
+    return {
+        "t_send": None, "t_first": None, "t_end": None, "ttft_s": None,
+        "prompt_tokens": None, "cached_tokens": None, "completion_tokens": 0, "error": "",
+    }
+
+
+async def mixed_ttft_request(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict,
+    *,
+    result: Optional[dict] = None,
+    first_token: Optional[asyncio.Event] = None,
+) -> dict:
+    """Stream one request and record its send time, first-token time and usage.
+
+    ``result`` is filled in place, so a caller can read ``t_first`` as soon as
+    ``first_token`` is set, before the request has finished.
+    """
+    result = new_mixed_request_result() if result is None else result
+    counter = UsageTokenCounter()
+    result["t_send"] = time.monotonic()
+    try:
+        async with client.stream(
+            "POST", url, json=payload,
+            timeout=httpx.Timeout(MIXED_REQUEST_TIMEOUT_SECONDS, connect=30.0),
+        ) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread()).decode("utf-8", "replace")[:300]
+                result["error"] = f"HTTP {resp.status_code}: {body}"
+                return result
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if data.get("error"):
+                    result["error"] = f"stream error: {data['error']}"[:300]
+                    break
+                now = time.monotonic()
+                counter.observe(data)
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    if usage.get("prompt_tokens") is not None:
+                        result["prompt_tokens"] = int(usage["prompt_tokens"])
+                    details = usage.get("prompt_tokens_details")
+                    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+                        result["cached_tokens"] = int(details["cached_tokens"])
+                if result["t_first"] is None and stream_chunk_has_output(data):
+                    result["t_first"] = now
+                    result["ttft_s"] = now - result["t_send"]
+                    if first_token is not None:
+                        first_token.set()
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    finally:
+        result["t_end"] = time.monotonic()
+        result["completion_tokens"] = counter.tokens
+        if result["t_first"] is not None:
+            result["ttft_s"] = result["t_first"] - result["t_send"]
+        elif not result["error"]:
+            result["error"] = "stream ended before the first output token"
+        if first_token is not None:
+            first_token.set()
+    return result
+
+
+@dataclass
+class MixedBackgroundStats:
+    """What the background decode streams of one mixed context delivered."""
+    samples: list = field(default_factory=list)          # (monotonic time, tokens) per chunk
+    first_token_at: dict = field(default_factory=dict)   # stream index -> first generated token
+    requests_started: int = 0
+    requests_completed: int = 0
+    prompt_tokens: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+    usage_chunks: int = 0
+    fallback_chunks: int = 0
+    alive: int = 0
+
+    def recent_tok_s(self, seconds: float = 2.0) -> float:
+        now = time.monotonic()
+        return mixed_window(self.samples, now - seconds, now + 1e-6)["tok_s"] or 0.0
+
+
+async def mixed_background_stream(
+    client: httpx.AsyncClient,
+    url: str,
+    index: int,
+    make_payload,
+    stop_event: asyncio.Event,
+    stats: MixedBackgroundStats,
+    *,
+    abort_url: str = "",
+    loop_check: Optional[LoopCheckState] = None,
+) -> None:
+    """Keep one background stream decoding until stop_event is set.
+
+    A finished request is replaced at once by a new one with a fresh, uncached
+    prompt from ``make_payload(index, ordinal)``. Every chunk that delivers
+    tokens is recorded as (time, tokens) in ``stats.samples``. A failed request
+    is recorded in ``stats.errors`` and ends this stream.
+    """
+    stats.alive += 1
+    ordinal = 0
+    try:
+        while not stop_event.is_set():
+            payload = make_payload(index, ordinal)
+            request_ordinal = ordinal
+            ordinal += 1
+            stats.requests_started += 1
+            counter = UsageTokenCounter()
+            detectors = {} if loop_check is not None and loop_check.enabled else None
+            request_id = ""
+            prompt_tokens = None
+            finished = False
+            error = ""
+
+            def check_loops(channel: str, text: str = "", *, finish: bool = False) -> None:
+                detector = detectors.setdefault(channel, StreamingLoopDetector())
+                finding = detector.finish() if finish else detector.feed(text)
+                loop_check.record(
+                    finding, channel=channel, stream_index=index,
+                    request_ordinal=request_ordinal, request_id=request_id,
+                    observed_completion_tokens=counter.tokens, phase="mixed_background",
+                )
+
+            try:
+                async with client.stream(
+                    "POST", url, json=payload,
+                    timeout=httpx.Timeout(MIXED_REQUEST_TIMEOUT_SECONDS, connect=30.0),
+                ) as resp:
+                    if resp.status_code >= 400:
+                        body = (await resp.aread()).decode("utf-8", "replace")[:200]
+                        error = f"HTTP {resp.status_code}: {body}"
+                    else:
+                        async for line in resp.aiter_lines():
+                            if stop_event.is_set():
+                                # SGLang keeps generating after the HTTP stream closes
+                                # unless the request is aborted while the stream is open.
+                                if request_id and abort_url:
+                                    await abort_sglang_request(client, abort_url, request_id)
+                                break
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                finished = True
+                                break
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(data, dict):
+                                continue
+                            if not request_id:
+                                request_id = str(data.get("id") or "")
+                            if data.get("error"):
+                                error = f"stream error: {data['error']}"
+                                break
+                            now = time.monotonic()
+                            delta = counter.observe(data)
+                            if delta > 0:
+                                stats.samples.append((now, delta))
+                                stats.first_token_at.setdefault(index, now)
+                            usage = data.get("usage")
+                            if isinstance(usage, dict) and usage.get("prompt_tokens") is not None:
+                                prompt_tokens = int(usage["prompt_tokens"])
+                            if any(
+                                isinstance(choice, dict) and choice.get("finish_reason") is not None
+                                for choice in data.get("choices") or []
+                            ):
+                                finished = True
+                            if detectors is not None:
+                                for channel, text in stream_chunk_channels(data):
+                                    check_loops(channel, text)
+                        if detectors is not None:
+                            for channel in tuple(detectors):
+                                check_loops(channel, finish=True)
+            except Exception as exc:
+                if not stop_event.is_set():
+                    error = f"{type(exc).__name__}: {exc}"
+            stats.usage_chunks += counter.usage_chunks
+            stats.fallback_chunks += counter.fallback_chunks
+            if prompt_tokens is not None:
+                stats.prompt_tokens.append(prompt_tokens)
+            if finished:
+                stats.requests_completed += 1
+            if not error and not finished and not stop_event.is_set() and counter.tokens == 0:
+                error = "stream ended without output"
+            if error:
+                stats.errors.append(f"background stream {index + 1}: {error}"[:300])
+                return
+    finally:
+        stats.alive -= 1
+
+
+def summarize_mixed_prefill_context(
+    context_tokens: int,
+    settings: MixedPrefillSettings,
+    *,
+    alone: dict,
+    arrival: Optional[dict],
+    stats: MixedBackgroundStats,
+    t_background_start: Optional[float],
+    t_stop: Optional[float],
+    errors: Optional[list] = None,
+    warnings: Optional[list] = None,
+    loop_check: Optional[LoopCheckState] = None,
+    hardware_summary: Optional[dict] = None,
+    skipped: bool = False,
+) -> dict:
+    """JSON-ready result of one mixed context from the raw request timings and samples."""
+    errors = list(errors or [])
+    samples = sorted(stats.samples, key=lambda item: item[0])
+
+    def r3(value):
+        return None if value is None else round(value, 3)
+
+    def r1(value):
+        return None if value is None else round(value, 1)
+
+    def prefill_rate(request: Optional[dict]):
+        if not request or not request.get("ttft_s"):
+            return None
+        tokens = request.get("prompt_tokens") or context_tokens
+        return tokens / request["ttft_s"]
+
+    ttft_alone = alone.get("ttft_s") if alone else None
+    ttft_load = arrival.get("ttft_s") if arrival else None
+    result = {
+        "context": context_tokens,
+        "status": "ok",
+        "ttft_alone_s": r3(ttft_alone),
+        "ttft_under_load_s": r3(ttft_load),
+        "slowdown": r3(ttft_load / ttft_alone) if ttft_alone and ttft_load else None,
+        "prompt_tokens_alone": alone.get("prompt_tokens") if alone else None,
+        "prompt_tokens_under_load": arrival.get("prompt_tokens") if arrival else None,
+        "cached_tokens_alone": alone.get("cached_tokens") if alone else None,
+        "cached_tokens_under_load": arrival.get("cached_tokens") if arrival else None,
+        "prefill_tok_s_alone": r1(prefill_rate(alone)),
+        "prefill_tok_s_under_load": r1(prefill_rate(arrival)),
+        "bg_tok_s_before": None,
+        "bg_tok_s_during": None,
+        "bg_tok_s_after": None,
+        "bg_during_vs_before": None,
+        "windows": {},
+        "background": {
+            "streams": settings.decode_streams,
+            "streams_decoding_at_arrival": None,
+            "prompt_tokens": int(median(stats.prompt_tokens)) if stats.prompt_tokens else None,
+            "max_tokens": settings.decode_max_tokens,
+            "warmup_s": None,
+            "requests_started": stats.requests_started,
+            "requests_completed": stats.requests_completed,
+            "errors": len(stats.errors),
+            "token_source": (
+                "usage" if stats.usage_chunks and not stats.fallback_chunks
+                else "chunks" if stats.fallback_chunks and not stats.usage_chunks
+                else "usage+chunks" if stats.fallback_chunks
+                else "none"
+            ),
+        },
+        "timeline": {"bin_seconds": MIXED_TIMELINE_BIN_SECONDS, "first_bin_start_s": None, "tok_s": []},
+        "errors": errors,
+        "warnings": list(warnings or []),
+        "loop_detected": bool(loop_check and loop_check.confirmed),
+        "loop_diagnostics": [
+            f for f in (loop_check.findings if loop_check else []) if f.get("status") == "confirmed"
+        ][:4],
+        "hardware_summary": hardware_summary or {},
+    }
+
+    t_send = arrival.get("t_send") if arrival else None
+    t_first = arrival.get("t_first") if arrival else None
+    if t_send is not None and t_background_start is not None:
+        decoding_since = sorted(t for t in stats.first_token_at.values() if t < t_send)
+        ready = (
+            decoding_since[settings.decode_streams - 1]
+            if len(decoding_since) >= settings.decode_streams else t_background_start
+        )
+        before_start = max(t_send - settings.window_seconds, ready, t_background_start)
+        windows = {"before": mixed_window(samples, before_start, t_send)}
+        if t_first is not None:
+            after_end = t_first + settings.window_seconds
+            if t_stop is not None:
+                after_end = min(after_end, t_stop)
+            windows["during"] = mixed_window(samples, t_send, t_first)
+            windows["after"] = mixed_window(samples, t_first, after_end)
+        bounds = {"before": (before_start, t_send)}
+        if t_first is not None:
+            bounds["during"] = (t_send, t_first)
+            bounds["after"] = (t_first, after_end)
+        for name, window in windows.items():
+            start, end = bounds[name]
+            result["windows"][name] = {
+                "start_s": r3(start - t_send),
+                "end_s": r3(end - t_send),
+                "seconds": r3(window["seconds"]),
+                "tokens": window["tokens"],
+                "tok_s": r1(window["tok_s"]),
+            }
+        result["bg_tok_s_before"] = result["windows"]["before"]["tok_s"]
+        if t_first is not None:
+            result["bg_tok_s_during"] = result["windows"]["during"]["tok_s"]
+            result["bg_tok_s_after"] = result["windows"]["after"]["tok_s"]
+            before_rate = windows["before"]["tok_s"]
+            during_rate = windows["during"]["tok_s"]
+            if before_rate and during_rate is not None:
+                result["bg_during_vs_before"] = r3(during_rate / before_rate)
+        result["background"]["streams_decoding_at_arrival"] = sum(
+            1 for t in stats.first_token_at.values() if t < t_send
+        )
+        result["background"]["warmup_s"] = r3(t_send - t_background_start)
+        if t_stop is not None:
+            result["timeline"] = mixed_timeline(samples, t_send, t_background_start, t_stop)
+
+    if skipped:
+        result["status"] = "skipped"
+        result["reason"] = "skipped by user"
+    elif ttft_alone is None or ttft_load is None:
+        result["status"] = "error"
+    return result
+
+
+async def run_mixed_prefill_context(
+    client: httpx.AsyncClient,
+    context_tokens: int,
+    settings: MixedPrefillSettings,
+    *,
+    model: str,
+    base_url: str,
+    engine: str,
+    prompt_text,
+    state: TUIState,
+    live,
+    console: Optional[Console] = None,
+    plain: bool = False,
+) -> dict:
+    """Measure one context: TTFT alone, then TTFT while N background streams decode.
+
+    ``prompt_text(tokens, tag)`` returns a calibrated prompt text of ``tokens``
+    tokens whose leading tag makes it unique, so no prompt hits the prefix cache.
+    """
+    url = f"{base_url}/v1/chat/completions"
+    abort_url = f"{base_url}/abort_request" if engine == ENGINE_SGLANG else ""
+    label = format_context(context_tokens)
+    streams = settings.decode_streams
+    errors: list = []
+    warnings: list = []
+    hw_start = len(state.hw_history)
+    stats = MixedBackgroundStats()
+    loop_check = LoopCheckState(enabled=settings.loop_detection)
+    alone = new_mixed_request_result()
+    arrival: Optional[dict] = None
+    t_background_start: Optional[float] = None
+    t_stop: Optional[float] = None
+    skipped = False
+
+    state.mixed_phase = True
+    state.cell_running = True
+    state.current_context = context_tokens
+    state.current_concurrency = streams
+    state.cell_start = time.monotonic()
+    state.mixed_bg_tps = 0.0
+    state.mixed_bg_decoding = 0
+    state.mixed_last = ""
+
+    def show(step: str, *, event: str = "") -> None:
+        state.mixed_step = step
+        state.mixed_bg_tps = stats.recent_tok_s()
+        state.mixed_bg_decoding = len(stats.first_token_at)
+        if event:
+            add_event(state, f"mixed {event} ctx={label}")
+            if plain and console is not None:
+                console.print(Text(f"  mixed {label}: {step}"))
+        live.update(build_display(state))
+
+    def skip_requested() -> bool:
+        if _skip_event.is_set():
+            _skip_event.clear()
+            return True
+        return False
+
+    def finish() -> dict:
+        state.cell_running = False
+        state.mixed_phase = False
+        return summarize_mixed_prefill_context(
+            context_tokens, settings,
+            alone=alone, arrival=arrival, stats=stats,
+            t_background_start=t_background_start, t_stop=t_stop,
+            errors=errors + stats.errors, warnings=warnings, loop_check=loop_check,
+            hardware_summary=summarize_hardware_history(state.hw_history[hw_start:]),
+            skipped=skipped,
+        )
+
+    add_event(state, f"mixed start ctx={label} streams={streams}")
+    try:
+        await require_decode_server_idle(
+            client, base_url, engine, state, live, boundary=f"before mixed ctx={label}",
+        )
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return finish()
+
+    # 1. Reference: the same-length prompt on an idle server.
+    show("reference: prompt alone on an idle server")
+    alone_payload = mixed_request_payload(
+        model, context_tokens, prompt_text(context_tokens, f"C{context_tokens}_REF"),
+        settings.arrival_max_tokens, settings,
+    )
+    alone_task = asyncio.create_task(mixed_ttft_request(client, url, alone_payload, result=alone))
+    while not alone_task.done():
+        show("reference: prompt alone on an idle server")
+        await asyncio.wait({alone_task}, timeout=0.5)
+    await alone_task
+    if alone["error"]:
+        errors.append(f"reference request: {alone['error']}")
+        show(f"reference failed: {alone['error']}", event="error")
+        return finish()
+    state.mixed_last = f"TTFT alone {alone['ttft_s']:.2f}s ({alone.get('prompt_tokens') or '?'} tokens)"
+    show(f"TTFT alone {alone['ttft_s']:.2f} s", event="reference")
+
+    # 2. Background streams, each restarted with a fresh prompt when it finishes.
+    def background_payload(index: int, ordinal: int) -> dict:
+        tag = f"C{context_tokens}_BG{index}_R{ordinal}"
+        return mixed_request_payload(
+            model, settings.decode_prompt_tokens,
+            prompt_text(settings.decode_prompt_tokens, tag), settings.decode_max_tokens, settings,
+        )
+
+    stop_event = asyncio.Event()
+    t_background_start = time.monotonic()
+    tasks = [
+        asyncio.create_task(mixed_background_stream(
+            client, url, index, background_payload, stop_event, stats,
+            abort_url=abort_url, loop_check=loop_check,
+        ))
+        for index in range(streams)
+    ]
+    arrival_task: Optional[asyncio.Task] = None
+    try:
+        warm_until = t_background_start + settings.warmup_seconds
+        ready_deadline = t_background_start + max(settings.ready_timeout(), settings.warmup_seconds)
+        while True:
+            now = time.monotonic()
+            decoding = len(stats.first_token_at)
+            # Every stream has produced a token, or ended (its error is reported).
+            starting = [i for i, task in enumerate(tasks) if i not in stats.first_token_at and not task.done()]
+            if not starting and now >= warm_until:
+                break
+            if all(task.done() for task in tasks):
+                break
+            if now >= ready_deadline:
+                warnings.append(
+                    f"only {decoding}/{streams} background streams were decoding "
+                    f"after {now - t_background_start:.0f}s; the prompt was sent anyway"
+                )
+                break
+            if skip_requested():
+                skipped = True
+                break
+            show(
+                f"background warmup {now - t_background_start:.0f}/{settings.warmup_seconds:g}s "
+                f"({decoding}/{streams} streams decoding)"
+            )
+            await asyncio.sleep(0.25)
+        if not skipped and stats.alive == 0:
+            errors.append("no background stream was running when the prompt was due")
+        if not skipped and stats.alive > 0:
+            # 3. The arrival: a unique prompt of the same length, sent under load.
+            arrival = new_mixed_request_result()
+            first_token = asyncio.Event()
+            arrival_payload = mixed_request_payload(
+                model, context_tokens, prompt_text(context_tokens, f"C{context_tokens}_ARR"),
+                settings.arrival_max_tokens, settings,
+            )
+            arrival_task = asyncio.create_task(mixed_ttft_request(
+                client, url, arrival_payload, result=arrival, first_token=first_token,
+            ))
+            await asyncio.sleep(0)  # let the request start: it stamps t_send right before sending
+            show("prompt arrived; prefill under load", event="arrival")
+            while not first_token.is_set():
+                if skip_requested():
+                    skipped = True
+                    break
+                show(f"prefill under load {time.monotonic() - (arrival['t_send'] or time.monotonic()):.1f}s")
+                try:
+                    await asyncio.wait_for(first_token.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            # 4. Keep the background running for the window after the first token.
+            if not skipped and arrival["t_first"] is not None:
+                state.mixed_last = (
+                    f"TTFT alone {alone['ttft_s']:.2f}s, under load {arrival['ttft_s']:.2f}s"
+                    if arrival.get("ttft_s") else state.mixed_last
+                )
+                deadline = arrival["t_first"] + settings.window_seconds
+                while (remaining := deadline - time.monotonic()) > 0:
+                    if skip_requested():
+                        skipped = True
+                        break
+                    show(f"background after the first token {settings.window_seconds - remaining:.0f}/"
+                         f"{settings.window_seconds:g}s")
+                    await asyncio.sleep(min(0.25, remaining))
+            if not skipped:
+                await arrival_task
+                if arrival["error"]:
+                    errors.append(f"prompt under load: {arrival['error']}")
+    finally:
+        t_stop = time.monotonic()
+        stop_event.set()
+        if arrival_task is not None and not arrival_task.done():
+            arrival_task.cancel()
+        pending_tasks = [task for task in tasks if not task.done()]
+        if pending_tasks:
+            _, pending = await asyncio.wait(pending_tasks, timeout=MIXED_STOP_GRACE_SECONDS)
+            for task in pending:
+                task.cancel()
+        cleanup = [*tasks, arrival_task] if arrival_task is not None else list(tasks)
+        await asyncio.gather(*cleanup, return_exceptions=True)
+    return finish()
+
+
+def mixed_prefill_skip_reason(context_tokens: int, settings: MixedPrefillSettings, *,
+                              server_context_length: int = 0, kv_budget: int = 0) -> str:
+    background_tokens = settings.decode_prompt_tokens + settings.decode_max_tokens
+    if server_context_length and background_tokens > server_context_length:
+        return (
+            f"background requests ({settings.decode_prompt_tokens} + {settings.decode_max_tokens} tokens) "
+            f"exceed the model context length {server_context_length:,}"
+        )
+    if server_context_length and context_tokens + settings.arrival_max_tokens > server_context_length:
+        return f"prompt exceeds the model context length {server_context_length:,}"
+    needed = settings.kv_tokens_needed(context_tokens)
+    if kv_budget > 0 and needed > kv_budget:
+        return f"KV cache: needs {needed:,} tokens, budget {kv_budget:,} ({format_kv_missing(needed, kv_budget)})"
+    return ""
+
+
+def skipped_mixed_prefill_result(context_tokens: int, settings: MixedPrefillSettings, reason: str) -> dict:
+    """A context that was not measured, with the same keys as a measured one."""
+    result = summarize_mixed_prefill_context(
+        context_tokens, settings, alone={}, arrival=None, stats=MixedBackgroundStats(),
+        t_background_start=None, t_stop=None,
+    )
+    result.update({"status": "skipped", "reason": reason})
+    return result
+
+
+def format_mixed_prefill_line(result: dict) -> str:
+    """One-line summary of a mixed context for the event log and plain output."""
+    label = format_context(int(result.get("context") or 0))
+    if result.get("status") == "skipped":
+        return f"{label}: skipped ({result.get('reason') or 'n/a'})"
+    if result.get("status") != "ok":
+        reason = (result.get("errors") or ["no result"])[0]
+        return f"{label}: ERROR {reason}"
+
+    def rate(value):
+        return "—" if value is None else f"{value:,.0f}"
+
+    line = (
+        f"{label}: TTFT {result['ttft_alone_s']:.2f}s alone, {result['ttft_under_load_s']:.2f}s under load "
+        f"({result['slowdown']:.2f}x); background tok/s {rate(result.get('bg_tok_s_before'))} before, "
+        f"{rate(result.get('bg_tok_s_during'))} during prefill, {rate(result.get('bg_tok_s_after'))} after"
+    )
+    if result.get("errors"):
+        line += f"; {len(result['errors'])} error(s)"
+    if result.get("loop_detected"):
+        line += "; loop detected"
+    return line
+
+
+async def run_mixed_prefill_phase(
+    settings: MixedPrefillSettings,
+    *,
+    model: str,
+    base_url: str,
+    engine: str,
+    auth_headers: dict,
+    prompt_text,
+    state: TUIState,
+    live,
+    console: Optional[Console] = None,
+    plain: bool = False,
+    server_context_length: int = 0,
+    kv_budget: int = 0,
+    results: Optional[dict] = None,
+) -> dict:
+    """Run every --mixed-prefill-contexts context; results are keyed by context."""
+    results = {} if results is None else results
+    if not settings.enabled:
+        return results
+    contexts_label = ", ".join(format_context(c) for c in settings.contexts)
+    intro = (
+        f"Mixed prefill + decode: {contexts_label} | {settings.decode_streams} background streams "
+        f"({settings.decode_prompt_tokens}-token prompts, max_tokens {settings.decode_max_tokens}), "
+        f"warmup {settings.warmup_seconds:g}s, windows {settings.window_seconds:g}s"
+    )
+    add_event(state, f"mixed phase start contexts={contexts_label} streams={settings.decode_streams}")
+    if plain and console is not None:
+        console.print(Text(intro, style="cyan"))
+    url = f"{base_url}/v1/chat/completions"
+    limits = httpx.Limits(
+        max_connections=settings.decode_streams + 8,
+        max_keepalive_connections=settings.decode_streams + 4,
+    )
+    try:
+        async with httpx.AsyncClient(limits=limits, headers=auth_headers or {}) as client:
+            runnable = [
+                c for c in settings.contexts
+                if c not in results and not mixed_prefill_skip_reason(
+                    c, settings, server_context_length=server_context_length, kv_budget=kv_budget,
+                )
+            ]
+            if runnable:
+                # One cold prefill outside the measurement, so the first reference
+                # TTFT does not include kernel JIT or first-allocation cost.
+                warmup_ctx = settings.warmup_context()
+                state.mixed_phase = True
+                state.cell_running = True
+                state.cell_start = time.monotonic()
+                state.current_context = warmup_ctx
+                state.current_concurrency = settings.decode_streams
+                state.mixed_step = "warmup: one prefill before the measured contexts"
+                add_event(state, f"mixed warmup start ctx={format_context(warmup_ctx)}")
+                live.update(build_display(state))
+                warmup = await mixed_ttft_request(client, url, mixed_request_payload(
+                    model, warmup_ctx, prompt_text(warmup_ctx, "WARMUP"), 1, settings,
+                ))
+                add_event(
+                    state,
+                    f"mixed warmup done ctx={format_context(warmup_ctx)}"
+                    + (f" ERROR {warmup['error']}" if warmup["error"] else ""),
+                )
+            for ctx in settings.contexts:
+                if ctx in results:
+                    continue
+                reason = mixed_prefill_skip_reason(
+                    ctx, settings, server_context_length=server_context_length, kv_budget=kv_budget,
+                )
+                if reason:
+                    results[ctx] = skipped_mixed_prefill_result(ctx, settings, reason)
+                else:
+                    started = time.monotonic()
+                    results[ctx] = await run_mixed_prefill_context(
+                        client, ctx, settings,
+                        model=model, base_url=base_url, engine=engine, prompt_text=prompt_text,
+                        state=state, live=live, console=console, plain=plain,
+                    )
+                    state.cell_times.append(time.monotonic() - started)
+                state.completed_tests += 1
+                line = format_mixed_prefill_line(results[ctx])
+                add_event(state, f"mixed done {line}")
+                if plain and console is not None:
+                    console.print(Text(f"Mixed prefill + decode {line}"))
+                live.update(build_display(state))
+                if results[ctx].get("status") != "skipped":
+                    await asyncio.sleep(1.0)
+    finally:
+        state.mixed_phase = False
+        state.cell_running = False
+        live.update(build_display(state))
+    return results
+
+
+def mixed_prefill_config_line(args) -> str:
+    settings = MixedPrefillSettings.from_args(args)
+    return (
+        f"Mixed prefill + decode: {[format_context(c) for c in settings.contexts]} | "
+        f"{settings.decode_streams} background streams x {settings.decode_prompt_tokens}-token prompts "
+        f"(max_tokens {settings.decode_max_tokens}) | warmup {settings.warmup_seconds:g}s, "
+        f"windows {settings.window_seconds:g}s | prompt max_tokens {settings.arrival_max_tokens}"
+    )
+
+
+def mixed_prefill_json(results: Optional[dict]) -> dict:
+    """The --output section: one entry per context, keyed by its token count."""
+    return {str(ctx): results[ctx] for ctx in sorted(results or {})}
+
+
+def print_mixed_prefill_results(console: Console, results: Optional[dict], *, compact: bool = False) -> None:
+    """Final report table of the mixed prefill + decode phase."""
+    if not results:
+        return
+    rows = [results[ctx] for ctx in sorted(results)]
+    measured = [r for r in rows if r.get("status") != "skipped" or r.get("ttft_alone_s") is not None]
+    sample = next((r for r in measured if r.get("background")), {})
+    background = sample.get("background") or {}
+    window = (sample.get("windows") or {}).get("before", {})
+
+    def secs(value):
+        return "—" if value is None else f"{value:.2f}"
+
+    def rate(value):
+        return "—" if value is None else f"{value:,.0f}"
+
+    if not compact:
+        console.print()
+        console.print(Panel(
+            "[bold]Mixed Prefill + Decode[/bold]\n"
+            "One long prompt arrives while other streams decode. TTFT under load vs. the same-length prompt "
+            "alone shows what the decode load costs the new request; background tok/s before, during and "
+            "after its prefill shows what the prefill costs the running streams.",
+            title=render_title("Phase 4"),
+            box=PANEL_BOX,
+            border_style=FRAME_BORDER,
+        ))
+    table = Table(
+        title=render_title(
+            "Mixed prefill + decode",
+            f"{background.get('streams', '?')} background streams" if background else "",
+        ),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    table.add_column("ctx", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    if not compact:
+        table.add_column("tokens", justify="right", no_wrap=True)
+    table.add_column("TTFT alone s", justify="right", no_wrap=True)
+    table.add_column("TTFT load s", justify="right", no_wrap=True)
+    table.add_column("slowdown", justify="right", no_wrap=True)
+    table.add_column("bg before", justify="right", no_wrap=True)
+    table.add_column("bg prefill", justify="right", no_wrap=True)
+    table.add_column("bg after", justify="right", no_wrap=True)
+    if not compact:
+        table.add_column("bg kept", justify="right", no_wrap=True)
+        table.add_column("err", justify="right", no_wrap=True)
+    for r in rows:
+        label = format_context(int(r.get("context") or 0))
+        status = r.get("status")
+        if status == "skipped" and r.get("ttft_alone_s") is None:
+            cells = ["skip"] + ["—"] * (len(table.columns) - 2)
+            table.add_row(label, *cells)
+            continue
+        tokens = r.get("prompt_tokens_under_load") or r.get("prompt_tokens_alone")
+        slowdown = r.get("slowdown")
+        values = []
+        if not compact:
+            values.append(f"{tokens:,}" if tokens else f"~{int(r.get('context') or 0):,}")
+        values += [
+            secs(r.get("ttft_alone_s")),
+            secs(r.get("ttft_under_load_s")),
+            f"{slowdown:.2f}x" if slowdown is not None else ("ERROR" if status == "error" else "—"),
+        ]
+        bg = [rate(r.get("bg_tok_s_before")), rate(r.get("bg_tok_s_during")), rate(r.get("bg_tok_s_after"))]
+        if r.get("loop_detected"):
+            bg = [f"{value} loop" if value != "—" else value for value in bg]
+        values += bg
+        if not compact:
+            kept = r.get("bg_during_vs_before")
+            values.append(f"{kept * 100:.0f}%" if kept is not None else "—")
+            values.append(str(len(r.get("errors") or [])))
+        table.add_row(label, *values)
+    console.print(table)
+    if compact:
+        return
+    for r in rows:
+        if r.get("status") == "skipped" and r.get("reason"):
+            console.print(Text(f"{format_context(int(r.get('context') or 0))}: skipped, {r['reason']}", style="dim"))
+        for message in (r.get("errors") or [])[:3]:
+            console.print(Text(f"{format_context(int(r.get('context') or 0))}: {message}", style=THEME_ERROR))
+        for message in (r.get("warnings") or [])[:3]:
+            console.print(Text(f"{format_context(int(r.get('context') or 0))}: {message}", style="yellow"))
+        if r.get("loop_detected"):
+            console.print(Text(
+                f"{format_context(int(r.get('context') or 0))}: ERROR: loop in a background stream; "
+                "its tok/s is not a valid throughput. Evidence in JSON.",
+                style="bold red",
+            ))
+    after = (sample.get("windows") or {}).get("after") or window
+    window_label = f"{after['seconds']:.0f}s" if after.get("seconds") else "window"
+    console.print(Text(
+        f"{background.get('streams', 'N')} background streams decode "
+        f"{background.get('prompt_tokens') or '?'}-token prompts (max_tokens {background.get('max_tokens', '?')}) "
+        "and restart with a fresh prompt when one finishes. TTFT alone = a unique prompt of the same length "
+        "on an idle server; TTFT load = a unique prompt sent after the background warmup; "
+        "slowdown = TTFT load / TTFT alone. bg before / prefill / after = background tok/s from usage "
+        f"completion_tokens in the {window_label} before the prompt, from its send to its first token, and in "
+        f"the {window_label} after its first token; bg kept = prefill / before.",
+        style="dim",
+    ))
+
+
 # Main benchmark loop
 # ---------------------------------------------------------------------------
 
 async def run_benchmark(args):
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
+    mixed_settings = MixedPrefillSettings.from_args(args)
+    mixed_only = bool(getattr(args, "mixed_only", False))
+    if getattr(args, "mixed_prefill_results", None) is None:
+        args.mixed_prefill_results = {}
     if args.host.startswith("http://") or args.host.startswith("https://"):
         base_url = args.host.rstrip("/")
         # Append --port if explicitly provided and URL doesn't already contain one
@@ -14610,11 +15645,22 @@ async def run_benchmark(args):
             f"{[format_context(c) for c in decode_prefill_contexts]}{extra}"
         )
 
+    if mixed_settings.enabled:
+        mixed_line = (
+            f"{[format_context(c) for c in mixed_settings.contexts]}, "
+            f"{mixed_settings.decode_streams} background streams x "
+            f"{mixed_settings.decode_prompt_tokens}-token prompts"
+            + (" (only this phase: --mixed-only)" if mixed_only else "")
+        )
+        console.print(f"[cyan]Mixed prefill + decode:[/cyan] {mixed_line}")
+        remember_startup(f"mixed prefill + decode: {mixed_line}")
+
     # --- Step 3: Generate padding text calibrated to actual token counts ---
     # Default to one calibration request and extrapolate all contexts. Exact
     # /tokenize targeting is available, but it is slow on long context matrices
     # and SGLang deployments often do not expose the endpoint.
-    all_ctx_sizes = sorted(set(prefill_contexts + [c for c in context_lengths if c > 0]))
+    decode_ctx_sizes = [] if mixed_only else [c for c in context_lengths if c > 0]
+    all_ctx_sizes = sorted(set(prefill_contexts + decode_ctx_sizes + mixed_settings.prompt_sizes()))
     max_ctx = max(all_ctx_sizes) if all_ctx_sizes else 0
     context_cache = {}
     context_actual_tokens = {}
@@ -14813,13 +15859,17 @@ async def run_benchmark(args):
     remember_startup("startup preparation done")
 
     # --- Step 4: Initialize TUI state ---
+    decode_matrix = not args.prefill_only and not mixed_only
     state = TUIState(
         engine=engine,
         model_name=args.model,
         server_url=server_label,
-        total_tests=0 if args.prefill_only else len(concurrency_levels) * len(context_lengths),
-        concurrency_levels=concurrency_levels,
-        context_lengths=context_lengths,
+        total_tests=(
+            (len(concurrency_levels) * len(context_lengths) if decode_matrix else 0)
+            + len(mixed_settings.contexts)
+        ),
+        concurrency_levels=concurrency_levels if not mixed_only else [],
+        context_lengths=context_lengths if not mixed_only else [],
         overall_start=time.monotonic(),
         show_capacity_limited_values=args.show_capacity_limited_values,
         metrics_available=metrics_available,
@@ -14879,14 +15929,14 @@ async def run_benchmark(args):
             return False
         return conc * (ctx + args.max_tokens) > args.max_total_tokens
 
-    if not args.prefill_only and args.max_total_tokens > 0:
+    if decode_matrix and args.max_total_tokens > 0:
         state.kv_cache_budget = args.max_total_tokens
 
         runnable = sum(
             1 for ctx in context_lengths for conc in concurrency_levels
             if not _should_skip(ctx, conc)
         )
-        skipped = state.total_tests - runnable
+        skipped = len(concurrency_levels) * len(context_lengths) - runnable
         state.skipped_cells = skipped
         for ctx in context_lengths:
             for conc in concurrency_levels:
@@ -14915,12 +15965,39 @@ async def run_benchmark(args):
             return warmup_prefix + cached[len(measured_prefix):]
         return warmup_prefix + cached
 
+    def _mixed_prompt_text(tokens: int, tag: str) -> str:
+        """Calibrated text of ``tokens`` tokens with a unique leading tag (no prefix-cache hit)."""
+        cached = context_cache.get(tokens) or generate_padding_text(tokens)
+        measured_prefix = f"[BENCH_{run_id}_CTX_{tokens}] "
+        if cached.startswith(measured_prefix):
+            cached = cached[len(measured_prefix):]
+        return f"[MIXED_{run_id}_{tag}] " + cached
+
+    async def run_mixed_phase(live) -> None:
+        if not mixed_settings.enabled:
+            return
+        await run_mixed_prefill_phase(
+            mixed_settings,
+            model=args.model,
+            base_url=base_url,
+            engine=engine,
+            auth_headers=auth_headers,
+            prompt_text=_mixed_prompt_text,
+            state=state,
+            live=live,
+            console=console,
+            plain=args.display_mode == "plain",
+            server_context_length=server_context_length,
+            kv_budget=args.max_total_tokens,
+            results=args.mixed_prefill_results,
+        )
+
     # Decode-context prefill is part of each decode context scout request. Only
     # standalone samples and scout-only extra contexts add independent tests.
     state.prefill_contexts = prefill_contexts
     state.total_tests += len(standalone_prefill_contexts) if args.standalone_prefill and not args.skip_prefill else 0
     state.total_tests += len(prefill_scout_only_contexts) if not args.standalone_prefill and not args.skip_prefill else 0
-    if args.run_burst and args.request_count == 0 and not args.prefill_only:
+    if args.run_burst and args.request_count == 0 and decode_matrix:
         state.total_tests += len(concurrency_levels) * len(context_lengths)
 
     # Run benchmark
@@ -15460,6 +16537,7 @@ async def run_benchmark(args):
                     state.cell_running = False
                     state.prefill_phase = False
                     live.update(build_display(state))
+                    await run_mixed_phase(live)
                     setattr(args, "hardware_run_summary", summarize_hardware_history(state.hw_history))
                     return all_results, burst_results, state.prefill_results, engine
 
@@ -15561,7 +16639,7 @@ async def run_benchmark(args):
             first_ctx = context_lengths[0]
 
             # Hidden decode warmup. Duration 0 disables it explicitly.
-            if args.decode_warmup_seconds > 0:
+            if args.decode_warmup_seconds > 0 and decode_matrix:
                 warmup_ctx = _select_decode_warmup_context()
                 warmup_conc = 1
                 setattr(args, "decode_warmup_context", warmup_ctx)
@@ -15621,6 +16699,8 @@ async def run_benchmark(args):
                 for conc in concurrency_levels[1:]:
                     if (ctx, conc) not in done_set:
                         test_order.append((ctx, conc))
+            if not decode_matrix:
+                test_order = []  # --mixed-only: no sustained decode matrix
 
             for ctx, conc in test_order:
                     # Already measured by a resumed checkpoint
@@ -15777,6 +16857,9 @@ async def run_benchmark(args):
                     live.update(build_display(state))
                     await asyncio.sleep(1.0)
 
+            # === Optional Phase 4: mixed prefill + decode ===
+            await run_mixed_phase(live)
+
     setattr(args, "event_log", list(state.events))
     setattr(args, "hardware_run_summary", summarize_hardware_history(state.hw_history))
     return all_results, burst_results, state.prefill_results, engine
@@ -15790,7 +16873,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                         console: Console, prefill_results: dict = None,
                         show_capacity_limited_values: bool = False,
                         burst_results: list = None,
-                        hardware_run_summary: dict = None):
+                        hardware_run_summary: dict = None,
+                        mixed_prefill_results: dict = None):
     console.print("\n")
     console.print(f"[dim]llm-decode-bench v{VERSION}[/dim]")
     for cell in [*results, *(burst_results or [])]:
@@ -15883,6 +16967,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         console.print()
 
     if not results and not burst_results:
+        print_mixed_prefill_results(console, mixed_prefill_results)
         return
 
     if results:
@@ -16221,6 +17306,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
             border_style=SUBTLE_BORDER,
         ))
 
+    print_mixed_prefill_results(console, mixed_prefill_results)
+
     if prefill_results or results:
         console.print()
         console.print(Panel(
@@ -16351,11 +17438,16 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
             f"directly comparable. (accept len) = tokens emitted per engine step.{ref_note}[/dim]"
         )
 
+    if mixed_prefill_results and (prefill_results or results):
+        print_mixed_prefill_results(console, mixed_prefill_results, compact=True)
+
 
 def save_results(results: list, args, filepath: str, prefill_results: dict = None,
                  engine: str = "", burst_results: list = None):
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
+    mixed_settings = MixedPrefillSettings.from_args(args)
+    mixed_results = getattr(args, "mixed_prefill_results", None) or {}
 
     # Build summary table (exclude skipped)
     summary = {}
@@ -16466,6 +17558,8 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             ),
             "p2pmark_status": getattr(args, "p2pmark_result", {}).get("status", "not_run"),
             "amd_fabric_status": getattr(args, "amd_fabric_result", {}).get("status", "not_run"),
+            "mixed_only": getattr(args, "mixed_only", False),
+            "mixed_prefill": mixed_settings.metadata() if mixed_settings.enabled else None,
         },
         "startup_diagnostics": getattr(args, "startup_diagnostics", {}),
         "nvidia_p2p_override": getattr(args, "nvidia_p2p_override", {}),
@@ -16478,6 +17572,7 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
         "summary_table": summary,
         "burst_results": [asdict(r) for r in actual_burst_results],
         "burst_summary_table": burst_summary,
+        "mixed_prefill": mixed_prefill_json(mixed_results),
         "methodology": {
             "prefill": {
                 "name": "Prefill",
@@ -16521,6 +17616,30 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
                 "notes": (
                     "Finite client-facing request burst using OpenAI stream usage. "
                     "It includes request admission, scheduling, prefill/cache behavior, and completion."
+                ),
+            },
+            "mixed_prefill": {
+                "name": "Mixed Prefill + Decode",
+                "present": bool(mixed_results),
+                "formula": (
+                    "slowdown = ttft_under_load_s / ttft_alone_s; "
+                    "bg_tok_s_<window> = background usage completion_tokens deltas in the window / window seconds"
+                ),
+                "windows": {
+                    "before": "window_seconds before the arrival is sent (after the background warmup)",
+                    "during": "arrival send -> its first streamed token (its prefill under load)",
+                    "after": "its first token -> window_seconds later",
+                },
+                "notes": (
+                    "Per context: a unique prompt of that length is sent alone on an idle server "
+                    "(ttft_alone_s). Then decode_streams background streams decode unique "
+                    "decode_prompt_tokens prompts (max_tokens decode_max_tokens, restarted at once when "
+                    "one finishes, continuous usage stats); after warmup_seconds a second unique prompt "
+                    "of the same length arrives (ttft_under_load_s) and the background keeps running "
+                    "window_seconds after its first token. Background tokens come from "
+                    "usage.completion_tokens deltas, so multi-token chunks (MTP) count fully. "
+                    "Prompts are calibrated filler text whose leading tag is unique per request, so "
+                    "the prefix cache cannot shorten them; prompt token counts come from usage."
                 ),
             },
             "acceptance_normalization": {
@@ -16604,6 +17723,7 @@ def resume_config_signature(args) -> dict:
         "skip_prefill": getattr(args, "skip_prefill", False),
         "standalone_prefill": getattr(args, "standalone_prefill", False),
         "prefill_only": getattr(args, "prefill_only", False),
+        "mixed_only": getattr(args, "mixed_only", False),
     }
 
 
@@ -18198,6 +19318,78 @@ def check_for_update(console: Console) -> bool:
     return False
 
 
+MIXED_PREFILL_CLI_OPTIONS = (
+    "--mixed-decode-streams", "--mixed-decode-prompt-tokens", "--mixed-decode-max-tokens",
+    "--mixed-warmup-seconds", "--mixed-window-seconds", "--mixed-arrival-max-tokens", "--mixed-only",
+)
+
+
+def validate_mixed_prefill_args(parser: argparse.ArgumentParser, args) -> None:
+    """Parse --mixed-prefill-contexts into args.mixed_prefill_context_list and check the phase options."""
+    contexts = []
+    for part in (args.mixed_prefill_contexts or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = parse_token_value(part)
+        except ValueError:
+            parser.error(f"--mixed-prefill-contexts: cannot read {part!r}; use token counts such as 32768 or 32k")
+        if value <= 0:
+            parser.error("--mixed-prefill-contexts values must be > 0")
+        if value not in contexts:
+            contexts.append(value)
+    args.mixed_prefill_context_list = contexts
+    if not contexts:
+        if (args.mixed_prefill_contexts or "").strip():
+            parser.error("--mixed-prefill-contexts needs at least one prompt length")
+        used = [name for name in MIXED_PREFILL_CLI_OPTIONS if cli_option_present(name)]
+        if args.mixed_only and "--mixed-only" not in used:
+            used.append("--mixed-only")
+        if used:
+            verb = "needs" if len(used) == 1 else "need"
+            parser.error(f"{', '.join(used)} {verb} --mixed-prefill-contexts")
+        return
+    if args.mixed_decode_streams < 1:
+        parser.error("--mixed-decode-streams must be >= 1")
+    if args.mixed_decode_prompt_tokens < 1:
+        parser.error("--mixed-decode-prompt-tokens must be >= 1")
+    if args.mixed_decode_max_tokens < 1:
+        parser.error("--mixed-decode-max-tokens must be >= 1")
+    if args.mixed_warmup_seconds < 0:
+        parser.error("--mixed-warmup-seconds must be >= 0")
+    if not args.mixed_window_seconds > 0:
+        parser.error("--mixed-window-seconds must be > 0")
+    if args.mixed_arrival_max_tokens < 1:
+        parser.error("--mixed-arrival-max-tokens must be >= 1")
+    conflicts = [
+        name for name, used in (
+            ("--completion-stats/--test-profile", args.completion_stats),
+            ("--tool-eval", args.tool_eval),
+            ("--p2pmark-only", args.p2pmark_only),
+            ("--amd-fabric-only", args.amd_fabric_only),
+            ("--compare-candidate", bool(args.compare_candidate)),
+        ) if used
+    ]
+    if conflicts:
+        parser.error(
+            "--mixed-prefill-contexts is a phase of the prefill/decode benchmark; "
+            f"it cannot be combined with {', '.join(conflicts)}"
+        )
+    if args.mixed_only:
+        conflicts = [
+            name for name, used in (
+                ("--prefill-only", args.prefill_only),
+                ("--standalone-prefill", args.standalone_prefill and not args.prefill_only),
+                ("--run-burst", args.run_burst),
+                ("--request-count", args.request_count > 0),
+            ) if used
+        ]
+        if conflicts:
+            parser.error(f"--mixed-only runs only the mixed phase; it cannot be combined with {', '.join(conflicts)}")
+        args.skip_prefill = True
+
+
 TOOL_EVAL_CLI_OPTIONS = (
     "--tool-eval-seed", "--tool-eval-temperature", "--tool-eval-parallel", "--tool-eval-max-turns",
     "--tool-eval-timeout", "--tool-eval-hardmode", "--no-tool-eval-hardmode", "--tool-eval-args",
@@ -18730,6 +19922,49 @@ def parse_args():
              "Useful for prefill/PCIe communication sweeps. Implies --standalone-prefill."
     )
     parser.add_argument(
+        "--mixed-prefill-contexts", default="",
+        help="Comma-separated prompt lengths (k suffix) for the mixed prefill + decode phase, "
+             "run after the other phases: per length, TTFT of a unique prompt alone on an idle "
+             "server, then TTFT of another unique prompt of that length sent while "
+             "--mixed-decode-streams background streams decode, plus the background decode tok/s "
+             "before, during and after its prefill. Empty disables the phase. (default: empty)"
+    )
+    parser.add_argument(
+        "--mixed-decode-streams", type=int, default=8,
+        help="Background decode streams in the mixed phase. Each one restarts with a fresh "
+             "prompt as soon as its request finishes. (default: 8)"
+    )
+    parser.add_argument(
+        "--mixed-decode-prompt-tokens", type=int, default=2048,
+        help="Prompt length of every background request in the mixed phase; every request gets "
+             "a unique prompt, so none is served from the prefix cache. (default: 2048)"
+    )
+    parser.add_argument(
+        "--mixed-decode-max-tokens", type=int, default=1024,
+        help="max_tokens of every background request in the mixed phase (ignore_eos unless "
+             "--respect-eos). (default: 1024)"
+    )
+    parser.add_argument(
+        "--mixed-warmup-seconds", type=float, default=20.0,
+        help="Seconds the background streams decode before the long prompt is sent; the prompt "
+             "also waits until every stream has produced a token. (default: 20)"
+    )
+    parser.add_argument(
+        "--mixed-window-seconds", type=float, default=10.0,
+        help="Length of the background throughput windows before the prompt is sent and after "
+             "its first token; the background keeps running this long after the first token. "
+             "(default: 10)"
+    )
+    parser.add_argument(
+        "--mixed-arrival-max-tokens", type=int, default=16,
+        help="max_tokens of the long prompt, sent alone and under load. (default: 16)"
+    )
+    parser.add_argument(
+        "--mixed-only", action="store_true",
+        help="Run only the mixed prefill + decode phase: no prefill rows and no sustained "
+             "decode matrix. Needs --mixed-prefill-contexts; implies --skip-prefill."
+    )
+    parser.add_argument(
         "--tool-eval", action="store_true",
         help=(
             "Run tool-eval-bench (github.com/SeraphimSerapis/tool-eval-bench), an agentic "
@@ -18939,6 +20174,7 @@ def parse_args():
     if prefill_metric not in ("client", "auto", "prometheus"):
         parser.error("--prefill-metric must be one of: client, auto, prometheus, ttft")
     args.prefill_metric = prefill_metric
+    validate_mixed_prefill_args(parser, args)
     return args
 
 
@@ -19163,7 +20399,7 @@ def main():
         done_burst = len(checkpoint.get("burst_results", []))
         done_prefill = len(checkpoint.get("prefill_results", {}))
         total_cells = (
-            0 if args.prefill_only
+            0 if args.prefill_only or args.mixed_only
             else len(args.concurrency.split(",")) * len(args.contexts.split(","))
         )
         accept = False
@@ -19206,8 +20442,10 @@ def main():
 
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
-    decode_count = 0 if args.prefill_only else len(concurrency_levels) * len(context_lengths)
+    decode_count = 0 if args.prefill_only or args.mixed_only else len(concurrency_levels) * len(context_lengths)
     decode_mode = (
+        "Decode: skipped (--mixed-only)"
+        if args.mixed_only else
         "Decode: skipped (--prefill-only)"
         if args.prefill_only else
         f"Request-count: {args.request_count} measured"
@@ -19230,16 +20468,29 @@ def main():
     else:
         prefill_label = "Prefill: integrated decode scouts"
 
-    console.print(Panel(
-        f"[bold {PHOSPHOR}]LLM Inference Benchmark[/bold {PHOSPHOR}]\n"
-        f"Model: {args.model} @ {args.host if args.host.startswith('http') else f'{args.host}:{args.port or 5000}'}\n"
-        f"Decode concurrency: {concurrency_levels}\n"
-        f"Decode contexts: {[format_context(c) for c in context_lengths]}\n"
-        f"{decode_mode} | Max tokens: {args.max_tokens}\n"
-        f"Pre-decode warmup: {'disabled' if args.decode_warmup_seconds <= 0 else f'C=1 max-runnable context for {args.decode_warmup_seconds:g}s'}\n"
+    config_lines = [
+        f"[bold {PHOSPHOR}]LLM Inference Benchmark[/bold {PHOSPHOR}]",
+        f"Model: {args.model} @ {args.host if args.host.startswith('http') else f'{args.host}:{args.port or 5000}'}",
+    ]
+    if not args.mixed_only:
+        config_lines += [
+            f"Decode concurrency: {concurrency_levels}",
+            f"Decode contexts: {[format_context(c) for c in context_lengths]}",
+            f"{decode_mode} | Max tokens: {args.max_tokens}",
+            f"Pre-decode warmup: {'disabled' if args.decode_warmup_seconds <= 0 else f'C=1 max-runnable context for {args.decode_warmup_seconds:g}s'}",
+        ]
+    config_lines.append(
         f"Exact-loop guard: {'enabled' if args.loop_detection else 'disabled'} | "
-        f"Output preview: {'unavailable in plain mode' if args.display_mode == 'plain' else 'press o'}\n"
-        f"{prefill_label} | Sustained decode: {decode_count} cells{phase3}",
+        f"Output preview: {'unavailable in plain mode' if args.display_mode == 'plain' else 'press o'}"
+    )
+    if not args.mixed_only:
+        config_lines.append(f"{prefill_label} | Sustained decode: {decode_count} cells{phase3}")
+    else:
+        config_lines.append(f"{decode_mode} | {prefill_label}")
+    if args.mixed_prefill_context_list:
+        config_lines.append(mixed_prefill_config_line(args))
+    console.print(Panel(
+        "\n".join(config_lines),
         title=render_title("Configuration"),
         box=PANEL_BOX,
         border_style=FRAME_BORDER,
@@ -19261,7 +20512,8 @@ def main():
         results = _partial_results
         prefill_results = _prefill_results
 
-    if results or burst_results or prefill_results:
+    mixed_results = getattr(args, "mixed_prefill_results", None) or {}
+    if results or burst_results or prefill_results or mixed_results:
         print_final_results(
             results,
             concurrency_levels,
@@ -19271,6 +20523,7 @@ def main():
             show_capacity_limited_values=args.show_capacity_limited_values,
             burst_results=burst_results,
             hardware_run_summary=getattr(args, "hardware_run_summary", {}),
+            mixed_prefill_results=mixed_results,
         )
         save_results(results, args, args.output, prefill_results, engine=engine, burst_results=burst_results)
         if run_completed:

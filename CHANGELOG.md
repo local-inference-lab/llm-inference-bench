@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.9 - 2026-10-07
+
+### Mixed prefill + decode: TTFT under decode load and what the prefill costs
+
+- New phase `--mixed-prefill-contexts 32k,128k`, run after the other phases
+  (`--mixed-only` runs only this phase). Per context C: a unique prompt of C
+  tokens is streamed alone on an idle server (TTFT alone); then
+  `--mixed-decode-streams` (8) background streams decode unique
+  `--mixed-decode-prompt-tokens` (2048) prompts with `max_tokens`
+  `--mixed-decode-max-tokens` (1024, `ignore_eos`), each restarting at once when
+  its request finishes; after `--mixed-warmup-seconds` (20 s) another unique
+  prompt of C tokens arrives (TTFT under load), and the background keeps
+  running `--mixed-window-seconds` (10 s) after its first token.
+  `--mixed-arrival-max-tokens` (16) is the long prompt's `max_tokens`.
+- Reported per context: `ttft_alone_s`, `ttft_under_load_s`, `slowdown`, prompt
+  tokens from `usage.prompt_tokens`, prefill tok/s of both requests, and the
+  background decode tok/s in the window before the arrival, during its prefill
+  (send to first token) and in the window after its first token, plus a 1 s
+  timeline and the errors of every request. Background tokens come from the
+  increase of `usage.completion_tokens` per chunk (continuous usage stats), so
+  chunks that carry several tokens (MTP / speculative decoding) count fully.
+- Prompts reuse the calibrated filler text with a unique leading tag per
+  request, so none hits the prefix cache. One prefill of `min(8k, C)` warms the
+  server before the first context. Contexts that exceed `max_model_len` or the
+  KV budget are skipped with the reason. The decode request settings
+  (`--temperature`, `--forced-token-id`, `--respect-eos`, loop detection)
+  apply to the background streams.
+- `--output` has a new `mixed_prefill` section keyed by context, the settings
+  in `metadata.mixed_prefill`, `metadata.mixed_only` and a methodology entry.
+  The final report prints a Phase 4 table and repeats it in the primary
+  summary; `--display-mode plain` prints one line per context as it finishes,
+  and the live dashboard shows the current step and background tok/s.
+  lil-bench's standard run does not include the phase.
+
 ## 0.7.8 - 2026-10-06
 
 ### lil-bench 1.4: DGX Spark (GB10) and servers across several machines
