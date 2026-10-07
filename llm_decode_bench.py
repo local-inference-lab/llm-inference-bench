@@ -15035,7 +15035,16 @@ async def run_mixed_prefill_context(
 
 
 def mixed_prefill_skip_reason(context_tokens: int, settings: MixedPrefillSettings, *,
-                              server_context_length: int = 0, kv_budget: int = 0) -> str:
+                              server_context_length: int = 0, kv_budget: int = 0,
+                              max_running_requests: int = 0) -> str:
+    if max_running_requests and settings.decode_streams + 1 > max_running_requests:
+        # The arriving prompt would wait in the queue, so its TTFT would measure
+        # scheduler admission instead of prefill under load.
+        return (
+            f"{settings.decode_streams} background streams + the arriving prompt exceed the "
+            f"server's {max_running_requests} running requests "
+            f"(use --mixed-decode-streams {max(max_running_requests - 1, 1)} or fewer)"
+        )
     background_tokens = settings.decode_prompt_tokens + settings.decode_max_tokens
     if server_context_length and background_tokens > server_context_length:
         return (
@@ -15124,6 +15133,7 @@ async def run_mixed_prefill_phase(
                 c for c in settings.contexts
                 if c not in results and not mixed_prefill_skip_reason(
                     c, settings, server_context_length=server_context_length, kv_budget=kv_budget,
+                    max_running_requests=state.max_running_requests,
                 )
             ]
             if runnable:
@@ -15151,6 +15161,7 @@ async def run_mixed_prefill_phase(
                     continue
                 reason = mixed_prefill_skip_reason(
                     ctx, settings, server_context_length=server_context_length, kv_budget=kv_budget,
+                    max_running_requests=state.max_running_requests,
                 )
                 if reason:
                     results[ctx] = skipped_mixed_prefill_result(ctx, settings, reason)

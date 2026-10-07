@@ -489,6 +489,17 @@ def test_skip_reasons():
     assert BENCH.mixed_prefill_skip_reason(8192, settings, kv_budget=20496) == ""
 
 
+def test_arrival_must_fit_the_running_request_limit():
+    # Four streams plus the arrival need five slots; with four the arrival
+    # would queue and its TTFT would measure scheduler admission.
+    settings = BENCH.MixedPrefillSettings(contexts=[8192], decode_streams=4, decode_prompt_tokens=2048,
+                                          decode_max_tokens=1024, arrival_max_tokens=16)
+    reason = BENCH.mixed_prefill_skip_reason(8192, settings, max_running_requests=4)
+    assert "exceed the server's 4 running requests" in reason
+    assert "--mixed-decode-streams 3" in reason
+    assert BENCH.mixed_prefill_skip_reason(8192, settings, max_running_requests=5) == ""
+
+
 # ---------------------------------------------------------------------------
 # Streams against the fake server
 # ---------------------------------------------------------------------------

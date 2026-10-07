@@ -24,7 +24,9 @@
 - Prompts reuse the calibrated filler text with a unique leading tag per
   request, so none hits the prefix cache. One prefill of `min(8k, C)` warms the
   server before the first context. Contexts that exceed `max_model_len` or the
-  KV budget are skipped with the reason. The decode request settings
+  KV budget are skipped with the reason, and so are all contexts when the
+  background streams plus the arriving prompt exceed the server's running
+  request limit (the arrival would queue and measure admission, not prefill). The decode request settings
   (`--temperature`, `--forced-token-id`, `--respect-eos`, loop detection)
   apply to the background streams.
 - `--output` has a new `mixed_prefill` section keyed by context, the settings
