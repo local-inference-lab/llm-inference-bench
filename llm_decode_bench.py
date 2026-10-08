@@ -11511,8 +11511,8 @@ async def run_one_cell(
                 state.cell_live_tps = measurement_usage_tokens / usage_elapsed
             elif token_elapsed > 0.5 and measurement_tokens > 0:
                 state.cell_live_tps = measurement_tokens / token_elapsed
-            elif state.srv_gen_throughput > 0:
-                state.cell_live_tps = state.srv_gen_throughput
+            else:
+                state.cell_live_tps = 0.0
             if warmup_done and state.cell_live_tps > 0:
                 state.cell_tps_history.append(state.cell_live_tps)
                 if len(state.cell_tps_history) > 240:
@@ -11613,9 +11613,8 @@ async def run_one_cell(
     if final_gen_throughput > 0:
         gen_throughput_samples.append(final_gen_throughput)
 
-    # Use an exact vLLM generation_tokens_total delta over the measured window
-    # as the primary decode metric. The previous implementation used the median
-    # of 1s counter rates, which is robust for display but can bias short runs.
+    # Server-wide token deltas are diagnostics. They include every client and
+    # cannot replace output observed on this cell's own streams.
     exact_server_tokens = 0
     exact_server_throughput = 0.0
     if (
@@ -11672,9 +11671,13 @@ async def run_one_cell(
         avg_gen_throughput = measurement_tokens / measure_duration
         aggregate_source = "openai_stream_chunks_fallback"
     else:
-        measure_duration = measurement_wall_duration
-        avg_gen_throughput = server_gen_throughput
-        aggregate_source = "prometheus_fallback" if server_gen_throughput > 0 else "none"
+        await cell_client.aclose()
+        state.cell_running = state.cell_warmup = False
+        state.cell_live_tps = 0.0
+        raise RuntimeError(
+            "No output tokens received from benchmark requests during measurement; "
+            "server-wide metrics cannot be attributed to this cell"
+        )
 
     spec_norm = compute_spec_normalization(
         measurement_spec_start,
@@ -11688,7 +11691,7 @@ async def run_one_cell(
     total_tokens = (
         measurement_usage_tokens
         if measurement_usage_tokens > 0
-        else (exact_server_tokens if exact_server_tokens > 0 else sum(r.total_tokens for r in stream_results))
+        else measurement_tokens
     )
 
     # Derive per-request from aggregate for consistency
