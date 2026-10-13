@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.8.0 - 2026-10-13
+
+### Scheduler tests (`--scheduler`)
+
+- New mode `--scheduler SCENARIOS` (comma-separated, or `all`) that exercises
+  the serving engine's scheduler from the outside and gives every scenario a
+  verdict: PASS, FAIL (a check failed), STALLED, WEDGED, SKIPPED (does not fit
+  the server, with the reason) or ERROR. Exit code 2 when any scenario fails,
+  1 when the run cannot start, so it works as a regression gate. Scenarios:
+  - `arrivals`: decode streams while unique long prompts arrive periodically;
+    decode tok/s inside and outside the prefill windows, gaps between streamed
+    chunks (p50/p99/max), arrival TTFT.
+  - `burst`: more long prompts at once than running slots / prefill lanes;
+    every request must finish; TTFT in send order and FCFS order inversions.
+  - `agents`: token-ID agent conversations (exact response token IDs on vLLM)
+    that outgrow the KV pool; per-minute running, waiting, KV, preemptions,
+    prefix-cache hits, turn latency and TTFT; every turn must succeed.
+  - `short-under-long`: Poisson short requests alone, then while long prompts
+    prefill; short TTFT baseline vs under load vs during a long prefill.
+  - `overload`: closed-loop capacity probe, open-loop arrivals at a multiple of
+    it, drain; queue depth, waiting by reason, TTFT growth, drain time, probe
+    before and after; timeouts and transport errors fail it.
+  - `abort-storm`: waves of requests cancelled in prefill, cancelled in decode
+    or completed; the server must report idle after every wave and serve a
+    probe afterwards.
+  - `soak-mix`: long mixed traffic, 1k-160k token prompts and optionally
+    (`--sched-soak-images`, needs Pillow) chat requests with 1-10 generated
+    images up to 6000x4000; no request may fail.
+- `/metrics` is sampled every `--sched-metrics-interval` seconds (vLLM and
+  SGLang names): running, waiting, waiting by reason, KV usage, preemptions,
+  prompt / generation / finished counters, prefix-cache and external
+  prefix-cache counters, the LIL scheduler's prefill compute share, prefill
+  backlog and compute seconds, and the TTFT, queue-time, prefill-time,
+  inter-token-latency and end-to-end histograms (mean and p50/p90/p99 per
+  scenario).
+- Stall watchdog: requests in flight (client) or running / waiting (server)
+  with no streamed token, no finished request and no movement of the server's
+  progress counters for `--sched-stall-seconds` (90) is a stall; after
+  `--sched-stop-after-stall` (120) the scenario is stopped as WEDGED and the
+  remaining scenarios are skipped. Without `/metrics` it uses client-side
+  progress only.
+- Scenarios size themselves from `max_model_len`, the KV pool and the
+  running-request limit (SGLang `/get_server_info`, the `--max-num-seqs` of a
+  local vLLM process, or `--sched-max-running`). Prompts are unique random
+  token-ID sequences from the server's `/tokenize` (exact lengths, no prefix
+  hits), padding text without it.
+- `--sched-ab-fairness off,0.4` (`off`, `auto` or a share): A/B on one running
+  vLLM server through its dev endpoint `/prefill_fairness`
+  (`VLLM_SERVER_DEV_MODE=1`), arms interleaved ABBA over `--sched-ab-rounds`,
+  the policy recorded with every run and restored at the end; the report adds
+  every headline metric per arm (mean, min-max).
+- `--output` holds `metadata.mode: "scheduler"`, the detected server limits and
+  fairness policy, per scenario its checks, headline and detailed metrics,
+  server summary, stalls, notes and the `/metrics` time series, the A/B
+  summary and a methodology entry per scenario. The `--api-key` value is
+  redacted from the recorded argv.
+
 ## 0.7.9 - 2026-10-07
 
 ### Mixed prefill + decode: TTFT under decode load and what the prefill costs

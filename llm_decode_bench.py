@@ -14,6 +14,7 @@ Usage:
     python3 llm_decode_bench.py --host https://openrouter.ai --api-key sk-or-... --model meta-llama/llama-3-70b
     python3 llm_decode_bench.py --skip-prefill --concurrency 1,2,4 --contexts 0
     python3 llm_decode_bench.py --port 8000 --mixed-only --mixed-prefill-contexts 32k,128k
+    python3 llm_decode_bench.py --port 8000 --scheduler all
 """
 
 import argparse
@@ -43,6 +44,7 @@ import threading
 import time
 import traceback
 import tty
+import uuid
 import zipfile
 import zlib
 from collections import deque
@@ -69,7 +71,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.7.9"
+VERSION = "0.8.0"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -19268,6 +19270,2403 @@ def cli_option_present(*names: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Scheduler tests (--scheduler)
+# ---------------------------------------------------------------------------
+#
+# Load patterns that exercise a serving engine's scheduler from the outside:
+# admission, prefill/decode interleaving, fairness, queueing under overload,
+# aborts and long mixed traffic. Every scenario samples /metrics while it runs,
+# a watchdog flags stalls (requests in flight but no token moves anywhere), and
+# the report gives a PASS / FAIL / STALLED / WEDGED verdict per scenario. The
+# exit code is 2 when any scenario fails, so the mode works as a regression gate.
+
+SCHEDULER_SCENARIOS = (
+    "arrivals", "burst", "agents", "short-under-long", "overload", "abort-storm", "soak-mix",
+)
+SCHEDULER_SCENARIO_HELP = {
+    "arrivals": "decode streams while long prompts arrive periodically: decode tok/s during the "
+                "prefills, gaps between streamed chunks, TTFT of the arrivals",
+    "burst": "more long prompts at once than running slots / prefill lanes: every request must "
+             "finish; TTFT order and spread",
+    "agents": "agent conversations that grow until they outgrow the KV pool: per-window running, "
+              "waiting, KV, preemptions, prefix hits and turn latency",
+    "short-under-long": "short chats alone, then while long prompts prefill: short-request TTFT "
+                        "(head-of-line blocking behind long prefills)",
+    "overload": "open-loop arrivals above the measured capacity, then a drain: queue growth, "
+                "waiting reasons, recovery to idle",
+    "abort-storm": "clients cancel during prefill and during decode: the server must return to "
+                   "idle and keep serving",
+    "soak-mix": "long mixed traffic (1k-160k prompts, optionally images): no errors, no stall",
+}
+SCHED_STATUS_FAILED = ("fail", "stalled", "wedged", "error")
+# vLLM's default --max-num-seqs (V1 engine, GPU) when a local server's command line has none.
+VLLM_DEFAULT_MAX_NUM_SEQS = 256
+SCHED_MAX_CLIENT_IN_FLIGHT = 1024
+SCHED_PROGRESS_PRINT_SECONDS = 15.0
+SCHED_WINDOW_SECONDS = 60.0
+SCHED_PROBE_PROMPT_TOKENS = 128
+SCHED_PROBE_MAX_TOKENS = 8
+SCHED_ABORT_MAX_TOKENS = 512
+SCHED_SOAK_TEXT_TOKENS = (1024, 8192, 30720, 92160, 163840)
+SCHED_SOAK_IMAGE_TEXT_TOKENS = (4096, 30720, 81920)
+SCHED_SOAK_MAX_TOKENS = (64, 256, 1024)
+SCHED_SOAK_IMAGE_SIZES = (
+    (256, 256), (640, 480), (1024, 768), (1280, 1280), (1600, 1200), (1920, 1080), (2048, 2048),
+    (3000, 3000), (3840, 2160), (4000, 3000), (6000, 4000), (800, 4000), (4000, 800),
+)
+
+# Logical metric -> Prometheus names (the first one a server exports wins).
+SCHED_SCALAR_METRICS = {
+    ENGINE_VLLM: {
+        "running": ("vllm:num_requests_running",),
+        "waiting": ("vllm:num_requests_waiting",),
+        "kv_usage": ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"),
+        "preemptions": ("vllm:num_preemptions_total",),
+        "prompt_tokens": ("vllm:prompt_tokens_total",),
+        "generation_tokens": ("vllm:generation_tokens_total",),
+        "prefix_queries": ("vllm:prefix_cache_queries_total",),
+        "prefix_hits": ("vllm:prefix_cache_hits_total",),
+        "external_prefix_queries": ("vllm:external_prefix_cache_queries_total",),
+        "external_prefix_hits": ("vllm:external_prefix_cache_hits_total",),
+        "requests_finished": ("vllm:request_success_total",),
+        "prefill_compute_share": ("vllm:scheduler_prefill_compute_share",),
+        "prefill_backlog_tokens": ("vllm:scheduler_local_prefill_backlog_tokens",),
+    },
+    ENGINE_SGLANG: {
+        "running": ("sglang:num_running_reqs",),
+        "waiting": ("sglang:num_queue_reqs",),
+        "kv_usage": ("sglang:token_usage",),
+        "prompt_tokens": ("sglang:prompt_tokens_total",),
+        "generation_tokens": ("sglang:generation_tokens_total",),
+        "requests_finished": ("sglang:num_requests_total",),
+    },
+}
+# Gauges averaged over engines (data parallel) instead of summed.
+SCHED_AVERAGED_METRICS = ("kv_usage", "prefill_compute_share")
+# (metric, label, key prefix): one key per label value, e.g. waiting_capacity.
+SCHED_LABELED_METRICS = {
+    ENGINE_VLLM: (
+        ("vllm:num_requests_waiting_by_reason", "reason", "waiting_"),
+        ("vllm:scheduler_compute_seconds_total", "class", "compute_seconds_"),
+        ("vllm:scheduler_compute_pressure", "class", "compute_pressure_"),
+    ),
+}
+SCHED_HISTOGRAMS = {
+    ENGINE_VLLM: {
+        "ttft": "vllm:time_to_first_token_seconds",
+        "queue_time": "vllm:request_queue_time_seconds",
+        "prefill_time": "vllm:request_prefill_time_seconds",
+        "inter_token_latency": "vllm:inter_token_latency_seconds",
+        "e2e": "vllm:e2e_request_latency_seconds",
+    },
+    ENGINE_SGLANG: {
+        "ttft": "sglang:time_to_first_token_seconds",
+        "queue_time": "sglang:queue_time_seconds",
+        "inter_token_latency": "sglang:inter_token_latency_seconds",
+        "e2e": "sglang:e2e_request_latency_seconds",
+    },
+}
+# A change in any of these (or a streamed token / finished request on the
+# client side) is progress for the stall watchdog.
+SCHED_PROGRESS_KEYS = (
+    "prompt_tokens", "generation_tokens", "prefill_backlog_tokens", "requests_finished",
+    "compute_seconds_decode", "compute_seconds_prefill",
+)
+# vLLM scheduler options recorded from a local server's command line.
+SCHED_ARGV_OPTIONS = (
+    "max-num-seqs", "max-num-batched-tokens", "max-parallel-prefills", "prefill-compute-share",
+    "prefill-compute-half-life", "max-num-prefill-tokens-per-step", "prefill-policy",
+    "decode-refill-target", "enable-chunked-prefill", "no-enable-chunked-prefill",
+    "long-prefill-token-threshold", "max-num-partial-prefills", "max-long-partial-prefills",
+    "scheduling-policy", "max-model-len", "kv-cache-memory-bytes", "gpu-memory-utilization",
+    "block-size", "tensor-parallel-size", "decode-context-parallel-size", "speculative-config",
+    "kv-transfer-config", "enable-prefix-caching", "no-enable-prefix-caching", "config",
+    # SGLang
+    "max-running-requests", "chunked-prefill-size", "schedule-policy", "max-total-tokens",
+)
+SCHED_METRIC_LINE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)")
+SCHED_LABEL_PAIR = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+SCHED_METHODOLOGY = {
+    "common": (
+        "Prompts are unique random token-ID sequences drawn from the server's own tokenization of "
+        "the padding text (POST /tokenize), sent to /v1/completions, so none hits the prefix cache "
+        "unless a scenario reuses a prefix on purpose; servers without /tokenize get unique padding "
+        "text. Requests stream with continuous usage stats and ignore_eos. /metrics is sampled every "
+        "--sched-metrics-interval seconds. A stall is a period of at least --sched-stall-seconds in "
+        "which requests are in flight (client side) or running/waiting (server side) but no token is "
+        "streamed, no request finishes and none of the server's prompt/generation token counters, "
+        "finished-request counter, prefill backlog or compute-seconds counters move. A scenario with a "
+        "stall is STALLED; one whose stall lasts --sched-stop-after-stall seconds is stopped and "
+        "WEDGED, and the remaining scenarios are skipped because the server needs a restart. Between "
+        "scenarios the bench waits until the server reports no running or waiting request."
+    ),
+    "arrivals": (
+        "N background streams decode continuously (unique prompts, restarted when they finish). "
+        "After the warmup, a unique prompt of the arrival context arrives every period (max_tokens 1; "
+        "the next one is sent period seconds later or 1 s after the previous finished, whichever is "
+        "later). Decode tok/s is measured over the window from the streams' usage.completion_tokens, "
+        "split into inside / outside the arrivals' prefill windows (send to first token); gaps are the "
+        "times between consecutive token-bearing chunks of one stream inside the window."
+    ),
+    "burst": (
+        "K prompts of the burst context are sent 20 ms apart (fixed order) with small max_tokens. All "
+        "must finish. TTFT is reported in send order; inversions = share of request pairs whose first "
+        "tokens arrived in the opposite order to their sends (0 = strict FCFS)."
+    ),
+    "agents": (
+        "A agents keep one token-ID conversation each: a turn sends the whole conversation, appends the "
+        "exact response tokens (vLLM return_tokens_as_token_ids; random tokens of the same count "
+        "elsewhere) and a block of random tool-result tokens, thinks, and repeats. A conversation that "
+        "would exceed the model length or KV pool restarts from a new start context. Per-window rows "
+        "combine the agents' turns with /metrics samples."
+    ),
+    "short-under-long": (
+        "Short requests arrive open-loop (Poisson) for a baseline period alone, then for the measured "
+        "duration while long prompts arrive periodically (max_tokens 1). Short TTFT is reported for the "
+        "baseline, for the loaded period, and for the shorts whose wait overlapped a long prefill."
+    ),
+    "overload": (
+        "A closed-loop probe at the server's running-request limit measures capacity in requests/s "
+        "(completions in the last two thirds of the probe). Then requests arrive open-loop (Poisson) at "
+        "factor x capacity for the duration and the bench waits for every request and for the server "
+        "to report idle (drain). A short probe request before and after shows recovery. HTTP "
+        "rejections are reported, timeouts and transport errors fail the scenario."
+    ),
+    "abort-storm": (
+        "Waves of long-prompt requests: one third is cancelled by the client after a random delay of "
+        "0.05-2 s (mostly in prefill), one third after 1-64 streamed tokens, one third runs to "
+        "completion. After every wave the server must report no running or waiting request within "
+        "--sched-idle-timeout; a short probe must succeed after the storm."
+    ),
+    "soak-mix": (
+        "W workers send back-to-back requests for the duration: token-ID prompts of 1k-160k tokens "
+        "(capped by the model length and KV pool) with 64-1024 output tokens and, with "
+        "--sched-soak-images, chat requests with 1-10 generated JPEG images of up to 6000x4000. "
+        "Every error fails the scenario."
+    ),
+}
+
+
+class SchedulerSetupError(Exception):
+    """The scheduler tests cannot start (server unreachable, missing dev endpoint, ...)."""
+
+
+def parse_token_range(text: str, *, floats: bool = False) -> tuple:
+    """'40k-100k' -> (40960, 102400); '0-3' -> (0.0, 3.0) with floats; one value -> (v, v)."""
+    parts = [p.strip() for p in str(text).split("-") if p.strip()]
+    if not 1 <= len(parts) <= 2:
+        raise ValueError(f"cannot read range {text!r}")
+    values = [float(p) for p in parts] if floats else [parse_token_value(p) for p in parts]
+    lo, hi = values[0], values[-1]
+    if lo < 0 or hi < lo:
+        raise ValueError(f"range {text!r} must be low-high with 0 <= low <= high")
+    return (lo, hi)
+
+
+def parse_fairness_arm(text: str) -> tuple:
+    """An A/B arm: 'off' (no prefill compute share), 'auto' or a share in (0, 1)."""
+    label = text.strip()
+    lowered = label.lower()
+    if lowered in ("off", "none", "null", "disabled"):
+        return ("off", None)
+    if lowered == "auto":
+        return ("auto", "auto")
+    try:
+        value = float(lowered)
+    except ValueError:
+        raise ValueError(f"fairness arm {text!r}: use off, auto or a share between 0 and 1")
+    if not 0.0 < value < 1.0:
+        raise ValueError(f"fairness arm {text!r}: a share must be strictly between 0 and 1")
+    return (f"{value:g}", value)
+
+
+def sched_percentile(values, q: float) -> Optional[float]:
+    values = [float(v) for v in values if v is not None]
+    if not values:
+        return None
+    return percentile(values, q)
+
+
+def sched_round(value, digits: int = 3):
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return round(value, digits)
+
+
+def sched_stats(values, digits: int = 3) -> dict:
+    """count / p50 / p90 / p99 / max / mean of a list of numbers (None for an empty list)."""
+    values = [float(v) for v in values if v is not None]
+    if not values:
+        return {"count": 0, "p50": None, "p90": None, "p99": None, "max": None, "mean": None}
+    return {
+        "count": len(values),
+        "p50": sched_round(percentile(values, 50), digits),
+        "p90": sched_round(percentile(values, 90), digits),
+        "p99": sched_round(percentile(values, 99), digits),
+        "max": sched_round(max(values), digits),
+        "mean": sched_round(mean(values), digits),
+    }
+
+
+def sched_parse_metrics(text: str, engine: str) -> dict:
+    """Scheduler gauges, counters and histograms of one /metrics scrape.
+
+    Scalars are summed over label sets (engines), except SCHED_AVERAGED_METRICS.
+    Histograms keep their cumulative buckets so two scrapes can be subtracted.
+    """
+    names = {}
+    for key, metric_names in SCHED_SCALAR_METRICS.get(engine, {}).items():
+        for priority, name in enumerate(metric_names):
+            names[name] = (key, priority)
+    labeled = {name: (label, prefix) for name, label, prefix in SCHED_LABELED_METRICS.get(engine, ())}
+    histogram_names = {name: key for key, name in SCHED_HISTOGRAMS.get(engine, {}).items()}
+    sums: dict = {}
+    counts: dict = {}
+    priorities: dict = {}
+    histograms: dict = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = SCHED_METRIC_LINE.match(line)
+        if not match:
+            continue
+        name, label_text, raw = match.groups()
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if math.isnan(value):
+            continue
+        if name in names:
+            key, priority = names[name]
+            if key in priorities and priority > priorities[key]:
+                continue
+            if key in priorities and priority < priorities[key]:
+                sums.pop(key, None)
+                counts.pop(key, None)
+            priorities[key] = priority
+            sums[key] = sums.get(key, 0.0) + value
+            counts[key] = counts.get(key, 0) + 1
+            continue
+        if name in labeled:
+            label, prefix = labeled[name]
+            labels = dict(SCHED_LABEL_PAIR.findall(label_text or ""))
+            if labels.get(label):
+                key = prefix + re.sub(r"\W", "_", labels[label])
+                sums[key] = sums.get(key, 0.0) + value
+                counts[key] = counts.get(key, 0) + 1
+            continue
+        for suffix in ("_bucket", "_sum", "_count"):
+            base = name[: -len(suffix)]
+            if name.endswith(suffix) and base in histogram_names:
+                hist = histograms.setdefault(histogram_names[base], {"sum": 0.0, "count": 0.0, "buckets": {}})
+                if suffix == "_bucket":
+                    labels = dict(SCHED_LABEL_PAIR.findall(label_text or ""))
+                    le = labels.get("le")
+                    if le is not None:
+                        hist["buckets"][le] = hist["buckets"].get(le, 0.0) + value
+                else:
+                    hist[suffix[1:]] += value
+                break
+    snapshot = {
+        key: (value / counts[key] if key in SCHED_AVERAGED_METRICS else value)
+        for key, value in sums.items()
+    }
+    snapshot["histograms"] = histograms
+    return snapshot
+
+
+def sched_histogram_delta(start: Optional[dict], end: Optional[dict]) -> Optional[dict]:
+    """Mean and interpolated p50/p90/p99 of the observations between two scrapes."""
+    if not end:
+        return None
+    start = start or {"sum": 0.0, "count": 0.0, "buckets": {}}
+    count = end.get("count", 0.0) - start.get("count", 0.0)
+    if count <= 0:
+        return {"count": 0}
+    total = end.get("sum", 0.0) - start.get("sum", 0.0)
+    buckets = []
+    for le, cumulative in end.get("buckets", {}).items():
+        try:
+            bound = float(le)
+        except ValueError:
+            continue
+        buckets.append((bound, cumulative - start.get("buckets", {}).get(le, 0.0)))
+    buckets.sort()
+
+    def quantile(q: float) -> Optional[float]:
+        if not buckets:
+            return None
+        target = q * count
+        previous_bound, previous_count = 0.0, 0.0
+        for bound, cumulative in buckets:
+            if cumulative >= target:
+                if math.isinf(bound):
+                    return previous_bound
+                if cumulative <= previous_count:
+                    return bound
+                return previous_bound + (bound - previous_bound) * (
+                    (target - previous_count) / (cumulative - previous_count))
+            previous_bound, previous_count = bound, cumulative
+        return previous_bound
+
+    return {
+        "count": int(round(count)),
+        "mean_s": sched_round(total / count, 4),
+        "p50_s": sched_round(quantile(0.50), 4),
+        "p90_s": sched_round(quantile(0.90), 4),
+        "p99_s": sched_round(quantile(0.99), 4),
+    }
+
+
+def sched_parse_cli_options(argv: list) -> dict:
+    """``--a b``, ``--a=b`` and bare flags of a command line (names without dashes)."""
+    options = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("--"):
+            name, sep, value = token[2:].partition("=")
+            name = name.replace("_", "-")
+            if sep:
+                options[name] = value
+            elif index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                options[name] = argv[index + 1]
+                index += 1
+            else:
+                options[name] = True
+        index += 1
+    return options
+
+
+def sched_local_server_options(base_url: str) -> dict:
+    """Scheduler options from the command line of a local vLLM / SGLang server on this port."""
+    try:
+        parsed = urlparse(base_url)
+    except Exception:
+        return {}
+    if (parsed.hostname or "") not in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or not parsed.port:
+        return {}
+    try:
+        proc = subprocess.run(["ps", "-eo", "args="], check=False, capture_output=True, text=True, timeout=3)
+    except Exception:
+        return {}
+    port_re = re.compile(rf"--port(?:=|\s+){parsed.port}\b")
+    for command in proc.stdout.splitlines():
+        if not re.search(r"vllm|sglang", command) or not port_re.search(command):
+            continue
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+        options = sched_parse_cli_options(argv)
+        return {
+            "engine_hint": "sglang" if "sglang" in command else "vllm",
+            "options": {name: options[name] for name in SCHED_ARGV_OPTIONS if name in options},
+        }
+    return {}
+
+
+def sched_cache_config_kv_tokens(metrics_text: str, dcp_size: int = 0) -> dict:
+    """KV capacity from vllm:cache_config_info (kv_cache_size_tokens, else blocks x block size)."""
+    for line in metrics_text.splitlines():
+        if not line.startswith("vllm:cache_config_info"):
+            continue
+        labels = dict(SCHED_LABEL_PAIR.findall(line))
+        reported = labels.get("kv_cache_size_tokens") or ""
+        if reported.isdigit() and int(reported) > 0:
+            return {"kv_tokens": int(reported), "kv_tokens_source": "vllm kv_cache_size_tokens"}
+        try:
+            local = int(labels.get("num_gpu_blocks") or 0) * int(labels.get("block_size") or 0)
+        except ValueError:
+            local = 0
+        if local > 0:
+            multiplier = dcp_size if dcp_size > 1 else 1
+            return {"kv_tokens": local * multiplier,
+                    "kv_tokens_source": f"num_gpu_blocks x block_size{f' x DCP {multiplier}' if multiplier > 1 else ''}"}
+    return {}
+
+
+@dataclass
+class SchedulerSettings:
+    """Settings of the scheduler tests (--scheduler and --sched-*)."""
+    scenarios: list = field(default_factory=list)
+    duration: float = 180.0
+    warmup: float = 20.0
+    stall_seconds: float = 90.0
+    stop_after_stall: float = 120.0
+    metrics_interval: float = 2.0
+    idle_timeout: float = 120.0
+    request_timeout: float = 600.0
+    max_running: int = 0
+    seed: int = 7
+    temperature: Optional[float] = None
+    ab_arms: list = field(default_factory=list)
+    ab_rounds: int = 2
+    streams: int = 0
+    stream_prompt_tokens: int = 512
+    stream_max_tokens: int = 2048
+    arrival_context: int = 32768
+    arrival_period: float = 20.0
+    burst_requests: int = 0
+    burst_context: int = 30720
+    burst_max_tokens: int = 32
+    agents: int = 8
+    agents_duration: float = 600.0
+    agent_start: Optional[tuple] = None
+    agent_tool: tuple = (1024, 6144)
+    agent_response: tuple = (300, 4000)
+    agent_think: tuple = (0.0, 3.0)
+    short_rate: float = 2.0
+    short_prompt_tokens: int = 256
+    short_max_tokens: int = 16
+    short_baseline_seconds: float = 30.0
+    overload_factor: float = 2.0
+    overload_prompt_tokens: int = 2048
+    overload_max_tokens: int = 256
+    overload_probe_seconds: float = 30.0
+    abort_waves: int = 3
+    abort_requests: int = 0
+    abort_context: int = 16384
+    soak_duration: float = 600.0
+    soak_concurrency: int = 8
+    soak_images: bool = False
+
+    @classmethod
+    def from_args(cls, args) -> "SchedulerSettings":
+        return cls(
+            scenarios=list(getattr(args, "scheduler_list", None) or []),
+            duration=float(args.sched_duration),
+            warmup=float(args.sched_warmup),
+            stall_seconds=float(args.sched_stall_seconds),
+            stop_after_stall=float(args.sched_stop_after_stall),
+            metrics_interval=float(args.sched_metrics_interval),
+            idle_timeout=float(args.sched_idle_timeout),
+            request_timeout=float(args.sched_request_timeout),
+            max_running=int(args.sched_max_running),
+            seed=int(args.sched_seed),
+            temperature=getattr(args, "temperature", None),
+            ab_arms=list(getattr(args, "sched_ab_arms", None) or []),
+            ab_rounds=int(args.sched_ab_rounds),
+            streams=int(args.sched_streams),
+            stream_prompt_tokens=parse_token_value(str(args.sched_stream_prompt_tokens)),
+            stream_max_tokens=int(args.sched_stream_max_tokens),
+            arrival_context=parse_token_value(str(args.sched_arrival_context)),
+            arrival_period=float(args.sched_arrival_period),
+            burst_requests=int(args.sched_burst_requests),
+            burst_context=parse_token_value(str(args.sched_burst_context)),
+            burst_max_tokens=int(args.sched_burst_max_tokens),
+            agents=int(args.sched_agents),
+            agents_duration=float(args.sched_agents_duration),
+            agent_start=getattr(args, "sched_agent_start_range", None),
+            agent_tool=args.sched_agent_tool_range,
+            agent_response=args.sched_agent_response_range,
+            agent_think=args.sched_agent_think_range,
+            short_rate=float(args.sched_short_rate),
+            short_prompt_tokens=parse_token_value(str(args.sched_short_prompt_tokens)),
+            short_max_tokens=int(args.sched_short_max_tokens),
+            short_baseline_seconds=float(args.sched_short_baseline_seconds),
+            overload_factor=float(args.sched_overload_factor),
+            overload_prompt_tokens=parse_token_value(str(args.sched_overload_prompt_tokens)),
+            overload_max_tokens=int(args.sched_overload_max_tokens),
+            overload_probe_seconds=float(args.sched_overload_probe_seconds),
+            abort_waves=int(args.sched_abort_waves),
+            abort_requests=int(args.sched_abort_requests),
+            abort_context=parse_token_value(str(args.sched_abort_context)),
+            soak_duration=float(args.sched_soak_duration),
+            soak_concurrency=int(args.sched_soak_concurrency),
+            soak_images=bool(args.sched_soak_images),
+        )
+
+    def metadata(self) -> dict:
+        data = asdict(self)
+        data["ab_arms"] = [label for label, _ in self.ab_arms]
+        for key in ("agent_start", "agent_tool", "agent_response", "agent_think"):
+            if data[key] is not None:
+                data[key] = list(data[key])
+        return data
+
+
+class SchedulerPromptFactory:
+    """Unique prompts of an exact token count.
+
+    With /tokenize the prompts are random sequences of token IDs the model's
+    tokenizer produced for ordinary text (exact length, never a prefix-cache
+    hit). Without it they are padding text behind a unique tag (approximate
+    length; the server's usage.prompt_tokens is recorded). The content comes
+    from a generator seeded per invocation, so a second run with the same
+    --sched-seed (which fixes lengths and timing) does not hit the prefix cache
+    of the first.
+    """
+
+    def __init__(self, seed: int):
+        self.pool: list = []
+        self.mode = "text"
+        self.rng = random.Random(f"{seed}:prompts:{uuid.uuid4().hex}")
+        self.counter = 0
+
+    async def setup(self, client: httpx.AsyncClient, base_url: str, model: str) -> None:
+        text = " ".join(PADDING_SENTENCES) + " " + GENERATION_PROMPT
+        try:
+            resp = await client.post(f"{base_url}/tokenize", json={"model": model, "prompt": text}, timeout=30.0)
+            tokens = resp.json().get("tokens") if resp.status_code < 400 else None
+        except (httpx.HTTPError, ValueError, AttributeError):
+            tokens = None
+        pool = sorted({t for t in tokens or [] if isinstance(t, int) and t >= 0})
+        if len(pool) >= 64:
+            self.pool = pool
+            self.mode = "token_ids"
+
+    def make(self, tokens: int):
+        tokens = max(1, int(tokens))
+        if self.mode == "token_ids":
+            return self.rng.choices(self.pool, k=tokens)
+        return self.text(tokens)
+
+    def text(self, tokens: int) -> str:
+        self.counter += 1
+        return f"[SCHED_{uuid.uuid4().hex[:12]}_{self.counter}] " + generate_padding_text(max(1, int(tokens)))
+
+    def extend(self, prompt, tokens: int):
+        """``prompt`` followed by ``tokens`` more prompt tokens (same representation)."""
+        if tokens <= 0:
+            return prompt
+        if isinstance(prompt, list):
+            return prompt + self.rng.choices(self.pool, k=tokens)
+        return prompt + " " + generate_padding_text(tokens)
+
+
+class SchedulerClientTracker:
+    """Client-side request counters shared by one scenario's requests."""
+
+    def __init__(self):
+        self.in_flight = 0
+        self.sent = 0
+        self.chunks = 0
+        self.tokens = 0
+        self.completed = 0
+        self.errors = 0
+        self.aborted = 0
+
+    def as_dict(self) -> dict:
+        return dict(vars(self))
+
+
+class SchedulerStallWatchdog:
+    """Detects periods with work outstanding but no progress anywhere."""
+
+    def __init__(self, stall_seconds: float, stop_after_seconds: float):
+        self.stall_seconds = stall_seconds
+        self.stop_after_seconds = stop_after_seconds
+        self.stalls: list = []
+        self.current: Optional[dict] = None
+        self.last_signature = None
+        self.last_progress: Optional[float] = None
+        self.wedged = False
+
+    def observe(self, now: float, snapshot: Optional[dict], tracker: SchedulerClientTracker) -> bool:
+        """Record one observation at scenario time ``now``; True when the run must stop."""
+        server_busy = bool(snapshot) and (snapshot.get("running", 0) + snapshot.get("waiting", 0)) > 0
+        busy = tracker.in_flight > 0 or server_busy
+        signature = (tracker.chunks, tracker.completed) + tuple(
+            (snapshot or {}).get(key) for key in SCHED_PROGRESS_KEYS
+        )
+        moved = signature != self.last_signature
+        self.last_signature = signature
+        if self.last_progress is None or not busy or moved:
+            self.last_progress = now
+            if self.current is not None:
+                self.current["end_s"] = round(now, 1)
+                self.current["seconds"] = round(now - self.current["start_s"], 1)
+                self.current = None
+            return False
+        if now - self.last_progress < self.stall_seconds:
+            return False
+        if self.current is None:
+            self.current = {
+                "start_s": round(self.last_progress, 1),
+                "detected_s": round(now, 1),
+                "client_in_flight": tracker.in_flight,
+                "server": {k: v for k, v in (snapshot or {}).items() if k != "histograms"},
+            }
+            self.stalls.append(self.current)
+        self.current["seconds"] = round(now - self.last_progress, 1)
+        if self.stop_after_seconds > 0 and now - self.last_progress >= self.stop_after_seconds:
+            self.wedged = True
+            self.current["stopped_run"] = True
+            return True
+        return False
+
+
+class SchedulerMetricsSampler:
+    """Polls /metrics during a scenario and feeds the stall watchdog."""
+
+    def __init__(self, client: httpx.AsyncClient, base_url: str, engine: str, interval: float,
+                 available: bool = True):
+        self.client = client
+        self.base_url = base_url
+        self.engine = engine
+        self.interval = interval
+        self.available = available and engine in (ENGINE_VLLM, ENGINE_SGLANG)
+        self.samples: list = []
+        self.errors = 0
+
+    async def fetch(self) -> Optional[dict]:
+        if not self.available:
+            return None
+        try:
+            resp = await self.client.get(f"{self.base_url}/metrics", timeout=10.0)
+        except (httpx.HTTPError, asyncio.TimeoutError):
+            self.errors += 1
+            return None
+        if resp.status_code >= 400:
+            self.errors += 1
+            return None
+        return sched_parse_metrics(resp.text, self.engine)
+
+    async def run(self, run: "SchedulerRun") -> None:
+        next_print = SCHED_PROGRESS_PRINT_SECONDS
+        last_print = None
+        while not run.finished.is_set():
+            snapshot = await self.fetch()
+            now = run.elapsed()
+            if snapshot is not None:
+                sample = {k: v for k, v in snapshot.items() if k != "histograms"}
+                sample["t"] = round(now, 2)
+                sample["client_in_flight"] = run.tracker.in_flight
+                self.samples.append(sample)
+            reported = len(run.watchdog.stalls)
+            if run.watchdog.observe(now, snapshot, run.tracker):
+                run.wedge.set()
+            if len(run.watchdog.stalls) > reported:
+                run.say(f"STALL: requests in flight but no progress for {run.watchdog.stall_seconds:g} s "
+                        f"({run.tracker.in_flight} client requests in flight)")
+            if now >= next_print:
+                run.say(sched_progress_line(run, snapshot, last_print, now))
+                last_print = (now, snapshot)
+                next_print = now + SCHED_PROGRESS_PRINT_SECONDS
+            try:
+                await asyncio.wait_for(run.finished.wait(), timeout=self.interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def wait_idle(self, timeout: float, *, stable: int = 2, interval: float = 0.5) -> dict:
+        """Wait until the server reports no running and no waiting request."""
+        if not self.available:
+            return {"checked": False}
+        started = time.monotonic()
+        streak = 0
+        last = None
+        while True:
+            snapshot = await self.fetch()
+            if snapshot is not None:
+                last = snapshot
+                if snapshot.get("running", 0) + snapshot.get("waiting", 0) <= 0:
+                    streak += 1
+                    if streak >= stable:
+                        return {"checked": True, "idle": True,
+                                "seconds": round(time.monotonic() - started, 2),
+                                "kv_usage": sched_round(snapshot.get("kv_usage"), 4)}
+                else:
+                    streak = 0
+            if time.monotonic() - started >= timeout:
+                return {"checked": True, "idle": False, "seconds": round(time.monotonic() - started, 2),
+                        "running": (last or {}).get("running"), "waiting": (last or {}).get("waiting"),
+                        "kv_usage": sched_round((last or {}).get("kv_usage"), 4)}
+            await asyncio.sleep(interval)
+
+
+def sched_progress_line(run: "SchedulerRun", snapshot: Optional[dict], last: Optional[tuple], now: float) -> str:
+    t = run.tracker
+    parts = [f"{now:5.0f}s in flight {t.in_flight}, done {t.completed}, errors {t.errors}"]
+    if snapshot:
+        parts.append(f"running {snapshot.get('running', 0):.0f} waiting {snapshot.get('waiting', 0):.0f}")
+        if snapshot.get("kv_usage") is not None:
+            parts.append(f"KV {100 * snapshot['kv_usage']:.0f}%")
+        if last and last[1] and snapshot.get("generation_tokens") is not None \
+                and last[1].get("generation_tokens") is not None and now > last[0]:
+            rate = (snapshot["generation_tokens"] - last[1]["generation_tokens"]) / (now - last[0])
+            parts.append(f"gen {rate:,.0f} tok/s")
+    return " | ".join(parts)
+
+
+class SchedulerFairness:
+    """vLLM's dev endpoint /prefill_fairness (VLLM_SERVER_DEV_MODE=1): live policy switch."""
+
+    def __init__(self, client: httpx.AsyncClient, base_url: str):
+        self.client = client
+        self.url = f"{base_url}/prefill_fairness"
+        self.available = False
+        self.original: Optional[dict] = None
+        self.changed = False
+        self.reason = ""
+
+    async def probe(self) -> None:
+        try:
+            resp = await self.client.get(self.url, timeout=10.0)
+        except httpx.HTTPError as exc:
+            self.reason = f"{type(exc).__name__}: {exc}"
+            return
+        if resp.status_code == 200:
+            try:
+                self.original = resp.json()
+                self.available = isinstance(self.original, dict)
+            except ValueError:
+                self.reason = "GET /prefill_fairness did not return JSON"
+        else:
+            self.reason = (f"GET /prefill_fairness returned HTTP {resp.status_code} "
+                           "(start vLLM with VLLM_SERVER_DEV_MODE=1)")
+
+    async def get(self) -> Optional[dict]:
+        try:
+            resp = await self.client.get(self.url, timeout=10.0)
+            return resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def apply(self, value, half_life=None) -> dict:
+        body = {"prefill_compute_share": value}
+        if half_life is not None:
+            body["prefill_compute_half_life"] = half_life
+        self.changed = True
+        try:
+            resp = await self.client.post(self.url, json=body, timeout=30.0)
+        except httpx.HTTPError as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "request": body}
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"text": resp.text[:300]}
+        ok = resp.status_code < 400 and (not isinstance(payload, dict) or payload.get("applied", True) is not False)
+        return {"ok": ok, "status": resp.status_code, "request": body, "response": payload}
+
+    async def restore(self) -> dict:
+        original = self.original or {}
+        share = original.get("prefill_compute_share")
+        half_life = original.get("prefill_compute_half_life") if share == "auto" else None
+        return await self.apply(share, half_life)
+
+
+@dataclass
+class SchedulerContext:
+    """Everything the scenarios share: clients, server limits, settings, prompts."""
+    client: httpx.AsyncClient
+    control: httpx.AsyncClient
+    base_url: str
+    model: str
+    engine: str
+    settings: SchedulerSettings
+    server: dict
+    prompts: SchedulerPromptFactory
+    console: Console
+    max_model_len: int = 0
+    kv_tokens: int = 0
+    max_running: int = 0
+    metrics: bool = True
+
+    def fit(self, tokens: int, max_tokens: int, run: Optional["SchedulerRun"] = None, what: str = "") -> int:
+        """Largest prompt <= tokens whose request fits the model length and the KV pool."""
+        limit = int(tokens)
+        if self.max_model_len:
+            limit = min(limit, self.max_model_len - max_tokens - 16)
+        if self.kv_tokens:
+            limit = min(limit, self.kv_tokens - max_tokens - 16)
+        if run is not None and what and limit < tokens:
+            run.note(f"{what} capped from {tokens:,} to {max(limit, 0):,} tokens by the model length / KV pool")
+        return limit
+
+    def auto_count(self, minimum: int = 8, maximum: int = 64) -> int:
+        """Twice the running-request limit, within [minimum, maximum] (minimum when unknown)."""
+        if self.max_running:
+            return max(minimum, min(maximum, 2 * self.max_running))
+        return minimum
+
+
+class SchedulerRun:
+    """One execution of one scenario (one arm and round of an A/B)."""
+
+    def __init__(self, ctx: SchedulerContext, name: str, arm: Optional[str] = None, round_index: int = 0):
+        self.ctx = ctx
+        self.name = name
+        self.arm = arm
+        self.round_index = round_index
+        self.tracker = SchedulerClientTracker()
+        settings = ctx.settings
+        self.watchdog = SchedulerStallWatchdog(settings.stall_seconds, settings.stop_after_stall)
+        self.sampler = SchedulerMetricsSampler(ctx.control, ctx.base_url, ctx.engine, settings.metrics_interval,
+                                               ctx.metrics)
+        self.wedge = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.t0 = time.monotonic()
+        self.tasks: set = set()
+        self.data: dict = {}
+        self.notes: list = []
+        self.skip_reason = ""
+        self.rng = random.Random(f"{settings.seed}:{name}:{arm}:{round_index}")
+
+    @property
+    def label(self) -> str:
+        return self.name + (f" [{self.arm} r{self.round_index + 1}]" if self.arm is not None else "")
+
+    @property
+    def stopped(self) -> bool:
+        return self.wedge.is_set()
+
+    def elapsed(self, t: Optional[float] = None) -> float:
+        return (time.monotonic() if t is None else t) - self.t0
+
+    def say(self, message: str) -> None:
+        self.ctx.console.print(Text(f"  {self.label}: {message}"))
+
+    def note(self, message: str) -> None:
+        if message not in self.notes:
+            self.notes.append(message)
+            self.say(message)
+
+    def skip(self, reason: str) -> None:
+        self.skip_reason = reason
+
+    def spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    async def sleep(self, seconds: float) -> bool:
+        """Sleep unless the run is stopped; False when it was stopped."""
+        if self.wedge.is_set():
+            return False
+        try:
+            await asyncio.wait_for(self.wedge.wait(), timeout=max(0.0, seconds))
+            return False
+        except asyncio.TimeoutError:
+            return True
+
+    async def sleep_until(self, deadline: float) -> bool:
+        return await self.sleep(deadline - time.monotonic())
+
+    async def wait_tasks(self, tasks, timeout: Optional[float] = None) -> bool:
+        """Wait for tasks until done, the run is stopped or timeout; True when all finished."""
+        pending = {t for t in tasks if not t.done()}
+        if not pending:
+            return True
+        wedge = asyncio.create_task(self.wedge.wait())
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while pending and not self.wedge.is_set():
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    break
+                done, _ = await asyncio.wait(pending | {wedge}, timeout=remaining,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                pending -= done
+        finally:
+            wedge.cancel()
+        return not pending
+
+    async def stop_tasks(self, tasks, grace: float = 30.0) -> None:
+        """Wait up to ``grace`` seconds for tasks, then cancel the rest."""
+        await self.wait_tasks(tasks, timeout=grace)
+        leftovers = [t for t in tasks if not t.done()]
+        for task in leftovers:
+            task.cancel()
+        if leftovers:
+            await asyncio.gather(*leftovers, return_exceptions=True)
+
+
+def sched_payload(ctx: SchedulerContext, prompt, max_tokens: int, *, collect_ids: bool = False) -> dict:
+    payload = {
+        "model": ctx.model,
+        "prompt": prompt,
+        "max_tokens": int(max_tokens),
+        "stream": True,
+        "stream_options": dict(MIXED_STREAM_OPTIONS),
+        "ignore_eos": True,
+    }
+    if ctx.settings.temperature is not None:
+        payload["temperature"] = ctx.settings.temperature
+    if collect_ids:
+        payload["logprobs"] = 1
+        payload["return_tokens_as_token_ids"] = True
+    return payload
+
+
+def sched_chunk_token_ids(data: dict) -> list:
+    """Token IDs of a completions chunk with return_tokens_as_token_ids ('token_id:123')."""
+    ids = []
+    for choice in data.get("choices") or []:
+        logprobs = choice.get("logprobs") if isinstance(choice, dict) else None
+        if not isinstance(logprobs, dict):
+            continue
+        for token in logprobs.get("tokens") or []:
+            if isinstance(token, str) and token.startswith("token_id:"):
+                try:
+                    ids.append(int(token.split(":", 1)[1]))
+                except ValueError:
+                    pass
+    return ids
+
+
+async def sched_abort_remote(run: SchedulerRun, request_id: str) -> None:
+    """SGLang keeps generating after a client disconnect unless the request is aborted."""
+    if run.ctx.engine == ENGINE_SGLANG and request_id:
+        await abort_sglang_request(run.ctx.control, f"{run.ctx.base_url}/abort_request", request_id)
+
+
+async def sched_request(
+    run: SchedulerRun,
+    payload: dict,
+    *,
+    path: str = "/v1/completions",
+    record: Optional[dict] = None,
+    on_token=None,
+    stop: Optional[asyncio.Event] = None,
+    cancel_after_tokens: int = 0,
+    collect_ids: bool = False,
+    collect_text: bool = False,
+) -> dict:
+    """Stream one request; ``record`` is filled in place (send/first/end times, usage, error).
+
+    ``stop`` ends the stream early without an error (``stopped``); the client
+    closing the stream after ``cancel_after_tokens`` tokens, or a cancelled
+    task, is an abort (``aborted``). A cancelled task re-raises after the
+    record is complete.
+    """
+    rec = record if record is not None else {}
+    rec.update(t_send=time.monotonic(), t_first=None, t_end=None, ttft_s=None, prompt_tokens=None,
+               cached_tokens=None, completion_tokens=0, error="", aborted=False, stopped=False,
+               finished=False)
+    counter = UsageTokenCounter()
+    ids: list = []
+    text_parts: list = []
+    request_id = ""
+    tracker = run.tracker
+    tracker.in_flight += 1
+    tracker.sent += 1
+    timeout = httpx.Timeout(run.ctx.settings.request_timeout, connect=30.0, pool=None)
+    cancelled = False
+    try:
+        async with run.ctx.client.stream("POST", run.ctx.base_url + path, json=payload, timeout=timeout) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread()).decode("utf-8", "replace")[:300]
+                rec["error"] = f"HTTP {resp.status_code}: {body}"
+                rec["http_status"] = resp.status_code
+            else:
+                async for line in resp.aiter_lines():
+                    if stop is not None and stop.is_set():
+                        rec["stopped"] = True
+                        await sched_abort_remote(run, request_id)
+                        break
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        rec["finished"] = True
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    if not request_id:
+                        request_id = str(data.get("id") or "")
+                    if data.get("error"):
+                        rec["error"] = f"stream error: {data['error']}"[:300]
+                        break
+                    now = time.monotonic()
+                    delta = counter.observe(data)
+                    usage = data.get("usage")
+                    if isinstance(usage, dict):
+                        if usage.get("prompt_tokens") is not None:
+                            rec["prompt_tokens"] = int(usage["prompt_tokens"])
+                        details = usage.get("prompt_tokens_details")
+                        if isinstance(details, dict) and details.get("cached_tokens") is not None:
+                            rec["cached_tokens"] = int(details["cached_tokens"])
+                    if collect_ids:
+                        ids.extend(sched_chunk_token_ids(data))
+                    if collect_text:
+                        text_parts.extend(text for _, text in stream_chunk_channels(data))
+                    if rec["t_first"] is None and stream_chunk_has_output(data):
+                        rec["t_first"] = now
+                    if delta > 0:
+                        tracker.chunks += 1
+                        tracker.tokens += delta
+                        if on_token is not None:
+                            on_token(now, delta)
+                    if any(isinstance(c, dict) and c.get("finish_reason") is not None
+                           for c in data.get("choices") or []):
+                        rec["finished"] = True
+                    if cancel_after_tokens and counter.tokens >= cancel_after_tokens and not rec["finished"]:
+                        rec["aborted"] = True
+                        await sched_abort_remote(run, request_id)
+                        break
+    except asyncio.CancelledError:
+        cancelled = True
+        rec["aborted"] = True
+        try:
+            await sched_abort_remote(run, request_id)
+        except asyncio.CancelledError:
+            pass
+    except Exception as exc:
+        rec["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    finally:
+        tracker.in_flight -= 1
+        rec["t_end"] = time.monotonic()
+        rec["completion_tokens"] = counter.tokens
+        rec["request_id"] = request_id
+        if rec["t_first"] is not None:
+            rec["ttft_s"] = rec["t_first"] - rec["t_send"]
+        if collect_ids:
+            rec["output_ids"] = ids
+        if collect_text:
+            rec["output_text"] = "".join(text_parts)
+        if not rec["error"] and not rec["aborted"] and not rec["stopped"]:
+            if rec["t_first"] is None:
+                rec["error"] = "stream ended before the first output token"
+            else:
+                tracker.completed += 1
+        if rec["error"]:
+            tracker.errors += 1
+        if rec["aborted"]:
+            tracker.aborted += 1
+    if cancelled:
+        raise asyncio.CancelledError()
+    return rec
+
+
+def sched_ok(rec: dict) -> bool:
+    return bool(rec) and not rec.get("error") and not rec.get("aborted") and not rec.get("stopped") \
+        and rec.get("t_first") is not None
+
+
+def sched_rel(run: SchedulerRun, t: Optional[float]) -> Optional[float]:
+    return None if t is None else round(t - run.t0, 3)
+
+
+def sched_log_entry(run: SchedulerRun, rec: dict, keys: tuple) -> dict:
+    """One request of a scenario log: its own fields, times relative to the scenario start, usage."""
+    entry = {key: rec[key] for key in keys if rec.get(key) is not None}
+    entry.update(
+        send_s=sched_rel(run, rec.get("t_send")),
+        ttft_s=sched_round(rec.get("ttft_s")),
+        seconds=sched_round(rec["t_end"] - rec["t_send"]) if rec.get("t_end") and rec.get("t_send") else None,
+        prompt_tokens=rec.get("prompt_tokens"),
+        cached_tokens=rec.get("cached_tokens"),
+        completion_tokens=rec.get("completion_tokens"),
+    )
+    for flag in ("aborted", "stopped"):
+        if rec.get(flag):
+            entry[flag] = True
+    if rec.get("error"):
+        entry["error"] = rec["error"]
+    return entry
+
+
+def sched_error_kinds(records) -> dict:
+    kinds: dict = {}
+    for rec in records:
+        error = rec.get("error") or ""
+        if not error:
+            continue
+        if rec.get("http_status"):
+            kind = f"HTTP {rec['http_status']}"
+        elif "timeout" in error.lower() or "timed out" in error.lower():
+            kind = "timeout"
+        else:
+            kind = error.split(":", 1)[0][:60]
+        kinds[kind] = kinds.get(kind, 0) + 1
+    return kinds
+
+
+def sched_error_samples(records, limit: int = 5) -> list:
+    return [rec["error"] for rec in records if rec.get("error")][:limit]
+
+
+def sched_check(name: str, ok: bool, detail: str = "") -> dict:
+    return {"check": name, "ok": bool(ok), "detail": detail}
+
+
+def sched_status(checks: list) -> str:
+    return "pass" if all(c["ok"] for c in checks) else "fail"
+
+
+def sched_merge_windows(windows: list) -> list:
+    merged = []
+    for start, end in sorted(w for w in windows if w[1] > w[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def sched_auto_streams(ctx: SchedulerContext) -> int:
+    if ctx.max_running:
+        return max(1, min(16, ctx.max_running - 1))
+    return 16
+
+
+async def sched_probe(run: SchedulerRun) -> dict:
+    """One short request: TTFT of a fresh prompt on the current server state."""
+    rec: dict = {}
+    payload = sched_payload(run.ctx, run.ctx.prompts.make(SCHED_PROBE_PROMPT_TOKENS), SCHED_PROBE_MAX_TOKENS)
+    await sched_request(run, payload, record=rec)
+    return {"ok": sched_ok(rec), "ttft_s": sched_round(rec.get("ttft_s")), "error": rec.get("error") or ""}
+
+
+# --- arrivals --------------------------------------------------------------
+
+async def sched_run_arrivals(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    streams = s.streams or sched_auto_streams(ctx)
+    context = ctx.fit(s.arrival_context, 1, run, "arrival context")
+    if context < 1024:
+        run.skip(f"arrival context {context} tokens is too small for this server")
+        return
+    needed = streams * (s.stream_prompt_tokens + s.stream_max_tokens) + context + 1
+    if ctx.kv_tokens and needed > ctx.kv_tokens:
+        run.skip(f"KV cache: {streams} streams x ({s.stream_prompt_tokens}+{s.stream_max_tokens}) + the "
+                 f"{context:,}-token arrival need {needed:,} tokens, the pool has {ctx.kv_tokens:,} "
+                 "(use --sched-streams or --sched-stream-max-tokens)")
+        return
+    if ctx.max_running and streams + 1 > ctx.max_running:
+        run.note(f"{streams} streams + the arrival exceed the server's {ctx.max_running} running requests; "
+                 "arrivals will queue")
+    d = run.data
+    d.update(streams=streams, context=context, samples=[], gaps=[], arrivals=[], stream_records=[])
+    t_measure = run.t0 + s.warmup
+    t_stop = t_measure + s.duration
+    d["window"] = (s.warmup, s.warmup + s.duration)
+    halt = asyncio.Event()
+
+    async def stream_worker(index: int) -> None:
+        while not halt.is_set() and not run.stopped:
+            last = [None]
+
+            def on_token(now: float, delta: int) -> None:
+                if t_measure <= now < t_stop:
+                    d["samples"].append((now - run.t0, delta))
+                    if last[0] is not None and last[0] >= t_measure:
+                        d["gaps"].append(now - last[0])
+                last[0] = now
+
+            rec = {"stream": index}
+            await sched_request(run, sched_payload(ctx, ctx.prompts.make(s.stream_prompt_tokens),
+                                                   s.stream_max_tokens),
+                                record=rec, on_token=on_token, stop=halt)
+            d["stream_records"].append(rec)
+            if rec["error"] and not await run.sleep(1.0):
+                return
+
+    async def arrival_worker() -> None:
+        if not await run.sleep_until(t_measure):
+            return
+        next_send = t_measure
+        while not run.stopped:
+            now = time.monotonic()
+            if now >= t_stop - 1.0:
+                return
+            if now < next_send:
+                if not await run.sleep(min(next_send, t_stop - 1.0) - now):
+                    return
+                continue
+            rec = {"index": len(d["arrivals"])}
+            d["arrivals"].append(rec)
+            await sched_request(run, sched_payload(ctx, ctx.prompts.make(context), 1), record=rec)
+            next_send = max(next_send + s.arrival_period, rec["t_end"] + 1.0)
+
+    workers = [run.spawn(stream_worker(i)) for i in range(streams)]
+    arrivals = run.spawn(arrival_worker())
+    await run.sleep_until(t_stop)
+    await run.wait_tasks([arrivals], timeout=s.request_timeout)
+    d["t_stop_actual"] = run.elapsed()
+    halt.set()
+    await run.stop_tasks(workers, grace=30.0)
+
+
+def sched_summarize_arrivals(run: SchedulerRun) -> dict:
+    d = run.data
+    t_measure, t_stop = d["window"]
+    t_stop = min(t_stop, d.get("t_stop_actual", run.elapsed()))
+    duration = max(0.0, t_stop - t_measure)
+    samples = sorted(d["samples"])
+    arrivals = d["arrivals"]
+    windows = []
+    for rec in arrivals:
+        start = sched_rel(run, rec.get("t_send"))
+        end = sched_rel(run, rec.get("t_first") or rec.get("t_end"))
+        if start is None or end is None:
+            continue
+        windows.append((max(start, t_measure), min(end, t_stop)))
+    merged = sched_merge_windows(windows)
+    inside_s = sum(end - start for start, end in merged)
+    total = sum(n for _, n in samples)
+    inside = sum(n for t, n in samples if any(start <= t < end for start, end in merged))
+    outside_s = duration - inside_s
+    gaps_ms = [1000.0 * g for g in d["gaps"]]
+    ok = [r for r in arrivals if sched_ok(r)]
+    stream_errors = [r for r in d["stream_records"] if r.get("error")]
+    arrival_errors = [r for r in arrivals if r.get("error")]
+    during = inside / inside_s if inside_s > 0 else None
+    outside = (total - inside) / outside_s if outside_s > 0 else None
+    metrics = {
+        "streams": d["streams"],
+        "arrival_context": d["context"],
+        "window_s": sched_round(duration, 1),
+        "decode_tok_s": sched_round(total / duration, 1) if duration > 0 else None,
+        "decode_tok_s_during_prefill": sched_round(during, 1),
+        "decode_tok_s_outside_prefill": sched_round(outside, 1),
+        "decode_kept": sched_round(during / outside, 3) if during is not None and outside else None,
+        "prefill_busy_share": sched_round(inside_s / duration, 3) if duration > 0 else None,
+        "gap_ms": sched_stats(gaps_ms, 1),
+        "arrivals": len(arrivals),
+        "arrival_ttft_s": sched_stats([r["ttft_s"] for r in ok]),
+        "arrival_prompt_tokens": sched_stats([r.get("prompt_tokens") for r in ok], 0),
+        "stream_requests": len(d["stream_records"]),
+        "errors": len(stream_errors) + len(arrival_errors),
+        "error_kinds": sched_error_kinds(stream_errors + arrival_errors),
+        "error_samples": sched_error_samples(arrival_errors + stream_errors),
+    }
+    checks = [
+        sched_check("every request succeeded", metrics["errors"] == 0, f"{metrics['errors']} errors"),
+        sched_check("at least one arrival was measured", len(ok) > 0, f"{len(ok)} arrivals"),
+    ]
+    headline = {
+        "decode_tok_s": metrics["decode_tok_s"],
+        "decode_tok_s_during_prefill": metrics["decode_tok_s_during_prefill"],
+        "decode_kept": metrics["decode_kept"],
+        "gap_p99_ms": metrics["gap_ms"]["p99"],
+        "gap_max_ms": metrics["gap_ms"]["max"],
+        "arrival_ttft_p50_s": metrics["arrival_ttft_s"]["p50"],
+        "arrival_ttft_max_s": metrics["arrival_ttft_s"]["max"],
+    }
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+# --- burst ------------------------------------------------------------------
+
+async def sched_run_burst(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    count = s.burst_requests or ctx.auto_count()
+    context = ctx.fit(s.burst_context, s.burst_max_tokens, run, "burst context")
+    if context < 256:
+        run.skip(f"burst context {context} tokens is too small for this server")
+        return
+    d = run.data
+    d.update(count=count, context=context, requests=[])
+    payloads = [sched_payload(ctx, ctx.prompts.make(context), s.burst_max_tokens) for _ in range(count)]
+    tasks = []
+    for index, payload in enumerate(payloads):
+        rec = {"index": index}
+        d["requests"].append(rec)
+        tasks.append(run.spawn(sched_request(run, payload, record=rec)))
+        if not await run.sleep(0.02):
+            break
+    await run.wait_tasks(tasks, timeout=s.request_timeout + 30.0)
+
+
+def sched_order_inversions(firsts: list) -> Optional[float]:
+    """Share of pairs (i < j in send order) whose first tokens came in the opposite order."""
+    pairs = inverted = 0
+    for i in range(len(firsts)):
+        for j in range(i + 1, len(firsts)):
+            if firsts[i] is None or firsts[j] is None:
+                continue
+            pairs += 1
+            inverted += firsts[j] < firsts[i]
+    return round(inverted / pairs, 3) if pairs else None
+
+
+def sched_summarize_burst(run: SchedulerRun) -> dict:
+    d = run.data
+    reqs = d["requests"]
+    ok = [r for r in reqs if sched_ok(r)]
+    errors = [r for r in reqs if r.get("error")]
+    unfinished = d["count"] - len(ok) - len(errors)
+    sends = [r["t_send"] for r in reqs if r.get("t_send")]
+    ends = [r["t_end"] for r in reqs if r.get("t_end")]
+    wall = (max(ends) - min(sends)) if sends and ends else None
+    firsts = [r.get("t_first") for r in reqs]
+    metrics = {
+        "requests": d["count"],
+        "context": d["context"],
+        "completed": len(ok),
+        "errors": len(errors),
+        "unfinished": unfinished,
+        "wall_s": sched_round(wall, 2),
+        "ttft_s": sched_stats([r["ttft_s"] for r in ok]),
+        "e2e_s": sched_stats([r["t_end"] - r["t_send"] for r in ok]),
+        "ttft_in_send_order_s": [sched_round(r.get("ttft_s"), 2) for r in reqs],
+        "order_inversions": sched_order_inversions(firsts),
+        "error_kinds": sched_error_kinds(errors),
+        "error_samples": sched_error_samples(errors),
+    }
+    checks = [sched_check("every request finished", len(ok) == d["count"],
+                          f"{len(ok)}/{d['count']} completed, {len(errors)} errors, {unfinished} unfinished")]
+    headline = {
+        "completed": len(ok),
+        "wall_s": metrics["wall_s"],
+        "ttft_p50_s": metrics["ttft_s"]["p50"],
+        "ttft_max_s": metrics["ttft_s"]["max"],
+        "order_inversions": metrics["order_inversions"],
+    }
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+# --- agents -------------------------------------------------------------------
+
+def sched_agent_start_range(ctx: SchedulerContext, cap: int) -> tuple:
+    s = ctx.settings
+    if s.agent_start:
+        lo, hi = s.agent_start
+        return (min(lo, cap), min(hi, cap))
+    hi = min(100 * 1024, cap // 2)
+    return (min(40 * 1024, hi // 2), hi)
+
+
+async def sched_run_agents(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    cap = ctx.fit(10 ** 9, s.agent_response[1])
+    cap -= s.agent_tool[1]
+    start_lo, start_hi = sched_agent_start_range(ctx, cap)
+    if cap < 2048 or start_hi < 1:
+        run.skip(f"conversations need room for {s.agent_response[1]} response + {s.agent_tool[1]} tool tokens; "
+                 "the model length / KV pool is too small")
+        return
+    exact = ctx.engine == ENGINE_VLLM and ctx.prompts.mode == "token_ids"
+    if not exact:
+        run.note("responses are appended as random tokens of the same count (exact response token IDs need "
+                 "vLLM with /tokenize)")
+    d = run.data
+    d.update(agents=s.agents, cap=cap, start=(start_lo, start_hi), exact_history=exact,
+             turns=[], samples=[], resets=0)
+    deadline = run.t0 + s.agents_duration
+    halt = asyncio.Event()
+
+    def on_token(now: float, delta: int) -> None:
+        d["samples"].append((now - run.t0, delta))
+
+    async def agent(index: int) -> None:
+        rng = random.Random(f"{s.seed}:agent:{index}:{run.arm}:{run.round_index}")
+        prompt = ctx.prompts.make(rng.randint(start_lo, start_hi))
+        length = len(prompt) if isinstance(prompt, list) else None
+        turn = 0
+        while time.monotonic() < deadline and not run.stopped:
+            max_tokens = rng.randint(*s.agent_response)
+            if length is not None and length + max_tokens + s.agent_tool[1] > cap:
+                d["resets"] += 1
+                prompt = ctx.prompts.make(rng.randint(start_lo, start_hi))
+                length = len(prompt)
+            rec = {"agent": index, "turn": turn, "prompt_len": length, "max_tokens": max_tokens}
+            d["turns"].append(rec)
+            await sched_request(run, sched_payload(ctx, prompt, max_tokens, collect_ids=exact), record=rec,
+                                on_token=on_token, stop=halt, collect_ids=exact)
+            out_ids = rec.pop("output_ids", None)
+            if rec["error"]:
+                if not await run.sleep(5.0):
+                    return
+            elif not rec["stopped"]:
+                tool = rng.randint(*s.agent_tool)
+                if isinstance(prompt, list):
+                    out = out_ids if exact and out_ids else ctx.prompts.make(rec["completion_tokens"])
+                    prompt = prompt + list(out) + ctx.prompts.make(tool)
+                    length = len(prompt)
+                else:
+                    prompt = ctx.prompts.extend(prompt, rec["completion_tokens"] + tool)
+                    if rec.get("prompt_tokens"):
+                        rec["prompt_len"] = rec["prompt_tokens"]
+                    if rec.get("prompt_tokens") and rec["prompt_tokens"] + 2 * max_tokens + tool > cap:
+                        d["resets"] += 1
+                        prompt = ctx.prompts.make(rng.randint(start_lo, start_hi))
+            turn += 1
+            if not await run.sleep(rng.uniform(*s.agent_think)):
+                return
+
+    tasks = []
+    for index in range(s.agents):
+        tasks.append(run.spawn(agent(index)))
+        if not await run.sleep(2.0):
+            break
+    await run.sleep_until(deadline)
+    halt.set()
+    await run.stop_tasks(tasks, grace=30.0)
+
+
+def sched_window_rows(run: SchedulerRun, end_s: float, turns: list, samples: list) -> list:
+    rows = []
+    metrics = run.sampler.samples
+    window = SCHED_WINDOW_SECONDS
+    start = 0.0
+    previous = None
+    while start < end_s:
+        stop = start + window
+        inside = [m for m in metrics if start <= m["t"] < stop]
+        done = [t for t in turns if sched_ok(t) and start <= sched_rel(run, t["t_end"]) < stop]
+        tokens = sum(n for t, n in samples if start <= t < stop)
+        row = {
+            "start_s": round(start), "turns": len(done),
+            "turn_s_mean": sched_round(mean([t["t_end"] - t["t_send"] for t in done]), 1) if done else None,
+            "ttft_s_mean": sched_round(mean([t["ttft_s"] for t in done]), 2) if done else None,
+            "tok_s": sched_round(tokens / min(window, end_s - start), 1) if end_s > start else None,
+            "max_context": max((t.get("prompt_len") or 0) for t in done) if done else None,
+        }
+        if inside:
+            last = inside[-1]
+            base = previous if previous is not None else inside[0]
+            row.update(
+                running=f"{min(m.get('running', 0) for m in inside):.0f}-{max(m.get('running', 0) for m in inside):.0f}",
+                waiting_max=max(m.get("waiting", 0) for m in inside),
+                kv_max_pct=sched_round(100 * max(m.get("kv_usage", 0) for m in inside), 1),
+                preemptions=(last.get("preemptions", 0) - base.get("preemptions", 0))
+                if last.get("preemptions") is not None else None,
+            )
+            queries = last.get("prefix_queries", 0) - base.get("prefix_queries", 0)
+            hits = last.get("prefix_hits", 0) - base.get("prefix_hits", 0)
+            row["prefix_hit_pct"] = sched_round(100 * hits / queries, 1) if queries > 0 else None
+            previous = last
+        rows.append(row)
+        start = stop
+    return rows
+
+
+def sched_summarize_agents(run: SchedulerRun) -> dict:
+    d = run.data
+    turns = d["turns"]
+    ok = [t for t in turns if sched_ok(t)]
+    errors = [t for t in turns if t.get("error")]
+    samples = sorted(d["samples"])
+    ends = [t["t_end"] for t in turns if t.get("t_end")]
+    wall = (max(ends) - run.t0) if ends else 0.0
+    prompt = sum(t.get("prompt_tokens") or t.get("prompt_len") or 0 for t in ok)
+    cached = sum(t.get("cached_tokens") or 0 for t in ok)
+    metrics = {
+        "agents": d["agents"],
+        "start_context": list(d["start"]),
+        "context_cap": d["cap"],
+        "exact_history": d["exact_history"],
+        "turns_ok": len(ok),
+        "turn_errors": len(errors),
+        "timeouts": sum("timeout" in (t.get("error") or "").lower() for t in errors),
+        "resets": d["resets"],
+        "wall_s": sched_round(wall, 1),
+        "decode_tok_s": sched_round(sum(n for _, n in samples) / wall, 1) if wall > 0 else None,
+        "turn_ttft_s": sched_stats([t["ttft_s"] for t in ok]),
+        "turn_s": sched_stats([t["t_end"] - t["t_send"] for t in ok]),
+        "max_context": max((t.get("prompt_len") or 0) for t in ok) if ok else None,
+        "cached_pct_usage": sched_round(100 * cached / prompt, 1) if prompt and any(
+            t.get("cached_tokens") is not None for t in ok) else None,
+        "windows": sched_window_rows(run, wall, turns, samples),
+        "turn_log": [sched_log_entry(run, t, ("agent", "turn", "prompt_len", "max_tokens")) for t in turns],
+        "error_kinds": sched_error_kinds(errors),
+        "error_samples": sched_error_samples(errors),
+    }
+    checks = [
+        sched_check("every turn succeeded", not errors, f"{len(errors)} failed turns"),
+        sched_check("turns finished", len(ok) > 0, f"{len(ok)} turns"),
+    ]
+    headline = {
+        "turns_ok": len(ok),
+        "decode_tok_s": metrics["decode_tok_s"],
+        "turn_ttft_p50_s": metrics["turn_ttft_s"]["p50"],
+        "turn_ttft_p99_s": metrics["turn_ttft_s"]["p99"],
+        "max_context": metrics["max_context"],
+    }
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+# --- short-under-long -----------------------------------------------------------
+
+async def sched_run_short_under_long(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    context = ctx.fit(s.arrival_context, 1, run, "long prompt")
+    if context < 1024:
+        run.skip(f"long prompt {context} tokens is too small for this server")
+        return
+    d = run.data
+    d.update(context=context, shorts=[], longs=[], dropped=0)
+    t_load = run.t0 + s.short_baseline_seconds
+    t_stop = t_load + s.duration
+    d["t_load"] = s.short_baseline_seconds
+    pending: set = set()
+
+    async def shorts() -> None:
+        next_send = time.monotonic()
+        while not run.stopped:
+            now = time.monotonic()
+            if now >= t_stop:
+                return
+            if now < next_send:
+                if not await run.sleep(min(next_send, t_stop) - now):
+                    return
+                continue
+            next_send += run.rng.expovariate(s.short_rate)
+            if run.tracker.in_flight >= SCHED_MAX_CLIENT_IN_FLIGHT:
+                d["dropped"] += 1
+                continue
+            rec = {"phase": "baseline" if now < t_load else "load"}
+            d["shorts"].append(rec)
+            payload = sched_payload(ctx, ctx.prompts.make(s.short_prompt_tokens), s.short_max_tokens)
+            pending.add(run.spawn(sched_request(run, payload, record=rec)))
+
+    async def longs() -> None:
+        if not await run.sleep_until(t_load):
+            return
+        next_send = t_load
+        while not run.stopped:
+            now = time.monotonic()
+            if now >= t_stop - 1.0:
+                return
+            if now < next_send:
+                if not await run.sleep(min(next_send, t_stop - 1.0) - now):
+                    return
+                continue
+            rec = {"index": len(d["longs"])}
+            d["longs"].append(rec)
+            await sched_request(run, sched_payload(ctx, ctx.prompts.make(context), 1), record=rec)
+            next_send = max(next_send + s.arrival_period, rec["t_end"] + 1.0)
+
+    workers = [run.spawn(shorts()), run.spawn(longs())]
+    await run.wait_tasks(workers, timeout=s.short_baseline_seconds + s.duration + s.request_timeout)
+    await run.wait_tasks(list(pending), timeout=s.request_timeout)
+
+
+def sched_summarize_short_under_long(run: SchedulerRun) -> dict:
+    d = run.data
+    shorts, longs = d["shorts"], d["longs"]
+    windows = [(r["t_send"], r.get("t_first") or r.get("t_end")) for r in longs if r.get("t_send")]
+
+    def overlapped(rec: dict) -> bool:
+        end = rec.get("t_first") or rec.get("t_end")
+        return any(start < end and rec["t_send"] < stop for start, stop in windows if stop)
+
+    ok = [r for r in shorts if sched_ok(r)]
+    baseline = [r["ttft_s"] for r in ok if r["phase"] == "baseline"]
+    load = [r for r in ok if r["phase"] == "load"]
+    blocked = [r["ttft_s"] for r in load if overlapped(r)]
+    clear = [r["ttft_s"] for r in load if not overlapped(r)]
+    errors = [r for r in shorts + longs if r.get("error")]
+    base_stats = sched_stats(baseline)
+    load_stats = sched_stats([r["ttft_s"] for r in load])
+    blocked_stats = sched_stats(blocked)
+
+    def ratio(a, b):
+        return sched_round(a / b, 2) if a is not None and b else None
+
+    metrics = {
+        "long_context": d["context"],
+        "short_rate_per_s": run.ctx.settings.short_rate,
+        "shorts": len(shorts),
+        "short_ttft_baseline_s": base_stats,
+        "short_ttft_under_load_s": load_stats,
+        "short_ttft_during_long_prefill_s": blocked_stats,
+        "short_ttft_outside_long_prefill_s": sched_stats(clear),
+        "slowdown_p50": ratio(load_stats["p50"], base_stats["p50"]),
+        "slowdown_p99": ratio(load_stats["p99"], base_stats["p99"]),
+        "slowdown_p99_during_long_prefill": ratio(blocked_stats["p99"], base_stats["p99"]),
+        "longs": len(longs),
+        "long_ttft_s": sched_stats([r["ttft_s"] for r in longs if sched_ok(r)]),
+        "client_dropped": d["dropped"],
+        "errors": len(errors),
+        "error_kinds": sched_error_kinds(errors),
+        "error_samples": sched_error_samples(errors),
+    }
+    checks = [
+        sched_check("every request succeeded", not errors, f"{len(errors)} errors"),
+        sched_check("shorts measured in both phases", bool(baseline) and bool(load),
+                    f"{len(baseline)} baseline, {len(load)} under load"),
+    ]
+    headline = {
+        "short_ttft_p50_s_baseline": base_stats["p50"],
+        "short_ttft_p50_s_under_load": load_stats["p50"],
+        "short_ttft_p99_s_under_load": load_stats["p99"],
+        "short_ttft_p99_s_during_long_prefill": blocked_stats["p99"],
+        "long_ttft_p50_s": metrics["long_ttft_s"]["p50"],
+    }
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+# --- overload -------------------------------------------------------------------
+
+async def sched_run_overload(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    prompt_tokens = ctx.fit(s.overload_prompt_tokens, s.overload_max_tokens, run, "overload prompt")
+    if prompt_tokens < 16:
+        run.skip("the overload prompt does not fit this server")
+        return
+    d = run.data
+    d.update(prompt_tokens=prompt_tokens, probe=[], requests=[], client_dropped=0)
+    d["probe_before"] = await sched_probe(run)
+    concurrency = max(1, min(64, ctx.max_running or 16))
+    d["probe_concurrency"] = concurrency
+    t_probe0 = time.monotonic()
+    t_probe1 = t_probe0 + s.overload_probe_seconds
+
+    async def closed_loop() -> None:
+        while time.monotonic() < t_probe1 and not run.stopped:
+            rec: dict = {}
+            d["probe"].append(rec)
+            await sched_request(run, sched_payload(ctx, ctx.prompts.make(prompt_tokens),
+                                                   s.overload_max_tokens), record=rec)
+            if rec["error"] and not await run.sleep(1.0):
+                return
+
+    workers = [run.spawn(closed_loop()) for _ in range(concurrency)]
+    await run.wait_tasks(workers, timeout=s.overload_probe_seconds + s.request_timeout)
+    if run.stopped:
+        return
+    counted_from = t_probe0 + s.overload_probe_seconds / 3.0
+    counted = [r for r in d["probe"] if sched_ok(r) and counted_from <= r["t_end"] <= t_probe1]
+    if counted:
+        capacity = len(counted) / (t_probe1 - counted_from)
+    else:
+        done = [r for r in d["probe"] if sched_ok(r)]
+        elapsed = max(time.monotonic() - t_probe0, 1e-6)
+        capacity = max(len(done), 1) / elapsed
+        run.note("no probe request finished inside the counting window; capacity estimated from the whole probe")
+    rate = s.overload_factor * capacity
+    d.update(capacity_rps=capacity, offered_rps=rate)
+    d["settle_after_probe"] = await run.sampler.wait_idle(s.idle_timeout)
+    run.say(f"capacity {capacity:.2f} req/s, offering {rate:.2f} req/s for {s.duration:g} s")
+    tasks: set = set()
+    t_open0 = time.monotonic()
+    t_open1 = t_open0 + s.duration
+    d["open_window"] = (run.elapsed(t_open0), run.elapsed(t_open1))
+    next_send = t_open0
+    while not run.stopped:
+        now = time.monotonic()
+        if now >= t_open1:
+            break
+        if now < next_send:
+            if not await run.sleep(min(next_send, t_open1) - now):
+                break
+            continue
+        next_send += run.rng.expovariate(rate)
+        if run.tracker.in_flight >= SCHED_MAX_CLIENT_IN_FLIGHT:
+            d["client_dropped"] += 1
+            continue
+        rec = {}
+        d["requests"].append(rec)
+        tasks.add(run.spawn(sched_request(run, sched_payload(ctx, ctx.prompts.make(prompt_tokens),
+                                                                 s.overload_max_tokens), record=rec)))
+    t_drain = time.monotonic()
+    await run.wait_tasks(list(tasks), timeout=s.request_timeout + 30.0)
+    d["client_drain_s"] = time.monotonic() - t_drain
+    if run.stopped:
+        return
+    idle = await run.sampler.wait_idle(s.idle_timeout)
+    d["idle"] = idle
+    d["drain_s"] = time.monotonic() - t_drain
+    d["probe_after"] = await sched_probe(run)
+
+
+def sched_summarize_overload(run: SchedulerRun) -> dict:
+    d = run.data
+    if "open_window" not in d:
+        checks = [sched_check("capacity probe finished", False, "the run stopped during the probe")]
+        return {"status": "fail", "checks": checks, "metrics": {}, "headline": {}}
+    reqs = d["requests"]
+    t0, t1 = d["open_window"]
+    duration = t1 - t0
+    ok = [r for r in reqs if sched_ok(r)]
+    rejected = [r for r in reqs if r.get("http_status")]
+    failed = [r for r in reqs if r.get("error") and not r.get("http_status")]
+    thirds = []
+    for k in range(3):
+        lo, hi = t0 + k * duration / 3, t0 + (k + 1) * duration / 3
+        part = [r["ttft_s"] for r in ok if lo <= sched_rel(run, r["t_send"]) < hi]
+        thirds.append(sched_stats(part))
+    in_window = [r for r in ok if t0 <= sched_rel(run, r["t_end"]) <= t1]
+    samples = [m for m in run.sampler.samples if t0 <= m["t"]]
+    idle = d.get("idle") or {}
+    probe_after = d.get("probe_after") or {}
+    metrics = {
+        "prompt_tokens": d["prompt_tokens"],
+        "probe_concurrency": d["probe_concurrency"],
+        "capacity_rps": sched_round(d["capacity_rps"], 3),
+        "offered_rps": sched_round(d["offered_rps"], 3),
+        "sent": len(reqs),
+        "completed_in_window_rps": sched_round(len(in_window) / duration, 3) if duration > 0 else None,
+        "completed": len(ok),
+        "rejected": len(rejected),
+        "failed": len(failed),
+        "client_dropped": d["client_dropped"],
+        "ttft_s": sched_stats([r["ttft_s"] for r in ok]),
+        "ttft_s_by_third": thirds,
+        "max_waiting": max((m.get("waiting", 0) for m in samples), default=None),
+        "max_waiting_capacity": max((m["waiting_capacity"] for m in samples if "waiting_capacity" in m), default=None),
+        "max_waiting_deferred": max((m["waiting_deferred"] for m in samples if "waiting_deferred" in m), default=None),
+        "client_drain_s": sched_round(d.get("client_drain_s"), 1),
+        "drain_s": sched_round(d.get("drain_s"), 1),
+        "idle_after_drain": idle,
+        "probe_before": d.get("probe_before"),
+        "probe_after": probe_after,
+        "error_kinds": sched_error_kinds(rejected + failed),
+        "error_samples": sched_error_samples(failed + rejected),
+    }
+    checks = [
+        sched_check("no timeouts or transport errors", not failed, f"{len(failed)} failed, {len(rejected)} rejected"),
+        sched_check("server drained to idle", idle.get("idle", True) and "idle" in d,
+                    f"{metrics['drain_s']} s" if idle.get("idle") else
+                    "not checked (no /metrics)" if not idle.get("checked") else f"not idle: {idle}"),
+        sched_check("probe after the drain succeeded", bool(probe_after.get("ok")), probe_after.get("error") or ""),
+    ]
+    headline = {
+        "capacity_rps": metrics["capacity_rps"],
+        "completed_in_window_rps": metrics["completed_in_window_rps"],
+        "ttft_p50_s": metrics["ttft_s"]["p50"],
+        "ttft_p99_s": metrics["ttft_s"]["p99"],
+        "max_waiting": metrics["max_waiting"],
+        "drain_s": metrics["drain_s"],
+    }
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+# --- abort-storm ------------------------------------------------------------------
+
+async def sched_run_abort_storm(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    count = s.abort_requests or ctx.auto_count()
+    context = ctx.fit(s.abort_context, SCHED_ABORT_MAX_TOKENS, run, "abort-storm context")
+    if context < 256:
+        run.skip(f"abort-storm context {context} tokens is too small for this server")
+        return
+    d = run.data
+    d.update(count=count, context=context, requests=[], waves=[])
+    d["probe_before"] = await sched_probe(run)
+
+    async def cancel_later(task: asyncio.Task, rec: dict, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if not task.done():
+            rec["cancelled_after_first_token"] = rec.get("t_first") is not None
+            task.cancel()
+
+    for wave in range(s.abort_waves):
+        if run.stopped:
+            break
+        tasks = []
+        for index in range(count):
+            mode = ("prefill", "decode", "complete")[index % 3]
+            rec = {"wave": wave, "mode": mode}
+            d["requests"].append(rec)
+            max_tokens = 32 if mode == "complete" else SCHED_ABORT_MAX_TOKENS
+            payload = sched_payload(ctx, ctx.prompts.make(context), max_tokens)
+            cancel_after = run.rng.randint(1, 64) if mode == "decode" else 0
+            task = run.spawn(sched_request(run, payload, record=rec, cancel_after_tokens=cancel_after))
+            if mode == "prefill":
+                run.spawn(cancel_later(task, rec, run.rng.uniform(0.05, 2.0)))
+            tasks.append(task)
+        await run.wait_tasks(tasks, timeout=s.request_timeout + 30.0)
+        if run.stopped:
+            break
+        idle = await run.sampler.wait_idle(s.idle_timeout)
+        d["waves"].append({"wave": wave, **idle})
+        run.say(f"wave {wave + 1}/{s.abort_waves}: " + (
+            f"idle after {idle['seconds']} s" if idle.get("idle") else
+            "idle not checked (no /metrics)" if not idle.get("checked") else f"NOT idle: {idle}"))
+    if not run.stopped:
+        d["probe_after"] = await sched_probe(run)
+
+
+def sched_summarize_abort_storm(run: SchedulerRun) -> dict:
+    d = run.data
+    reqs = d["requests"]
+    by_mode = {}
+    for mode in ("prefill", "decode", "complete"):
+        part = [r for r in reqs if r["mode"] == mode]
+        by_mode[mode] = {
+            "sent": len(part),
+            "aborted_before_first_token": sum(1 for r in part if r.get("aborted") and r.get("t_first") is None),
+            "aborted_after_first_token": sum(1 for r in part if r.get("aborted") and r.get("t_first") is not None),
+            "completed": sum(1 for r in part if sched_ok(r)),
+            "errors": sum(1 for r in part if r.get("error")),
+        }
+    complete = [r for r in reqs if r["mode"] == "complete"]
+    errors = [r for r in reqs if r.get("error")]
+    waves = d["waves"]
+    probe_after = d.get("probe_after") or {}
+    checked = [w for w in waves if w.get("checked")]
+    metrics = {
+        "requests_per_wave": d["count"],
+        "context": d["context"],
+        "waves": waves,
+        "by_mode": by_mode,
+        "idle_seconds_max": max((w["seconds"] for w in checked if w.get("idle")), default=None),
+        "kv_usage_after": checked[-1].get("kv_usage") if checked else None,
+        "probe_before": d.get("probe_before"),
+        "probe_after": probe_after,
+        "error_kinds": sched_error_kinds(errors),
+        "error_samples": sched_error_samples(errors),
+    }
+    checks = [
+        sched_check("server idle after every wave", all(w.get("idle") for w in checked) and
+                    len(waves) == run.ctx.settings.abort_waves,
+                    f"{sum(1 for w in checked if w.get('idle'))}/{run.ctx.settings.abort_waves} waves"
+                    + ("" if checked or not waves else " (no /metrics: idle not checked)")),
+        sched_check("requests left to finish completed", all(sched_ok(r) for r in complete),
+                    f"{sum(1 for r in complete if sched_ok(r))}/{len(complete)}"),
+        sched_check("probe after the storm succeeded", bool(probe_after.get("ok")), probe_after.get("error") or ""),
+    ]
+    headline = {
+        "idle_seconds_max": metrics["idle_seconds_max"],
+        "probe_ttft_before_s": (d.get("probe_before") or {}).get("ttft_s"),
+        "probe_ttft_after_s": probe_after.get("ttft_s"),
+        "aborted": sum(1 for r in reqs if r.get("aborted")),
+    }
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+# --- soak-mix ---------------------------------------------------------------------
+
+def sched_image_data_url(width: int, height: int, seed: int) -> str:
+    """A JPEG of random 16x16 blocks (compresses like a photo, unique per seed)."""
+    from PIL import Image
+    rnd = random.Random(seed)
+    small_w, small_h = max(1, width // 16), max(1, height // 16)
+    small = Image.frombytes("RGB", (small_w, small_h), rnd.randbytes(small_w * small_h * 3))
+    image = small.resize((width, height), Image.NEAREST)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def sched_images_available() -> bool:
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+async def sched_run_soak_mix(run: SchedulerRun) -> None:
+    ctx, s = run.ctx, run.ctx.settings
+    cap = ctx.fit(max(SCHED_SOAK_TEXT_TOKENS), max(SCHED_SOAK_MAX_TOKENS))
+    lengths = [n for n in SCHED_SOAK_TEXT_TOKENS if n <= cap] or ([cap] if cap >= 256 else [])
+    if not lengths:
+        run.skip("the model length / KV pool is too small for the soak prompts")
+        return
+    images = s.soak_images and sched_images_available()
+    if s.soak_images and not images:
+        run.note("--sched-soak-images needs Pillow (pip install pillow); sending text only")
+    kinds = ["text", "image", "images", "mixed"] if images else ["text"]
+    weights = [0.35, 0.25, 0.2, 0.2] if images else [1.0]
+    image_text = [n for n in SCHED_SOAK_IMAGE_TEXT_TOKENS if n <= cap // 2] or [min(lengths)]
+    d = run.data
+    d.update(lengths=lengths, images=images, requests=[], samples=[])
+    deadline = run.t0 + s.soak_duration
+    halt = asyncio.Event()
+
+    def on_token(now: float, delta: int) -> None:
+        d["samples"].append((now - run.t0, delta))
+
+    async def worker(first: int) -> None:
+        index = first
+        while time.monotonic() < deadline and not run.stopped:
+            rng = random.Random(f"{s.seed}:soak:{index}:{run.arm}:{run.round_index}")
+            kind = rng.choices(kinds, weights)[0]
+            max_tokens = rng.choice(SCHED_SOAK_MAX_TOKENS)
+            rec = {"index": index, "kind": kind, "max_tokens": max_tokens}
+            d["requests"].append(rec)
+            if kind == "text":
+                rec["target_tokens"] = rng.choice(lengths)
+                payload = sched_payload(ctx, ctx.prompts.make(rec["target_tokens"]), max_tokens)
+                path = "/v1/completions"
+            else:
+                count = 1 if kind == "image" else rng.randint(2, 10)
+                sizes = [SCHED_SOAK_IMAGE_SIZES[rng.randrange(len(SCHED_SOAK_IMAGE_SIZES))] for _ in range(count)]
+                rec["images"] = [f"{w}x{h}" for w, h in sizes]
+                content = []
+                for k, (w, h) in enumerate(sizes):
+                    url = await asyncio.to_thread(sched_image_data_url, w, h, rng.randrange(2 ** 31) + k)
+                    content.append({"type": "image_url", "image_url": {"url": url}})
+                rec["target_tokens"] = rng.choice(image_text) if kind == "mixed" else 64
+                content.append({"type": "text", "text": ctx.prompts.text(rec["target_tokens"])
+                                + "\nDescribe and summarize."})
+                payload = {
+                    "model": ctx.model, "messages": [{"role": "user", "content": content}],
+                    "max_tokens": max_tokens, "stream": True, "stream_options": dict(MIXED_STREAM_OPTIONS),
+                    "ignore_eos": True,
+                }
+                if s.temperature is not None:
+                    payload["temperature"] = s.temperature
+                path = "/v1/chat/completions"
+            await sched_request(run, payload, path=path, record=rec, on_token=on_token, stop=halt)
+            index += s.soak_concurrency
+
+    tasks = [run.spawn(worker(i)) for i in range(s.soak_concurrency)]
+    await run.sleep_until(deadline)
+    halt.set()
+    await run.stop_tasks(tasks, grace=60.0)
+
+
+def sched_summarize_soak_mix(run: SchedulerRun) -> dict:
+    d = run.data
+    reqs = d["requests"]
+    ok = [r for r in reqs if sched_ok(r)]
+    errors = [r for r in reqs if r.get("error")]
+    samples = d["samples"]
+    ends = [r["t_end"] for r in reqs if r.get("t_end")]
+    wall = (max(ends) - run.t0) if ends else 0.0
+    by_kind = {}
+    for kind in sorted({r["kind"] for r in reqs}):
+        part = [r for r in reqs if r["kind"] == kind]
+        by_kind[kind] = {"sent": len(part), "ok": sum(1 for r in part if sched_ok(r)),
+                         "errors": sum(1 for r in part if r.get("error"))}
+    metrics = {
+        "prompt_lengths": d["lengths"],
+        "images": d["images"],
+        "requests": len(reqs),
+        "ok": len(ok),
+        "errors": len(errors),
+        "by_kind": by_kind,
+        "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in ok),
+        "completion_tokens": sum(r.get("completion_tokens") or 0 for r in ok),
+        "decode_tok_s": sched_round(sum(n for _, n in samples) / wall, 1) if wall > 0 else None,
+        "ttft_s": sched_stats([r["ttft_s"] for r in ok]),
+        "request_log": [sched_log_entry(run, r, ("kind", "images", "target_tokens", "max_tokens")) for r in reqs],
+        "error_kinds": sched_error_kinds(errors),
+        "error_samples": sched_error_samples(errors),
+    }
+    checks = [sched_check("no request failed", not errors, f"{len(errors)} errors of {len(reqs)} requests"),
+              sched_check("requests finished", len(ok) > 0, f"{len(ok)} ok")]
+    headline = {"requests_ok": len(ok), "errors": len(errors), "decode_tok_s": metrics["decode_tok_s"],
+                "ttft_p99_s": metrics["ttft_s"]["p99"]}
+    return {"status": sched_status(checks), "checks": checks, "metrics": metrics, "headline": headline}
+
+
+SCHEDULER_SCENARIO_RUNNERS = {
+    "arrivals": (sched_run_arrivals, sched_summarize_arrivals),
+    "burst": (sched_run_burst, sched_summarize_burst),
+    "agents": (sched_run_agents, sched_summarize_agents),
+    "short-under-long": (sched_run_short_under_long, sched_summarize_short_under_long),
+    "overload": (sched_run_overload, sched_summarize_overload),
+    "abort-storm": (sched_run_abort_storm, sched_summarize_abort_storm),
+    "soak-mix": (sched_run_soak_mix, sched_summarize_soak_mix),
+}
+
+
+def sched_server_summary(run: SchedulerRun, start: Optional[dict], end: Optional[dict]) -> dict:
+    samples = run.sampler.samples
+    out = {"metrics_available": run.sampler.available and bool(samples), "samples": len(samples),
+           "scrape_errors": run.sampler.errors}
+    if samples:
+        def peak(key):
+            values = [m[key] for m in samples if key in m]
+            return max(values) if values else None
+        out.update(
+            max_running=peak("running"), max_waiting=peak("waiting"),
+            max_waiting_capacity=peak("waiting_capacity"), max_waiting_deferred=peak("waiting_deferred"),
+            max_kv_usage_pct=sched_round(100 * peak("kv_usage"), 1) if peak("kv_usage") is not None else None,
+            max_prefill_backlog_tokens=peak("prefill_backlog_tokens"),
+        )
+        shares = [m["prefill_compute_share"] for m in samples if "prefill_compute_share" in m]
+        if shares:
+            out["prefill_compute_share_mean"] = sched_round(mean(shares), 3)
+    if start and end:
+        def delta(key):
+            if key in start and key in end:
+                return end[key] - start[key]
+            return None
+        for key in ("preemptions", "prompt_tokens", "generation_tokens", "requests_finished"):
+            value = delta(key)
+            if value is not None:
+                out[key] = int(round(value))
+        for prefix in ("", "external_"):
+            queries, hits = delta(f"{prefix}prefix_queries"), delta(f"{prefix}prefix_hits")
+            if queries:
+                out[f"{prefix}prefix_hit_pct"] = sched_round(100 * (hits or 0) / queries, 1)
+        decode, prefill = delta("compute_seconds_decode"), delta("compute_seconds_prefill")
+        if decode is not None and prefill is not None and decode + prefill > 0:
+            out["compute_seconds"] = {"decode": sched_round(decode, 2), "prefill": sched_round(prefill, 2),
+                                      "prefill_share": sched_round(prefill / (decode + prefill), 3)}
+        histograms = {}
+        for key, hist in (end.get("histograms") or {}).items():
+            summary = sched_histogram_delta((start.get("histograms") or {}).get(key), hist)
+            if summary and summary.get("count"):
+                histograms[key] = summary
+        if histograms:
+            out["histograms"] = histograms
+    return out
+
+
+async def run_scheduler_scenario(ctx: SchedulerContext, name: str, *, arm: Optional[str] = None,
+                                 round_index: int = 0) -> dict:
+    execute, summarize = SCHEDULER_SCENARIO_RUNNERS[name]
+    run = SchedulerRun(ctx, name, arm, round_index)
+    start = await run.sampler.fetch()
+    started_at = datetime.now().isoformat(timespec="seconds")
+    run.t0 = time.monotonic()
+    run.say("start")
+    sampler_task = asyncio.create_task(run.sampler.run(run))
+    body = asyncio.create_task(execute(run))
+    wedge_wait = asyncio.create_task(run.wedge.wait())
+    error = ""
+    try:
+        await asyncio.wait({body, wedge_wait}, return_when=asyncio.FIRST_COMPLETED)
+        if body.done() and not body.cancelled() and body.exception() is not None:
+            exc = body.exception()
+            error = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
+    finally:
+        wedge_wait.cancel()
+        if not body.done():
+            body.cancel()
+        for task in list(run.tasks):
+            task.cancel()
+        await asyncio.gather(body, *list(run.tasks), return_exceptions=True)
+        run.finished.set()
+        await asyncio.gather(sampler_task, return_exceptions=True)
+    end = await run.sampler.fetch()
+    result = {"scenario": name, "arm": arm, "round": round_index + 1 if arm is not None else None,
+              "started": started_at, "elapsed_s": round(run.elapsed(), 1)}
+    if run.skip_reason:
+        result.update(status="skipped", reason=run.skip_reason, notes=run.notes)
+        return result
+    try:
+        result.update(summarize(run))
+    except Exception as exc:  # a summary bug must not lose the run
+        result.update(status="error", checks=[], metrics={}, headline={},
+                      reason=f"summary failed: {type(exc).__name__}: {exc}")
+    if error:
+        result["status"] = "error"
+        result["reason"] = error.strip().splitlines()[-1]
+        result["traceback"] = error
+    if run.watchdog.wedged:
+        result["status"] = "wedged"
+        result["reason"] = (f"no progress for {run.watchdog.stop_after_seconds:g} s with requests in flight; "
+                            "run stopped (restart the server)")
+    elif run.watchdog.stalls and result["status"] == "pass":
+        result["status"] = "stalled"
+        longest = max(s.get("seconds", 0) for s in run.watchdog.stalls)
+        result["reason"] = f"{len(run.watchdog.stalls)} stall(s), longest {longest:g} s"
+    result["stalls"] = run.watchdog.stalls
+    result["server"] = sched_server_summary(run, start, end)
+    result["client"] = run.tracker.as_dict()
+    result["notes"] = run.notes
+    result["timeseries"] = run.sampler.samples
+    return result
+
+
+async def sched_server_info(control: httpx.AsyncClient, base_url: str, args) -> dict:
+    """Model, engine and the limits the scenarios size themselves by."""
+    try:
+        resp = await control.get(f"{base_url}/v1/models", timeout=15.0)
+        models = resp.json()
+    except Exception as exc:
+        raise SchedulerSetupError(f"Cannot connect to the server at {base_url}: {exc}")
+    data = models.get("data") or [] if isinstance(models, dict) else []
+    model_ids = [m.get("id") for m in data if isinstance(m, dict)]
+    model = args.model
+    if model == "Qwen3.5" and model_ids:
+        model = model_ids[0]
+    info = {"base_url": base_url, "model": model, "models": model_ids,
+            "max_model_len": int((data[0] if data else {}).get("max_model_len") or 0)}
+    engine = ENGINE_OPENAI_PROXY
+    try:
+        resp = await control.get(f"{base_url}/get_server_info", timeout=10.0)
+        server_info = resp.json() if resp.status_code < 400 else {}
+    except (httpx.HTTPError, ValueError):
+        server_info = {}
+    if isinstance(server_info, dict) and "max_total_num_tokens" in server_info:
+        engine = ENGINE_SGLANG
+        info["version"] = server_info.get("version")
+        kv = int(server_info.get("max_total_num_tokens") or 0)
+        if kv:
+            dcp = int(getattr(args, "dcp_size", 0) or 0)
+            info["kv_tokens"] = kv * (dcp if dcp > 1 else 1)
+            info["kv_tokens_source"] = "sglang max_total_num_tokens"
+        if server_info.get("max_running_requests"):
+            info["max_running"] = int(server_info["max_running_requests"])
+            info["max_running_source"] = "sglang get_server_info"
+        info["max_model_len"] = int(server_info.get("context_length") or info["max_model_len"])
+    else:
+        try:
+            resp = await control.get(f"{base_url}/version", timeout=10.0)
+            version = resp.json() if resp.status_code < 400 else {}
+            if isinstance(version, dict) and "version" in version:
+                engine = ENGINE_VLLM
+                info["version"] = version["version"]
+        except (httpx.HTTPError, ValueError):
+            pass
+    metrics_text = ""
+    try:
+        resp = await control.get(f"{base_url}/metrics", timeout=10.0)
+        if resp.status_code < 400:
+            metrics_text = resp.text
+    except httpx.HTTPError:
+        pass
+    if engine == ENGINE_OPENAI_PROXY and "vllm:" in metrics_text[:5000]:
+        engine = ENGINE_VLLM
+    elif engine == ENGINE_OPENAI_PROXY and "sglang:" in metrics_text[:5000]:
+        engine = ENGINE_SGLANG
+    info["engine"] = engine
+    info["metrics"] = ("vllm:" in metrics_text) or ("sglang:" in metrics_text)
+    local = sched_local_server_options(base_url)
+    if local:
+        info["local_command"] = local
+    options = local.get("options", {}) if local else {}
+    if engine == ENGINE_VLLM and "kv_tokens" not in info and metrics_text:
+        dcp = int(getattr(args, "dcp_size", 0) or 0) or int(options.get("decode-context-parallel-size") or 0)
+        info.update(sched_cache_config_kv_tokens(metrics_text, dcp))
+    if getattr(args, "kv_budget", 0):
+        info["kv_tokens"] = int(args.kv_budget)
+        info["kv_tokens_source"] = "--kv-budget"
+    if args.sched_max_running:
+        info["max_running"] = int(args.sched_max_running)
+        info["max_running_source"] = "--sched-max-running"
+    elif "max_running" not in info and options:
+        value = options.get("max-num-seqs") or options.get("max-running-requests")
+        if value and value is not True:
+            info["max_running"] = int(value)
+            info["max_running_source"] = "server command line"
+        elif engine == ENGINE_VLLM and "config" not in options:
+            info["max_running"] = VLLM_DEFAULT_MAX_NUM_SEQS
+            info["max_running_source"] = "vLLM default (no --max-num-seqs on the command line)"
+    return info
+
+
+def sched_arm_schedule(settings: SchedulerSettings) -> list:
+    """(round, label, value) runs of one scenario; arms alternate ABBA across rounds."""
+    if not settings.ab_arms:
+        return [(0, None, None)]
+    schedule = []
+    for round_index in range(settings.ab_rounds):
+        arms = settings.ab_arms if round_index % 2 == 0 else list(reversed(settings.ab_arms))
+        schedule.extend((round_index, label, value) for label, value in arms)
+    return schedule
+
+
+def sched_ab_summary(results: list, settings: SchedulerSettings) -> dict:
+    """Per scenario and arm: every headline value across rounds with mean / min / max."""
+    summary = {}
+    for name in settings.scenarios:
+        arms: dict = {}
+        for result in results:
+            if result["scenario"] != name or result.get("arm") is None:
+                continue
+            if result.get("status") in ("skipped", "error"):
+                continue
+            for key, value in (result.get("headline") or {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    arms.setdefault(result["arm"], {}).setdefault(key, []).append(value)
+        if arms:
+            summary[name] = {
+                arm: {key: {"values": values, "mean": sched_round(mean(values), 3),
+                            "min": min(values), "max": max(values)} for key, values in metrics.items()}
+                for arm, metrics in arms.items()
+            }
+    return summary
+
+
+def sched_format_value(key: str, value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        if key.endswith("_ms") or key.endswith("tok_s"):
+            return f"{value:,.0f}"
+        return f"{value:.2f}"
+    return f"{value:,}" if isinstance(value, int) else str(value)
+
+
+def sched_result_line(result: dict) -> str:
+    status = result.get("status", "?").upper()
+    if status == "SKIPPED":
+        return f"SKIPPED ({result.get('reason', '')})"
+    parts = [f"{key} {sched_format_value(key, value)}" for key, value in (result.get("headline") or {}).items()]
+    failed = [c for c in result.get("checks") or [] if not c["ok"]]
+    if failed:
+        parts.append("failed: " + "; ".join(f"{c['check']} ({c['detail']})" for c in failed))
+    if result.get("reason") and status in ("STALLED", "WEDGED", "ERROR"):
+        parts.append(result["reason"])
+    return f"{status} " + ", ".join(parts)
+
+
+def print_scheduler_report(console: Console, report: dict) -> None:
+    results = report.get("scheduler", {}).get("scenarios") or []
+    if not results:
+        return
+    table = Table(title=render_title("Scheduler tests"), box=REPORT_BOX, border_style=FRAME_BORDER)
+    table.add_column("scenario", style=PHOSPHOR)
+    table.add_column("arm")
+    table.add_column("status")
+    table.add_column("results", overflow="fold")
+    colors = {"pass": PHOSPHOR, "skipped": REPORT_MUTED}
+    for result in results:
+        status = result.get("status", "?")
+        arm = "" if result.get("arm") is None else f"{result['arm']} r{result.get('round')}"
+        line = sched_result_line(result)
+        table.add_row(result["scenario"], arm,
+                      Text(status.upper(), style=colors.get(status, THEME_ERROR)),
+                      line.split(" ", 1)[1] if " " in line else "")
+    console.print(table)
+    ab = report.get("scheduler", {}).get("ab") or {}
+    for name, arms in ab.items():
+        labels = list(arms)
+        keys = []
+        for arm in labels:
+            keys.extend(k for k in arms[arm] if k not in keys)
+        ab_table = Table(title=render_title(f"A/B {name}", "(mean over rounds, min-max)"),
+                         box=REPORT_BOX, border_style=FRAME_BORDER)
+        ab_table.add_column("metric", style=PHOSPHOR)
+        for arm in labels:
+            ab_table.add_column(f"prefill share {arm}", justify="right")
+        for key in keys:
+            cells = []
+            for arm in labels:
+                entry = arms[arm].get(key)
+                cells.append("-" if entry is None else
+                             f"{sched_format_value(key, entry['mean'])} "
+                             f"({sched_format_value(key, entry['min'])}-{sched_format_value(key, entry['max'])})")
+            ab_table.add_row(key, *cells)
+        console.print(ab_table)
+    verdict = report["scheduler"].get("verdict", "?")
+    console.print(Text(f"Scheduler verdict: {verdict.upper()}",
+                       style=f"bold {PHOSPHOR if verdict == 'pass' else THEME_ERROR}"))
+
+
+def sched_redacted_argv() -> list:
+    argv = list(sys.argv[1:])
+    for index, token in enumerate(argv):
+        if token == "--api-key" and index + 1 < len(argv):
+            argv[index + 1] = "<redacted>"
+        elif token.startswith("--api-key="):
+            argv[index] = "--api-key=<redacted>"
+    return argv
+
+
+async def run_scheduler_suite(args, console: Console, report: dict) -> int:
+    """Run every --scheduler scenario (and A/B arm); fills ``report`` as it goes."""
+    settings = SchedulerSettings.from_args(args)
+    base_url = build_base_url_from_args(args)
+    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
+    limits = httpx.Limits(max_connections=SCHED_MAX_CLIENT_IN_FLIGHT + 64, max_keepalive_connections=128)
+    results = report["scheduler"]["scenarios"]
+    async with httpx.AsyncClient(headers=headers, limits=limits) as client, \
+            httpx.AsyncClient(headers=headers) as control:
+        server = await sched_server_info(control, base_url, args)
+        report["server"] = server
+        report["metadata"].update(model=server["model"], engine=server["engine"])
+        prompts = SchedulerPromptFactory(settings.seed)
+        await prompts.setup(control, base_url, server["model"])
+        server["prompt_mode"] = prompts.mode
+        fairness = SchedulerFairness(control, base_url)
+        if server["engine"] == ENGINE_VLLM:
+            await fairness.probe()
+        server["prefill_fairness"] = fairness.original if fairness.available else {"available": False,
+                                                                                    "reason": fairness.reason}
+        if settings.ab_arms and not fairness.available:
+            raise SchedulerSetupError(
+                "--sched-ab-fairness switches the policy through vLLM's /prefill_fairness dev endpoint, "
+                f"which is not available: {fairness.reason or 'not a vLLM server'}")
+        ctx = SchedulerContext(
+            client=client, control=control, base_url=base_url, model=server["model"], engine=server["engine"],
+            settings=settings, server=server, prompts=prompts, console=console,
+            max_model_len=int(server.get("max_model_len") or 0), kv_tokens=int(server.get("kv_tokens") or 0),
+            max_running=int(server.get("max_running") or 0), metrics=bool(server["metrics"]),
+        )
+        lines = [
+            f"[bold {PHOSPHOR}]Scheduler tests[/bold {PHOSPHOR}]",
+            f"Model: {escape(str(server['model']))} @ {escape(base_url)} ({server['engine']}"
+            + (f" {escape(str(server.get('version')))}" if server.get("version") else "") + ")",
+            f"Max model len: {ctx.max_model_len:,} | KV pool: "
+            + (f"{ctx.kv_tokens:,} tokens" if ctx.kv_tokens else "unknown")
+            + " | Max running: " + (f"{ctx.max_running} ({server.get('max_running_source')})"
+                                    if ctx.max_running else "unknown (--sched-max-running)"),
+            f"Metrics: {'yes' if server['metrics'] else 'no (stalls from client progress only)'} | "
+            f"Prompts: {'token IDs' if prompts.mode == 'token_ids' else 'padding text (no /tokenize)'}",
+            f"Scenarios: {', '.join(settings.scenarios)}",
+        ]
+        if fairness.available:
+            policy = fairness.original or {}
+            lines.append(
+                "Prefill fairness: share "
+                f"{policy.get('prefill_compute_share')}, max parallel prefills "
+                f"{policy.get('effective_max_parallel_prefills', policy.get('max_parallel_prefills'))}, "
+                f"policy {policy.get('prefill_policy')}")
+        if settings.ab_arms:
+            lines.append(f"A/B: prefill compute share {' vs '.join(l for l, _ in settings.ab_arms)}, "
+                         f"{settings.ab_rounds} rounds (ABBA)")
+        console.print(Panel("\n".join(lines), title=render_title("Configuration"), box=PANEL_BOX,
+                            border_style=FRAME_BORDER))
+        wedged_in = ""
+        try:
+            for name in settings.scenarios:
+                for round_index, label, value in sched_arm_schedule(settings):
+                    if wedged_in:
+                        results.append({"scenario": name, "arm": label,
+                                        "round": round_index + 1 if label is not None else None,
+                                        "status": "skipped",
+                                        "reason": f"the server wedged in {wedged_in}"})
+                        continue
+                    applied = None
+                    if label is not None:
+                        applied = await fairness.apply(value)
+                        if not applied["ok"]:
+                            results.append({"scenario": name, "arm": label, "round": round_index + 1,
+                                            "status": "error", "reason": "switching prefill fairness failed",
+                                            "fairness": applied})
+                            continue
+                    result = await run_scheduler_scenario(ctx, name, arm=label, round_index=round_index)
+                    if applied is not None:
+                        result["fairness"] = await fairness.get() or applied.get("response")
+                    results.append(result)
+                    console.print(Text(f"  {name}{'' if label is None else f' [{label} r{round_index + 1}]'}: "
+                                       f"{sched_result_line(result)}"))
+                    if result["status"] == "wedged":
+                        wedged_in = name
+                    elif result["status"] != "skipped":
+                        settle = await SchedulerMetricsSampler(control, base_url, ctx.engine, 1.0,
+                                                               ctx.metrics).wait_idle(settings.idle_timeout)
+                        result["settle"] = settle
+                        if settle.get("checked") and not settle.get("idle"):
+                            console.print(Text(f"  {name}: the server did not return to idle within "
+                                               f"{settings.idle_timeout:g} s ({settle})", style=THEME_ERROR))
+        finally:
+            if fairness.changed:
+                report["scheduler"]["fairness_restored"] = await fairness.restore()
+    report["scheduler"]["ab"] = sched_ab_summary(results, settings)
+    failed = [r for r in results if r.get("status") in SCHED_STATUS_FAILED]
+    report["scheduler"]["verdict"] = "fail" if failed else "pass"
+    return 2 if failed else 0
+
+
+def run_scheduler_mode(args, console: Console) -> tuple:
+    """--scheduler: run the scheduler scenarios; returns (report, exit code)."""
+    settings = SchedulerSettings.from_args(args)
+    report = {
+        "metadata": {
+            "version": VERSION,
+            "mode": "scheduler",
+            "timestamp": datetime.now().isoformat(),
+            "base_url": build_base_url_from_args(args),
+            "argv": sched_redacted_argv(),
+            "settings": settings.metadata(),
+        },
+        "server": {},
+        "scheduler": {"scenarios": []},
+        "methodology": {k: v for k, v in SCHED_METHODOLOGY.items()
+                        if k == "common" or k in settings.scenarios},
+    }
+    exit_code = 0
+    try:
+        exit_code = asyncio.run(run_scheduler_suite(args, console, report))
+    except SchedulerSetupError as exc:
+        console.print(Text(str(exc), style=THEME_ERROR))
+        report["scheduler"]["error"] = str(exc)
+        report["scheduler"]["verdict"] = "error"
+        return report, 1
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted; saving the scenarios finished so far.[/yellow]")
+        report["scheduler"]["interrupted"] = True
+        report["scheduler"]["verdict"] = "interrupted"
+        exit_code = 130
+    print_scheduler_report(console, report)
+    return report, exit_code
+
+
 def check_for_update(console: Console) -> bool:
     """Check GitHub for newer version. Returns True if user chose to upgrade and re-exec."""
     if os.environ.get("LLM_BENCH_NO_UPDATE_CHECK") == "1":
@@ -19446,6 +21845,104 @@ def validate_tool_eval_args(parser: argparse.ArgumentParser, args) -> None:
         args.tool_eval_extra_args = parse_tool_eval_extra_args(args.tool_eval_args)
     except ValueError as exc:
         parser.error(str(exc))
+
+
+def validate_scheduler_args(parser: argparse.ArgumentParser, args) -> None:
+    """--scheduler is a mode of its own; its --sched-* options need it."""
+    args.scheduler_list = []
+    args.sched_ab_arms = []
+    used = sorted({arg.split("=", 1)[0] for arg in sys.argv[1:] if arg.startswith("--sched-")})
+    if not (args.scheduler or "").strip():
+        if used:
+            verb = "applies" if len(used) == 1 else "apply"
+            parser.error(f"{', '.join(used)} only {verb} to --scheduler")
+        return
+    names = []
+    for part in args.scheduler.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part == "all":
+            names.extend(SCHEDULER_SCENARIOS)
+        elif part in SCHEDULER_SCENARIOS:
+            names.append(part)
+        else:
+            parser.error(f"--scheduler: unknown scenario {part!r}; choose from {', '.join(SCHEDULER_SCENARIOS)} or all")
+    args.scheduler_list = list(dict.fromkeys(names))
+    if not args.scheduler_list:
+        parser.error("--scheduler needs at least one scenario")
+    conflicts = [
+        name for name, active in (
+            ("--completion-stats/--test-profile", args.completion_stats or bool(args.test_profile)),
+            ("--tool-eval", args.tool_eval),
+            ("--p2pmark-only", args.p2pmark_only),
+            ("--amd-fabric-only", args.amd_fabric_only),
+            ("--compare-candidate", bool(args.compare_candidate)),
+            ("--mixed-prefill-contexts", bool((args.mixed_prefill_contexts or "").strip())),
+            ("--prefill-only", args.prefill_only),
+            ("--standalone-prefill", args.standalone_prefill),
+            ("--run-burst", args.run_burst),
+            ("--request-count", args.request_count > 0),
+            ("--coding-peak", args.coding_peak),
+        ) if active
+    ]
+    if conflicts:
+        parser.error(f"--scheduler runs only the scheduler tests; it cannot be combined with {', '.join(conflicts)}")
+    try:
+        args.sched_agent_start_range = (
+            parse_token_range(args.sched_agent_start) if args.sched_agent_start.strip() else None)
+        args.sched_agent_tool_range = parse_token_range(args.sched_agent_tool)
+        args.sched_agent_response_range = parse_token_range(args.sched_agent_response)
+        args.sched_agent_think_range = parse_token_range(args.sched_agent_think, floats=True)
+        for option in ("sched_stream_prompt_tokens", "sched_arrival_context", "sched_burst_context",
+                       "sched_short_prompt_tokens", "sched_overload_prompt_tokens", "sched_abort_context"):
+            if parse_token_value(str(getattr(args, option))) < 1:
+                raise ValueError(f"--{option.replace('_', '-')} must be >= 1")
+        arms = [parse_fairness_arm(part) for part in args.sched_ab_fairness.split(",") if part.strip()]
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.sched_agent_response_range[0] < 1:
+        parser.error("--sched-agent-response must be >= 1")
+    if len(arms) == 1:
+        parser.error("--sched-ab-fairness needs at least two arms, e.g. off,0.4")
+    if len({label for label, _ in arms}) != len(arms):
+        parser.error("--sched-ab-fairness arms must differ")
+    args.sched_ab_arms = arms
+    positive = {
+        "--sched-duration": args.sched_duration, "--sched-stall-seconds": args.sched_stall_seconds,
+        "--sched-metrics-interval": args.sched_metrics_interval, "--sched-idle-timeout": args.sched_idle_timeout,
+        "--sched-request-timeout": args.sched_request_timeout, "--sched-arrival-period": args.sched_arrival_period,
+        "--sched-agents-duration": args.sched_agents_duration, "--sched-short-rate": args.sched_short_rate,
+        "--sched-overload-factor": args.sched_overload_factor,
+        "--sched-overload-probe-seconds": args.sched_overload_probe_seconds,
+        "--sched-soak-duration": args.sched_soak_duration,
+    }
+    for name, value in positive.items():
+        if not value > 0:
+            parser.error(f"{name} must be > 0")
+    at_least_one = {
+        "--sched-ab-rounds": args.sched_ab_rounds, "--sched-stream-max-tokens": args.sched_stream_max_tokens,
+        "--sched-burst-max-tokens": args.sched_burst_max_tokens, "--sched-agents": args.sched_agents,
+        "--sched-short-max-tokens": args.sched_short_max_tokens,
+        "--sched-overload-max-tokens": args.sched_overload_max_tokens, "--sched-abort-waves": args.sched_abort_waves,
+        "--sched-soak-concurrency": args.sched_soak_concurrency,
+    }
+    for name, value in at_least_one.items():
+        if value < 1:
+            parser.error(f"{name} must be >= 1")
+    not_negative = {
+        "--sched-warmup": args.sched_warmup, "--sched-stop-after-stall": args.sched_stop_after_stall,
+        "--sched-max-running": args.sched_max_running, "--sched-streams": args.sched_streams,
+        "--sched-burst-requests": args.sched_burst_requests, "--sched-abort-requests": args.sched_abort_requests,
+        "--sched-short-baseline-seconds": args.sched_short_baseline_seconds,
+    }
+    for name, value in not_negative.items():
+        if value < 0:
+            parser.error(f"{name} must be >= 0")
+    if 0 < args.sched_stop_after_stall < args.sched_stall_seconds:
+        parser.error("--sched-stop-after-stall must be 0 or at least --sched-stall-seconds")
+    if args.sched_short_baseline_seconds <= 0 and "short-under-long" in args.scheduler_list:
+        parser.error("short-under-long needs --sched-short-baseline-seconds > 0")
 
 
 def parse_args():
@@ -20028,6 +22525,91 @@ def parse_args():
         help="Run this tool-eval-bench executable instead of installing one (offline hosts, "
              "your own install)."
     )
+    sched = parser.add_argument_group(
+        "scheduler tests",
+        "--scheduler runs load patterns that exercise the server's scheduler (admission, prefill/decode "
+        "interleaving, fairness, overload, aborts) while sampling /metrics, and gives each a PASS / FAIL / "
+        "STALLED / WEDGED verdict; exit code 2 when any fails. It is a mode of its own.",
+    )
+    sched.add_argument(
+        "--scheduler", default="",
+        help="Comma-separated scenarios, or all: " + ", ".join(SCHEDULER_SCENARIOS) + ". "
+             + " ".join(f"{name}: {text}." for name, text in SCHEDULER_SCENARIO_HELP.items())
+    )
+    sched.add_argument("--sched-duration", type=float, default=180.0,
+                       help="Measured seconds of arrivals, short-under-long and overload (default: 180)")
+    sched.add_argument("--sched-warmup", type=float, default=20.0,
+                       help="arrivals: seconds the decode streams run before the first arrival (default: 20)")
+    sched.add_argument("--sched-stall-seconds", type=float, default=90.0,
+                       help="No progress for this long with requests in flight is a stall (default: 90)")
+    sched.add_argument("--sched-stop-after-stall", type=float, default=120.0,
+                       help="Stop a scenario as WEDGED once a stall lasts this long; 0 = never (default: 120)")
+    sched.add_argument("--sched-metrics-interval", type=float, default=2.0,
+                       help="Seconds between /metrics samples (default: 2)")
+    sched.add_argument("--sched-idle-timeout", type=float, default=120.0,
+                       help="Longest wait for the server to report idle after a scenario / wave (default: 120)")
+    sched.add_argument("--sched-request-timeout", type=float, default=600.0,
+                       help="Client timeout of one request in seconds (default: 600)")
+    sched.add_argument("--sched-max-running", type=int, default=0,
+                       help="The server's running-request limit (max-num-seqs) when it cannot be detected; "
+                            "sizes the default burst, abort and probe counts")
+    sched.add_argument("--sched-seed", type=int, default=7, help="Seed of prompts, arrivals and agents (default: 7)")
+    sched.add_argument("--sched-ab-fairness", default="",
+                       help="A/B on one server: comma-separated prefill compute shares (off, auto or 0-1), "
+                            "switched live through vLLM's /prefill_fairness (needs VLLM_SERVER_DEV_MODE=1), "
+                            "e.g. off,0.4. Every scenario runs once per arm and round, ABBA order")
+    sched.add_argument("--sched-ab-rounds", type=int, default=2, help="A/B rounds (default: 2)")
+    sched.add_argument("--sched-streams", type=int, default=0,
+                       help="arrivals: background decode streams (default: max running - 1, at most 16)")
+    sched.add_argument("--sched-stream-prompt-tokens", default="512",
+                       help="arrivals: prompt tokens of a background stream (default: 512)")
+    sched.add_argument("--sched-stream-max-tokens", type=int, default=2048,
+                       help="arrivals: max_tokens of a background stream (default: 2048)")
+    sched.add_argument("--sched-arrival-context", default="32k",
+                       help="arrivals, short-under-long: prompt tokens of an arriving long prompt (default: 32k)")
+    sched.add_argument("--sched-arrival-period", type=float, default=20.0,
+                       help="arrivals, short-under-long: seconds between long prompts (default: 20)")
+    sched.add_argument("--sched-burst-requests", type=int, default=0,
+                       help="burst: requests sent at once (default: 2 x max running, 8-64)")
+    sched.add_argument("--sched-burst-context", default="30k", help="burst: prompt tokens (default: 30k)")
+    sched.add_argument("--sched-burst-max-tokens", type=int, default=32, help="burst: max_tokens (default: 32)")
+    sched.add_argument("--sched-agents", type=int, default=8, help="agents: concurrent agents (default: 8)")
+    sched.add_argument("--sched-agents-duration", type=float, default=600.0,
+                       help="agents: seconds of load (default: 600)")
+    sched.add_argument("--sched-agent-start", default="",
+                       help="agents: start context range, e.g. 40k-100k (default: 40k-100k within half the "
+                            "model length / KV pool)")
+    sched.add_argument("--sched-agent-tool", default="1k-6k", help="agents: tool-result tokens per turn (default: 1k-6k)")
+    sched.add_argument("--sched-agent-response", default="300-4000",
+                       help="agents: max_tokens per turn (default: 300-4000)")
+    sched.add_argument("--sched-agent-think", default="0-3", help="agents: think seconds between turns (default: 0-3)")
+    sched.add_argument("--sched-short-rate", type=float, default=2.0,
+                       help="short-under-long: short requests per second, Poisson (default: 2)")
+    sched.add_argument("--sched-short-prompt-tokens", default="256",
+                       help="short-under-long: prompt tokens of a short request (default: 256)")
+    sched.add_argument("--sched-short-max-tokens", type=int, default=16,
+                       help="short-under-long: max_tokens of a short request (default: 16)")
+    sched.add_argument("--sched-short-baseline-seconds", type=float, default=30.0,
+                       help="short-under-long: seconds of shorts alone before the long prompts (default: 30)")
+    sched.add_argument("--sched-overload-factor", type=float, default=2.0,
+                       help="overload: offered rate as a multiple of the measured capacity (default: 2)")
+    sched.add_argument("--sched-overload-prompt-tokens", default="2048",
+                       help="overload: prompt tokens per request (default: 2048)")
+    sched.add_argument("--sched-overload-max-tokens", type=int, default=256,
+                       help="overload: max_tokens per request (default: 256)")
+    sched.add_argument("--sched-overload-probe-seconds", type=float, default=30.0,
+                       help="overload: seconds of the closed-loop capacity probe (default: 30)")
+    sched.add_argument("--sched-abort-waves", type=int, default=3, help="abort-storm: waves (default: 3)")
+    sched.add_argument("--sched-abort-requests", type=int, default=0,
+                       help="abort-storm: requests per wave (default: 2 x max running, 8-64)")
+    sched.add_argument("--sched-abort-context", default="16k", help="abort-storm: prompt tokens (default: 16k)")
+    sched.add_argument("--sched-soak-duration", type=float, default=600.0,
+                       help="soak-mix: seconds of load (default: 600)")
+    sched.add_argument("--sched-soak-concurrency", type=int, default=8,
+                       help="soak-mix: concurrent workers (default: 8)")
+    sched.add_argument("--sched-soak-images", action="store_true",
+                       help="soak-mix: also send chat requests with 1-10 generated images (needs Pillow and "
+                            "a vision model)")
     args = parser.parse_args()
     validate_tool_eval_args(parser, args)
     if args.forced_token_id is not None:
@@ -20186,6 +22768,7 @@ def parse_args():
         parser.error("--prefill-metric must be one of: client, auto, prometheus, ttft")
     args.prefill_metric = prefill_metric
     validate_mixed_prefill_args(parser, args)
+    validate_scheduler_args(parser, args)
     return args
 
 
@@ -20230,6 +22813,19 @@ def main():
                 json.dump(output, f, indent=2, ensure_ascii=False)
                 f.write("\n")
             console.print(f"\n[green]Comparison saved to {args.output}[/green]")
+        return
+    if args.scheduler_list:
+        report, exit_code = run_scheduler_mode(args, console)
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+                f.write("\n")
+            console.print(f"\n[green]Results saved to {escape(args.output)}[/green]")
+        except OSError as exc:
+            console.print(Text(f"Cannot write {args.output}: {exc}", style=THEME_ERROR))
+            exit_code = exit_code or 1
+        if exit_code:
+            sys.exit(exit_code)
         return
     if args.tool_eval:
         report, exit_code = run_tool_eval_mode(args, console)
