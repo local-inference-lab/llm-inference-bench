@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1 - 2026-10-13
+
+### Scheduler tests: output
+
+- Progress and result lines of `--scheduler` stay on one line in a log written
+  without a terminal (they wrapped at 80 columns).
+- Whole-number values in the result lines print without decimals
+  (`max_waiting 294`, `decode_tok_s_during_prefill 397`).
+- soak-mix reports `stopped_at_end`: requests still running when the duration
+  ended, which are stopped and neither ok nor errors.
+
 ## 0.8.0 - 2026-10-13
 
 ### Scheduler tests (`--scheduler`)
