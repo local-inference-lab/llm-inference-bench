@@ -71,7 +71,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 # Bumped whenever the answer extraction / scoring rules change in a way that can
 # move a pass/fail verdict. Recorded in result metadata so old and new reports
@@ -20120,7 +20120,8 @@ class SchedulerRun:
         return (time.monotonic() if t is None else t) - self.t0
 
     def say(self, message: str) -> None:
-        self.ctx.console.print(Text(f"  {self.label}: {message}"))
+        # one line per event, also in a log without a terminal (80 columns)
+        self.ctx.console.print(Text(f"  {self.label}: {message}"), soft_wrap=True)
 
     def note(self, message: str) -> None:
         if message not in self.notes:
@@ -21215,13 +21216,15 @@ def sched_summarize_soak_mix(run: SchedulerRun) -> dict:
     for kind in sorted({r["kind"] for r in reqs}):
         part = [r for r in reqs if r["kind"] == kind]
         by_kind[kind] = {"sent": len(part), "ok": sum(1 for r in part if sched_ok(r)),
-                         "errors": sum(1 for r in part if r.get("error"))}
+                         "errors": sum(1 for r in part if r.get("error")),
+                         "stopped_at_end": sum(1 for r in part if r.get("stopped") or r.get("aborted"))}
     metrics = {
         "prompt_lengths": d["lengths"],
         "images": d["images"],
         "requests": len(reqs),
         "ok": len(ok),
         "errors": len(errors),
+        "stopped_at_end": sum(1 for r in reqs if r.get("stopped") or r.get("aborted")),
         "by_kind": by_kind,
         "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in ok),
         "completion_tokens": sum(r.get("completion_tokens") or 0 for r in ok),
@@ -21465,7 +21468,7 @@ def sched_format_value(key: str, value) -> str:
     if value is None:
         return "-"
     if isinstance(value, float):
-        if key.endswith("_ms") or key.endswith("tok_s"):
+        if key.endswith("_ms") or "tok_s" in key or value.is_integer():
             return f"{value:,.0f}"
         return f"{value:.2f}"
     return f"{value:,}" if isinstance(value, int) else str(value)
@@ -21614,7 +21617,7 @@ async def run_scheduler_suite(args, console: Console, report: dict) -> int:
                         result["fairness"] = await fairness.get() or applied.get("response")
                     results.append(result)
                     console.print(Text(f"  {name}{'' if label is None else f' [{label} r{round_index + 1}]'}: "
-                                       f"{sched_result_line(result)}"))
+                                       f"{sched_result_line(result)}"), soft_wrap=True)
                     if result["status"] == "wedged":
                         wedged_in = name
                     elif result["status"] != "skipped":
@@ -21623,7 +21626,8 @@ async def run_scheduler_suite(args, console: Console, report: dict) -> int:
                         result["settle"] = settle
                         if settle.get("checked") and not settle.get("idle"):
                             console.print(Text(f"  {name}: the server did not return to idle within "
-                                               f"{settings.idle_timeout:g} s ({settle})", style=THEME_ERROR))
+                                               f"{settings.idle_timeout:g} s ({settle})", style=THEME_ERROR),
+                                          soft_wrap=True)
         finally:
             if fairness.changed:
                 report["scheduler"]["fairness_restored"] = await fairness.restore()

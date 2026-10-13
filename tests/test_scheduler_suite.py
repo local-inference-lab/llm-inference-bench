@@ -394,6 +394,19 @@ def test_ranges_arms_and_ab_schedule():
     assert BENCH.sched_order_inversions([3.0, 2.0, 1.0]) == 1.0
 
 
+def test_result_values_and_lines_do_not_wrap(monkeypatch, make_server):
+    assert BENCH.sched_format_value("max_waiting", 294.0) == "294"
+    assert BENCH.sched_format_value("decode_tok_s_during_prefill", 1396.7) == "1,397"
+    assert BENCH.sched_format_value("ttft_p50_s", 5.538) == "5.54"
+    server = make_server(max_num_seqs=2)
+    args = parse(monkeypatch, server, "--scheduler", "burst", "--sched-burst-requests", "2",
+                 "--sched-burst-context", "1k", "--sched-burst-max-tokens", "2")
+    out = io.StringIO()
+    BENCH.run_scheduler_mode(args, Console(file=out, width=80))
+    result_lines = [line for line in out.getvalue().splitlines() if line.startswith("  burst: PASS")]
+    assert len(result_lines) == 1 and "order_inversions" in result_lines[0]
+
+
 def test_cli_validation(monkeypatch):
     def error_of(*argv):
         monkeypatch.setattr(sys, "argv", ["llm_decode_bench.py", *argv])
