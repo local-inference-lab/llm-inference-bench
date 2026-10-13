@@ -25,6 +25,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
 - **Mixed prefill + decode** — `--mixed-prefill-contexts` measures the TTFT of a long prompt that arrives while other streams decode, against the same length alone, and what its prefill costs the running streams' decode throughput
+- **Scheduler tests** — `--scheduler all` runs seven load patterns against the server's scheduler (long-prompt arrivals under decode, bursts above the slot/lane limit, KV-filling agent conversations, short requests behind long prefills, overload and drain, abort storms, a long mixed soak), samples `/metrics`, detects stalls, and exits 2 when a scenario fails; `--sched-ab-fairness off,0.4` A/Bs vLLM's prefill compute share live on one server
 - **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
 - **Dataset accuracy profiles** — pinned GSM8K (1319 items), stratified MMLU-Pro (1000 items), and GPQA Diamond (198 items) benchmarks with per-item scoring, Wilson confidence intervals, and per-category accuracy, designed to measure quantization degradation (e.g. NVFP4 w4a16 vs w4a4)
 - **Paired A/B comparison** — `--compare-baseline` pairs two runs per item and reports accuracy delta, correct/wrong flips, exact McNemar significance, per-category deltas, and completion-token inflation
@@ -73,6 +74,15 @@ python3 llm_decode_bench.py --port 5001 \
 # 8 streams decode (TTFT alone vs under load, background tok/s around it)
 python3 llm_decode_bench.py --port 8000 --mixed-only \
     --mixed-prefill-contexts 32k,128k --display-mode plain
+
+# Scheduler tests: all seven scenarios with a PASS/FAIL verdict per scenario
+# (exit code 2 on a failure, stall or wedge)
+python3 llm_decode_bench.py --port 8000 --scheduler all
+
+# A/B of vLLM's prefill compute share on one server (VLLM_SERVER_DEV_MODE=1),
+# arms switched live and interleaved off, 0.4, 0.4, off, ...
+python3 llm_decode_bench.py --port 8000 --scheduler arrivals,short-under-long \
+    --sched-ab-fairness off,0.4 --sched-ab-rounds 3
 
 # Burst / E2E-only mode: exactly N measured requests per cell
 python3 llm_decode_bench.py --port 5001 --skip-prefill \
@@ -184,6 +194,7 @@ python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval \
 | `--mixed-window-seconds` | `10` | Background throughput window before the prompt and after its first token; the background keeps running this long after the first token |
 | `--mixed-arrival-max-tokens` | `16` | `max_tokens` of the long prompt, alone and under load |
 | `--mixed-only` | `false` | Run only the mixed phase: no prefill rows, no sustained decode matrix (implies `--skip-prefill`) |
+| `--scheduler` | | Scheduler tests (a mode of its own): comma-separated scenarios or `all`. Options `--sched-*`. See [Scheduler Tests](#scheduler-tests) |
 | `--request-count` | `0` | Burst / E2E-only mode: measured requests per cell. `0` keeps Sustained Decode as the primary mode |
 | `--warmup-request-count` | `0` | Warmup requests to discard before each `--request-count` cell |
 | `--run-burst` | `false` | After sustained decode, run an additional short Burst / E2E matrix |
@@ -538,6 +549,120 @@ tok/s. Press `s` to skip the running context.
 (Abridged; numbers from a stub server, not a GPU.) Window times are seconds
 relative to the arrival's send. `timeline` holds the background tok/s in 1 s
 bins over the whole background run, for plotting the dip.
+
+### Scheduler Tests
+
+`--scheduler` is a mode of its own: it runs load patterns that exercise the
+serving engine's scheduler from the outside (admission, prefill/decode
+interleaving, fairness, queueing, aborts) and gives every scenario a verdict.
+It works against vLLM and SGLang, and against any OpenAI-compatible endpoint
+with fewer server-side numbers.
+
+```bash
+# everything, with the defaults (35-40 minutes)
+python3 llm_decode_bench.py --port 8000 --scheduler all --output sched.json
+
+# quick regression gate
+python3 llm_decode_bench.py --port 8000 --scheduler burst,abort-storm,overload --sched-duration 60
+```
+
+| Scenario | What it does | What it checks / reports | Caught before |
+|----------|--------------|--------------------------|---------------|
+| `arrivals` | `--sched-streams` (max running − 1, ≤ 16) streams decode continuously; after `--sched-warmup` a unique `--sched-arrival-context` (32k) prompt arrives every `--sched-arrival-period` (20 s) for `--sched-duration` (180 s) | decode tok/s inside / outside the arrivals' prefill windows (`decode_kept`), gaps between streamed chunks p50/p99/max, arrival TTFT | the prefill compute share A/B on GLM-5.3 (decode during a prefill 61 → ~410 tok/s, arrival TTFT 4.4 → 8.9 s) |
+| `burst` | `--sched-burst-requests` (2 × max running, 8–64) prompts of `--sched-burst-context` (30k) sent at once | every request must finish; TTFT in send order, order inversions (0 = FCFS), wall time | the parallel-prefill lane deadlock (LIL vLLM #959): with `--max-num-seqs 4 --max-parallel-prefills 2`, 8 × 31.5k prompts finished 0/8 in 600 s before the fix, 8/8 in 20 s after |
+| `agents` | `--sched-agents` (8) agents with token-ID conversations starting at 40k–100k tokens, + 300–4000 response and 1k–6k tool tokens per turn, 0–3 s think, for `--sched-agents-duration` (600 s); contexts outgrow the KV pool | every turn must succeed; per-minute rows: turns, turn time, TTFT, tok/s, running, waiting, KV %, preemptions, prefix-cache hit % | the restore-admission stall (LIL vLLM #946): GLM-5.3-Flash with LMCache, 3.8 GB KV pool, `--max-num-seqs 4`: requests running, KV ~98 %, all token counters frozen |
+| `short-under-long` | Poisson shorts (`--sched-short-rate` 2/s, 256-token prompts, 16 tokens) alone for `--sched-short-baseline-seconds` (30 s), then with long prompts arriving as in `arrivals` | short TTFT baseline vs under load vs while a long prompt prefills (`slowdown_p99`) | head-of-line blocking of short requests behind long prefills |
+| `overload` | closed-loop probe at max running for `--sched-overload-probe-seconds` (30 s) → capacity in req/s; open-loop Poisson at `--sched-overload-factor` (2) × capacity for `--sched-duration`; then a drain | no timeouts / transport errors (HTTP rejections are counted), server drains to idle, probe request after the drain; queue depth, waiting by reason, TTFT growth by thirds | — |
+| `abort-storm` | `--sched-abort-waves` (3) waves of `--sched-abort-requests` (2 × max running, 8–64) `--sched-abort-context` (16k) prompts: a third cancelled after 0.05–2 s, a third after 1–64 tokens, a third completes | server idle after every wave within `--sched-idle-timeout`, the completing third finishes, probe after the storm succeeds | cancel / abort leaks (requests that stay running or keep KV after the client is gone) |
+| `soak-mix` | `--sched-soak-concurrency` (8) workers for `--sched-soak-duration` (600 s): 1k–160k token prompts with 64–1024 output tokens; `--sched-soak-images` adds chat requests with 1–10 JPEGs up to 6000×4000 (needs Pillow and a vision model) | no request fails, no stall | — |
+
+**Verdicts.** `PASS`; `FAIL` (a check failed, listed in the report);
+`STALLED` (requests were in flight, or running/waiting on the server, but for
+`--sched-stall-seconds` (90 s) no token was streamed, no request finished and
+none of the server's prompt / generation token counters, finished-request
+counter, prefill backlog or compute-seconds counters moved); `WEDGED` (a
+stall that lasted `--sched-stop-after-stall` (120 s): the scenario is stopped
+and the remaining ones are skipped, because the server needs a restart);
+`SKIPPED` (does not fit the server, with the reason); `ERROR`. The exit code
+is 0 when nothing failed, 2 when any scenario is FAIL / STALLED / WEDGED /
+ERROR, 1 when the run could not start. A stall threshold must be longer than
+the longest single prefill the server needs, so raise `--sched-stall-seconds`
+for very long prompts on slow servers.
+
+**Sizing.** Scenarios size themselves from the server: `max_model_len` from
+`/v1/models`, the KV pool from `vllm:cache_config_info` (or SGLang's
+`max_total_num_tokens`), and the running-request limit from SGLang's
+`/get_server_info` or the `--max-num-seqs` of a local vLLM process on that port
+(vLLM's default 256 when the command line has none). For a remote vLLM pass
+`--sched-max-running`. Prompts that do not fit are capped, with a note.
+
+**Prompts.** Every prompt is a unique random sequence of token IDs taken from
+the server's own tokenization of ordinary text (`POST /tokenize`) and sent to
+`/v1/completions`, so lengths are exact and nothing hits the prefix cache
+unless a scenario reuses a prefix on purpose (agents). Servers without
+`/tokenize` get unique padding text. Requests stream with
+`continuous_usage_stats` and `ignore_eos`; `--temperature` applies.
+
+**A/B on one server.** Two servers of the same build differ a lot from each
+other (a scheduler change can drown in replica noise), so
+`--sched-ab-fairness off,0.4` switches vLLM's prefill compute share on the
+running server through its dev endpoint `/prefill_fairness` (start the server
+with `VLLM_SERVER_DEV_MODE=1`; arms are `off`, `auto` or a share in (0, 1)).
+Every scenario runs once per arm and round in ABBA order
+(`--sched-ab-rounds`, 2), the endpoint's state is recorded with every run, the
+original policy is restored at the end, and the report adds a table per
+scenario with every headline metric per arm (mean and min–max over rounds).
+
+**Reproducing the known bugs.** Lane deadlock: start vLLM with
+`--max-num-seqs 4 --max-parallel-prefills 2` and run
+`--scheduler burst --sched-burst-requests 8 --sched-burst-context 31k`; a build
+without the fix ends WEDGED. Restore stall: GLM-5.3-Flash with LMCache, a
+3.8 GB KV pool (`--kv-cache-memory-bytes 3800000000`) and `--max-num-seqs 4`,
+then `--scheduler agents --sched-agents 12 --sched-agents-duration 1800`.
+
+Other options: `--sched-metrics-interval` (2 s), `--sched-request-timeout`
+(600 s), `--sched-seed` (7), `--sched-stream-prompt-tokens` (512),
+`--sched-stream-max-tokens` (2048), `--sched-burst-max-tokens` (32),
+`--sched-agent-start`, `--sched-agent-tool`, `--sched-agent-response`,
+`--sched-agent-think` (ranges such as `40k-100k`), `--sched-short-prompt-tokens`,
+`--sched-short-max-tokens`, `--sched-overload-prompt-tokens` (2048),
+`--sched-overload-max-tokens` (256). `python3 llm_decode_bench.py --help` lists
+them all.
+
+The console prints a progress line every 15 s per scenario (client requests in
+flight, server running / waiting, KV %, generation tok/s) and a result line per
+scenario, then a summary table. `--output` gets:
+
+```json
+{
+  "metadata": {"mode": "scheduler", "version": "0.8.0", "settings": {...}, "argv": [...]},
+  "server": {"engine": "vllm", "max_model_len": 202752, "kv_tokens": 1048576, "max_running": 16,
+             "max_running_source": "server command line", "prompt_mode": "token_ids",
+             "prefill_fairness": {"prefill_compute_share": 0.4, "max_parallel_prefills": 2, ...},
+             "local_command": {"options": {"max-num-seqs": "16", ...}}},
+  "scheduler": {
+    "verdict": "pass",
+    "scenarios": [{
+      "scenario": "burst", "arm": null, "status": "pass", "elapsed_s": 41.2,
+      "checks": [{"check": "every request finished", "ok": true, "detail": "16/16 completed, ..."}],
+      "headline": {"completed": 16, "wall_s": 38.9, "ttft_p50_s": 12.1, ...},
+      "metrics": {...},
+      "server": {"max_running": 16, "max_waiting": 0, "max_kv_usage_pct": 61.0, "preemptions": 0,
+                 "prefix_hit_pct": 0.0, "histograms": {"ttft": {"count": 16, "p50_s": 11.8, ...},
+                 "queue_time": {...}}},
+      "stalls": [], "client": {...}, "notes": [], "timeseries": [{"t": 0.0, "running": 0, ...}, ...]
+    }],
+    "ab": {}
+  },
+  "methodology": {"common": "...", "burst": "..."}
+}
+```
+
+`timeseries` holds every `/metrics` sample of the scenario (running, waiting,
+waiting by reason, KV usage, token and preemption counters, prefix-cache
+counters, the prefill compute share and backlog of the LIL scheduler); the
+`server.histograms` entries are the server's own TTFT, queue-time, prefill-time,
+inter-token-latency and end-to-end histograms over the scenario.
 
 ### Completion-Token Statistics
 
