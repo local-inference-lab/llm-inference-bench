@@ -4,7 +4,7 @@ LLM inference decode throughput benchmark with a Rich TUI dashboard.
 
 Measures token generation speed across a matrix of **concurrency levels** and **context lengths**, giving you a full picture of how your serving engine scales under load.
 
-Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-compatible API (OpenRouter, Together AI, etc.).
+Supports **SGLang**, **vLLM**, and **Flare** engines (auto-detected). Works with any OpenAI-compatible API (OpenRouter, Together AI, etc.).
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)
 
@@ -16,7 +16,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Three benchmark layers** — prefill, sustained decode, and optional Burst / E2E decode
 - **Two decode entry points** — default duration-based Sustained Decode, plus request-count `--request-count` Burst / E2E-only mode
 - **Inline client latency detail** — aggregate decode cells can show `tok/s + TTFT/ITL` when there is enough terminal width
-- **Server-side validation** — optionally scrapes Prometheus `/metrics` for vLLM/SGLang validation, queue, KV, and scheduler signals
+- **Server-side validation** — optionally scrapes Prometheus `/metrics` for vLLM, SGLang, and Flare validation, queue, KV, and scheduler signals
 - **Live TUI dashboard** — adaptive Rich layout with compact modes for narrower terminals
 - **Decode loop guard** — detects sustained exact repetition in reasoning and content by default; invalid cells show an error instead of throughput
 - **Interactive output preview** — press `o` to view a request's output, Space to freeze the preview, PageUp/PageDown to browse, and End to return to live scrolling
@@ -34,7 +34,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
 - **JSON output** — structured results saved to `benchmark_results.json` for further analysis
 - **Smart test skipping** — reads KV cache budget from the server, automatically skips over-capacity cells
-- **Engine auto-detection** — automatically detects SGLang vs vLLM and adapts metric scraping
+- **Engine auto-detection** — automatically detects SGLang, vLLM, or Flare and adapts metric scraping
 - **Auto-update** — checks GitHub for new versions on startup, offers one-click upgrade
 
 ## Installation
@@ -338,7 +338,7 @@ runs for `--duration` seconds after its own readiness warmup and keeps the
 requested concurrency saturated by restarting streams as they finish.
 
 Aggregate decode throughput uses OpenAI stream usage by default. For local
-vLLM/SGLang this is exact when `continuous_usage_stats` is supported, because
+vLLM, SGLang, and Flare this is exact when `continuous_usage_stats` is supported, because
 the stream exposes cumulative `completion_tokens` during the measured window.
 Prometheus generation counters are still collected as validation and for
 scheduler/effective-concurrency state, but they are not the default headline
@@ -350,6 +350,36 @@ Prometheus `/metrics` is optional. If SGLang is started without
 prints a visible warning and continues with OpenAI stream metrics. In that mode,
 scheduler/effective-concurrency, KV auto-detection from metrics, and Prometheus
 validation fields are unavailable.
+
+Flare metrics support applies to the decode throughput benchmark. The separate
+`--scheduler` suite uses its generic OpenAI client fallback for Flare and does
+not collect Flare scheduler counters.
+
+Flare metrics provide active and queued requests, committed generation tokens,
+computed prefill tokens, and logical KV capacity. `flare_total_kv_tokens` already
+accounts for compressed storage and describes the pool on each tensor-parallel
+rank; the benchmark does not multiply it by rank count or physical page size.
+The scheduler drain check also waits for retiring slots, HTTP admission slots,
+and frontend workers before starting another cell.
+
+Flare speculation statistics keep two scopes separate. Acceptance length is
+`1 + accepted_draft_tokens / draft_request_rounds`, using progressing live
+request counters. Acceptance rate uses raw accepted/offered graph-record drafts,
+which can include work from cancelled lanes. Per-cell `server_flare_metrics`
+contains the counter deltas, verification and proposal graph counts and GPU
+times, raw emitted/offered/accepted counts, embedding cache hits and misses,
+and exposed embedding readiness time. Counter resets or changes in available
+counters invalidate this diagnostic window. Batched graph counts include
+padded lanes and terminal no-ops, so Flare does not populate acceptance-normalized
+step rates. Its offered-draft count for progressing live requests is unavailable
+(`server_spec_draft_tokens: null`); raw offered drafts remain in
+`server_flare_metrics.counter_delta.raw_offered_drafts`.
+
+Flare's committed generation count includes EOS and tokens withheld by text
+stops, so it can differ from client-visible output. Client usage remains the
+headline throughput source. Flare does not expose the prefill-duration histogram
+used by the server-side prefill calculation; prefill throughput therefore uses
+client time to first token rather than substituting total GPU time.
 
 Use this section as the main tuning/regression signal for kernels, NCCL, DCP,
 MTP, scheduler, and KV-cache changes. It answers: "How much decode throughput

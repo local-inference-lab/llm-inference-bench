@@ -3,7 +3,7 @@
 LLM Inference Benchmark with Rich TUI Dashboard.
 
 Measures decode throughput across a matrix of concurrency levels and context lengths.
-Auto-detects SGLang or vLLM engine and adapts metrics accordingly.
+Auto-detects SGLang, vLLM, or Flare and adapts metrics accordingly.
 
 Usage:
     python3 llm_decode_bench.py
@@ -4601,12 +4601,13 @@ BUILTIN_TEST_PROFILE_ALIASES = {
     "checksum-3332": "needle-checksum",
 }
 
-METRIC_RE = re.compile(r'^((?:sglang|vllm):\w+)(?:\{([^}]*)\})?\s+([\d.eE+-]+)')
+METRIC_RE = re.compile(r'^((?:(?:sglang|vllm):|flare_)\w+)(?:\{([^}]*)\})?\s+([\d.eE+-]+)')
 
 # Engine types
 ENGINE_SGLANG = "sglang"
 ENGINE_VLLM = "vllm"
 ENGINE_OPENAI_PROXY = "openai_proxy"
+ENGINE_FLARE = "flare"
 
 
 # ---------------------------------------------------------------------------
@@ -4700,9 +4701,10 @@ class CellResult:
     # aggregate_tps = server_steps_per_s * server_accept_len_effective, so
     # steps/s is the run-comparable engine speed with acceptance divided out.
     server_spec_drafts: int = 0
-    server_spec_draft_tokens: int = 0
+    server_spec_draft_tokens: int | None = 0
     server_spec_accepted_tokens: int = 0
     server_spec_pos_accept: list = field(default_factory=list)
+    server_flare_metrics: dict = field(default_factory=dict)
     server_engine_steps: float = 0.0
     server_steps_per_s: float = 0.0
     server_accept_len_effective: float = 0.0
@@ -9076,7 +9078,7 @@ def render_live_stats_panel(state: TUIState) -> Panel:
             f"[dim]spec[/dim] accept={state.srv_spec_accept_rate:.1%} "
             f"len={state.srv_spec_accept_length:.2f}"
         )
-        if state.srv_spec_accept_length > 1.0 and state.cell_live_tps > 0:
+        if state.engine != ENGINE_FLARE and state.srv_spec_accept_length > 1.0 and state.cell_live_tps > 0:
             spec_row += f" norm={state.cell_live_tps / state.srv_spec_accept_length:.1f} step/s"
         rows.append(spec_row)
     if state.cell_tps_history:
@@ -9257,7 +9259,7 @@ def extract_metric(metrics: dict, name: str, label_filter: str = "") -> float:
     if not name:
         return 0.0
     for key, val in metrics.items():
-        if key.startswith(name):
+        if key.partition("|")[0] == name:
             if label_filter and label_filter not in key:
                 continue
             return val
@@ -9269,7 +9271,7 @@ def sum_metric(metrics: dict, name: str, label_filter: str = "") -> float:
         return 0.0
     total = 0.0
     for key, val in metrics.items():
-        if not key.startswith(name):
+        if key.partition("|")[0] != name:
             continue
         if label_filter and label_filter not in key:
             continue
@@ -9281,7 +9283,7 @@ def has_metric(metrics: dict, name: str, label_filter: str = "") -> bool:
     if not name:
         return False
     for key in metrics:
-        if not key.startswith(name):
+        if key.partition("|")[0] != name:
             continue
         if label_filter and label_filter not in key:
             continue
@@ -9292,8 +9294,8 @@ def has_metric(metrics: dict, name: str, label_filter: str = "") -> bool:
 def extract_label(metrics: dict, metric_name: str, label: str) -> str:
     """Extract a label value from a labeled Prometheus metric."""
     for key in metrics:
-        if key.startswith(metric_name):
-            m = re.search(rf'{label}="([^"]*)"', key)
+        if key.partition("|")[0] == metric_name:
+            m = re.search(rf'(?:\||,){re.escape(label)}="([^"]*)"', key)
             if m:
                 return m.group(1)
     return ""
@@ -9420,15 +9422,75 @@ def metric_name(engine: str, key: str) -> str:
             "prefill_kv_computed_tokens": "vllm:request_prefill_kv_computed_tokens_sum",
         },
         ENGINE_OPENAI_PROXY: {},
+        ENGINE_FLARE: {
+            "running_reqs": "flare_active_requests",
+            "queue_reqs": "flare_pending_requests",
+            "gen_tokens_total": "flare_generated_tokens_total",
+            "prompt_tokens_total": "flare_prefill_tokens_total",
+            "request_success_total": "flare_requests_completed_total",
+            "spec_drafts_total": "flare_draft_request_rounds_total",
+            "spec_accepted_tokens_total": "flare_accepted_draft_tokens_total",
+        },
     }
     return names.get(engine, {}).get(key, "")
 
 
 SPEC_POS_METRIC = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
 
+FLARE_COUNTERS = {
+    "generated_tokens": "flare_generated_tokens_total",
+    "prefill_tokens": "flare_prefill_tokens_total",
+    "draft_request_rounds": "flare_draft_request_rounds_total",
+    "accepted_draft_tokens": "flare_accepted_draft_tokens_total",
+    "verification_graphs": "flare_speculative_rounds_total",
+    "verification_gpu_nanoseconds": "flare_speculative_gpu_nanoseconds_total",
+    "raw_emitted_tokens": "flare_speculative_emitted_tokens_total",
+    "raw_offered_drafts": "flare_speculative_offered_drafts_total",
+    "raw_accepted_drafts": "flare_speculative_accepted_drafts_total",
+    "proposal_graphs": "flare_proposal_rounds_total",
+    "proposal_gpu_nanoseconds": "flare_proposal_gpu_nanoseconds_total",
+    "embedding_cache_hits": "flare_engram_row_cache_hits_total",
+    "embedding_cache_misses": "flare_engram_row_cache_misses_total",
+    "embedding_cache_evictions": "flare_engram_row_cache_evictions_total",
+    "embedding_readiness_nanoseconds": "flare_replay_readiness_wait_nanoseconds_total",
+}
+
+
+def flare_metric_delta(before: dict, after: dict) -> dict:
+    """Keep committed request work distinct from padded/cancelled graph records."""
+    if not before or not after:
+        return {}
+    start, end = before.get("counters", {}), after.get("counters", {})
+    if start.keys() != end.keys():
+        return {"valid": False, "reason": "Flare counter availability changed"}
+    delta = {key: end[key] - start[key] for key in start}
+    if any(value < 0 for value in delta.values()):
+        return {"valid": False, "reason": "Flare counters reset during measurement"}
+    seconds = after["sample_time"] - before["sample_time"]
+    if seconds <= 0:
+        return {"valid": False, "reason": "Flare measurement interval is not positive"}
+    result = {"valid": True, "measurement_seconds": seconds, "counter_delta": delta}
+    rounds = delta.get("draft_request_rounds", 0)
+    if rounds and "accepted_draft_tokens" in delta:
+        result["request_acceptance_length"] = 1 + delta["accepted_draft_tokens"] / rounds
+    offered = delta.get("raw_offered_drafts", 0)
+    if offered and "raw_accepted_drafts" in delta:
+        result["raw_draft_acceptance"] = delta["raw_accepted_drafts"] / offered
+    if "verification_graphs" in delta:
+        result["verification_graphs_per_second"] = delta["verification_graphs"] / seconds
+    # Graph counts include padded lanes and terminal no-ops. They cannot supply
+    # vLLM's per-request engine-step denominator for acceptance-normalized TPS.
+    return result
+
 
 def snapshot_spec_counters(metrics: dict, engine: str) -> dict:
     """Snapshot cumulative speculative-decoding counters at a window edge."""
+    if engine == ENGINE_FLARE:
+        if not has_metric(metrics, "flare_generated_tokens_total"):
+            return {}
+        return {"engine": ENGINE_FLARE, "sample_time": time.monotonic(),
+                "counters": {key: sum_metric(metrics, name) for key, name in FLARE_COUNTERS.items()
+                             if has_metric(metrics, name)}}
     if engine != ENGINE_VLLM or not metrics:
         return {}
     if not has_metric(metrics, metric_name(engine, "spec_drafts_total")):
@@ -9467,6 +9529,8 @@ def compute_spec_normalization(
     """
     if not spec_start or not spec_end:
         return {}
+    if spec_start.get("engine") == ENGINE_FLARE or spec_end.get("engine") == ENGINE_FLARE:
+        return {"flare": flare_metric_delta(spec_start, spec_end)}
     d_drafts = spec_end.get("drafts", 0.0) - spec_start.get("drafts", 0.0)
     d_draft_tokens = spec_end.get("draft_tokens", 0.0) - spec_start.get("draft_tokens", 0.0)
     d_accepted = spec_end.get("accepted_tokens", 0.0) - spec_start.get("accepted_tokens", 0.0)
@@ -9528,8 +9592,25 @@ def apply_spec_normalization(
     throughput and acceptance gauges, so its verifier rate is the median of
     their per-snapshot quotients. The final gauge remains a last-resort fallback
     when a measurement is too short to collect a matched snapshot.
+    Flare retains request acceptance and raw graph counters separately; graph
+    counts do not provide a per-request normalization denominator.
     """
-    if norm:
+    if engine == ENGINE_FLARE:
+        cell.server_flare_metrics = norm.get("flare") or {
+            "valid": False, "reason": "Flare window-edge counters are unavailable"
+        }
+        cell.server_spec_accept_rate = 0.0
+        cell.server_spec_accept_length = 0.0
+        # Flare does not expose offered drafts restricted to progressing live
+        # request lanes. The raw offered count has a separate scope below.
+        cell.server_spec_draft_tokens = None
+        if cell.server_flare_metrics.get("valid"):
+            counters = cell.server_flare_metrics["counter_delta"]
+            cell.server_spec_drafts = int(counters.get("draft_request_rounds", 0))
+            cell.server_spec_accepted_tokens = int(counters.get("accepted_draft_tokens", 0))
+            cell.server_spec_accept_length = norm["flare"].get("request_acceptance_length", 0.0)
+            cell.server_spec_accept_rate = norm["flare"].get("raw_draft_acceptance", 0.0)
+    elif norm:
         cell.server_spec_drafts = norm["drafts"]
         cell.server_spec_draft_tokens = norm["draft_tokens"]
         cell.server_spec_accepted_tokens = norm["accepted_tokens"]
@@ -9867,8 +9948,26 @@ async def require_decode_server_idle(
     therefore must report zero running and queued requests before measurement
     continues.
     """
-    if not state.metrics_available or engine not in (ENGINE_SGLANG, ENGINE_VLLM):
+    if not state.metrics_available or engine not in (ENGINE_SGLANG, ENGINE_VLLM, ENGINE_FLARE):
         return
+
+    if engine == ENGINE_FLARE:
+        names = ("flare_active_requests", "flare_pending_requests", "flare_retiring_request_slots",
+                 "flare_http_inflight_requests", "flare_frontend_active_workers")
+        deadline = time.monotonic() + timeout_seconds
+        idle_since = None
+        while True:
+            metrics = await scrape_metrics(client, base_url)
+            if any(not has_metric(metrics, name) for name in names):
+                raise RuntimeError(f"Flare scheduler isolation metrics are unavailable {boundary}")
+            busy = {name: extract_metric(metrics, name) for name in names if extract_metric(metrics, name) != 0}
+            now = time.monotonic()
+            idle_since = (idle_since if idle_since is not None else now) if not busy else None
+            if idle_since is not None and now - idle_since >= 0.5:
+                return
+            if now >= deadline:
+                raise RuntimeError(f"Flare scheduler did not drain {boundary}: {busy}")
+            await asyncio.sleep(0.1)
 
     metrics = await scrape_metrics(client, base_url)
     running_name = metric_name(engine, "running_reqs")
@@ -10927,7 +11026,7 @@ async def run_one_cell(
         start_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
         measurement_gen_tokens_start = (
             extract_metric(start_metrics, metric_name(engine, "gen_tokens_total"))
-            if engine == ENGINE_VLLM else None
+            if engine in (ENGINE_VLLM, ENGINE_FLARE) else None
         )
         measurement_spec_start = snapshot_spec_counters(start_metrics, engine)
         measurement_start = time.monotonic()
@@ -10945,6 +11044,7 @@ async def run_one_cell(
         prev_spec_drafts = None
         prev_spec_draft_tokens = None
         prev_spec_accepted_tokens = None
+        prev_flare_snapshot = {}
 
         batch_cancel = asyncio.Event()
         batch_tokens = [0]
@@ -11012,6 +11112,12 @@ async def run_one_cell(
                 if engine == ENGINE_SGLANG:
                     state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
                     state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
+                elif engine == ENGINE_FLARE:
+                    flare_snapshot = snapshot_spec_counters(metrics, engine)
+                    flare_delta = flare_metric_delta(prev_flare_snapshot, flare_snapshot)
+                    state.srv_spec_accept_rate = flare_delta.get("raw_draft_acceptance", 0.0)
+                    state.srv_spec_accept_length = flare_delta.get("request_acceptance_length", 0.0)
+                    prev_flare_snapshot = flare_snapshot
                 elif engine == ENGINE_VLLM:
                     drafts_total = extract_metric(metrics, metric_name(engine, "spec_drafts_total"))
                     draft_tokens_total = extract_metric(metrics, metric_name(engine, "spec_draft_tokens_total"))
@@ -11099,7 +11205,7 @@ async def run_one_cell(
 
         metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
         exact_server_tokens = 0
-        if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
+        if engine in (ENGINE_VLLM, ENGINE_FLARE) and measurement_gen_tokens_start is not None:
             measurement_gen_tokens_end = extract_metric(metrics, metric_name(engine, "gen_tokens_total"))
             exact_server_tokens = max(
                 0,
@@ -11285,6 +11391,7 @@ async def run_one_cell(
     prev_spec_drafts = None
     prev_spec_draft_tokens = None
     prev_spec_accepted_tokens = None
+    prev_flare_snapshot = {}
     # Queue tracking: collect running/queue samples after warmup
     running_reqs_samples = []
     queue_reqs_samples = []
@@ -11351,6 +11458,12 @@ async def run_one_cell(
             if engine == ENGINE_SGLANG:
                 state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
                 state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
+            elif engine == ENGINE_FLARE:
+                flare_snapshot = snapshot_spec_counters(metrics, engine)
+                flare_delta = flare_metric_delta(prev_flare_snapshot, flare_snapshot)
+                state.srv_spec_accept_rate = flare_delta.get("raw_draft_acceptance", 0.0)
+                state.srv_spec_accept_length = flare_delta.get("request_acceptance_length", 0.0)
+                prev_flare_snapshot = flare_snapshot
             elif engine == ENGINE_VLLM:
                 drafts_total = extract_metric(metrics, metric_name(engine, "spec_drafts_total"))
                 draft_tokens_total = extract_metric(metrics, metric_name(engine, "spec_draft_tokens_total"))
@@ -11389,7 +11502,7 @@ async def run_one_cell(
                         and state.srv_queue_reqs == 0
                         and generating
                     )
-                    if engine not in (ENGINE_SGLANG, ENGINE_VLLM):
+                    if engine not in (ENGINE_SGLANG, ENGINE_VLLM, ENGINE_FLARE):
                         full_concurrency_running = all_streams_active
                     all_streams_have_tokens = shared_active_streams[0] >= concurrency
                     if not state.metrics_available:
@@ -11432,7 +11545,7 @@ async def run_one_cell(
                             )
                             measurement_tokens_start = shared_token_count[0]
                             measurement_usage_tokens_start = shared_usage_token_count[0]
-                            if engine == ENGINE_VLLM:
+                            if engine in (ENGINE_VLLM, ENGINE_FLARE):
                                 measurement_gen_tokens_start = extract_metric(
                                     metrics, metric_name(engine, "gen_tokens_total")
                                 )
@@ -11469,7 +11582,7 @@ async def run_one_cell(
                         )
                         measurement_tokens_start = shared_token_count[0]
                         measurement_usage_tokens_start = shared_usage_token_count[0]
-                        if engine == ENGINE_VLLM:
+                        if engine in (ENGINE_VLLM, ENGINE_FLARE):
                             measurement_gen_tokens_start = extract_metric(
                                 metrics, metric_name(engine, "gen_tokens_total")
                             )
@@ -11533,7 +11646,7 @@ async def run_one_cell(
             measurement_end = now
             measurement_wall_end = now
             cancel_event.set()
-            if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
+            if engine in (ENGINE_VLLM, ENGINE_FLARE) and measurement_gen_tokens_start is not None:
                 end_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
                 measurement_gen_tokens_end = extract_metric(
                     end_metrics, metric_name(engine, "gen_tokens_total")
@@ -11615,13 +11728,12 @@ async def run_one_cell(
     if final_gen_throughput > 0:
         gen_throughput_samples.append(final_gen_throughput)
 
-    # Use an exact vLLM generation_tokens_total delta over the measured window
-    # as the primary decode metric. The previous implementation used the median
-    # of 1s counter rates, which is robust for display but can bias short runs.
+    # Validate client throughput with committed generation-counter deltas over
+    # the measured window. Median scrape rates can bias short measurements.
     exact_server_tokens = 0
     exact_server_throughput = 0.0
     if (
-        engine == ENGINE_VLLM
+        engine in (ENGINE_VLLM, ENGINE_FLARE)
         and measurement_gen_tokens_start is not None
         and measurement_gen_tokens_end is not None
         and measurement_gen_end_time is not None
@@ -12071,7 +12183,7 @@ def build_display(state: TUIState) -> Layout:
     if state.metrics_available and (state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0):
         srv_table.add_row("spec_accept_rate", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_rate:.2%}[/{PHOSPHOR_SOFT}]")
         srv_table.add_row("spec_accept_len", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_length:.2f}[/{PHOSPHOR_SOFT}]")
-        if state.srv_spec_accept_length > 1.0 and state.cell_live_tps > 0:
+        if state.engine != ENGINE_FLARE and state.srv_spec_accept_length > 1.0 and state.cell_live_tps > 0:
             srv_table.add_row(
                 "norm_steps/s",
                 f"[{PHOSPHOR_SOFT}]{state.cell_live_tps / state.srv_spec_accept_length:.1f}[/{PHOSPHOR_SOFT}]",
@@ -15388,7 +15500,7 @@ async def run_benchmark(args):
                 server_context_length = model_data[0].get("max_model_len", 0) or 0
         except Exception as e:
             console.print(f"[red]Cannot connect to server at {base_url}: {e}[/red]")
-            console.print("Make sure SGLang or vLLM is running and the port is correct.")
+            console.print("Make sure SGLang, vLLM, or Flare is running and the port is correct.")
             return [], [], {}, engine
 
         # Detect engine: try SGLang's /get_server_info first, then vLLM's /version
@@ -15478,10 +15590,14 @@ async def run_benchmark(args):
                         engine = ENGINE_SGLANG
                         console.print(f"[green]Engine: SGLang (detected from metrics)[/green]  Models: {model_ids}")
                         remember_startup(f"engine SGLang from metrics models={model_ids}")
+                    elif resp.status_code < 400 and re.search(r"(?m)^flare_active_requests(?:\{|\s)", resp.text):
+                        engine = ENGINE_FLARE
+                        console.print(f"[green]Engine: Flare (detected from metrics)[/green]  Models: {model_ids}")
+                        remember_startup(f"engine Flare from metrics models={model_ids}")
                     else:
                         engine = ENGINE_OPENAI_PROXY
                         metrics_available = False
-                        reason = f"HTTP {resp.status_code}" if resp.status_code >= 400 else "no vllm:/sglang: metrics"
+                        reason = f"HTTP {resp.status_code}" if resp.status_code >= 400 else "no vllm:/sglang:/flare_ metrics"
                         metrics_warning = (
                             f"Only OpenAI /v1 endpoints appear reachable ({reason} on /metrics); "
                             "engine-specific probes and Prometheus diagnostics are disabled. "
@@ -15602,6 +15718,17 @@ async def run_benchmark(args):
                     "WARNING: vLLM KV cache budget not available from metrics; "
                     "use --kv-budget for exact capacity skips"
                 )
+
+        if engine == ENGINE_FLARE and metrics_available:
+            metrics = await scrape_metrics(check_client, base_url)
+            if args.max_total_tokens == 0:
+                # Already logical capacity, including compressed storage, per TP rank.
+                # Multiplying by ranks or by a physical page size overstates capacity.
+                args.max_total_tokens = int(extract_metric(metrics, "flare_total_kv_tokens"))
+                if args.max_total_tokens > 0:
+                    console.print(f"[cyan]KV cache budget (Flare metrics):[/cyan] {args.max_total_tokens:,} tokens")
+                    remember_startup(f"KV cache budget from Flare metrics: {args.max_total_tokens:,} logical tokens")
+            max_running = int(extract_metric(metrics, "flare_http_request_capacity")) or None
 
         # Handle max_running_requests
         if max_running:
@@ -17668,7 +17795,9 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
                     "mixes engine speed with data-dependent acceptance. steps_per_s (target-model "
                     "forward passes per second) is the acceptance-independent speed used to compare "
                     "runs; server_spec_pos_accept holds per-draft-position acceptance probabilities. "
-                    "Counters are vLLM window deltas; SGLang falls back to its lifetime accept-length gauge."
+                    "vLLM uses window deltas and SGLang uses matched throughput/acceptance gauges. "
+                    "Flare reports logical request acceptance and raw graph counters separately in "
+                    "server_flare_metrics; graph counts do not supply a per-request step denominator."
                 ),
             },
         },
