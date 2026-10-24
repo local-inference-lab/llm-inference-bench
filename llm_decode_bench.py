@@ -7607,6 +7607,61 @@ def build_messages(context_tokens: int, context_text: str) -> list:
     return messages
 
 
+async def native_message_tokens(client, base_url: str, model: str, messages: list,
+                                auth_headers=None) -> int:
+    """Exact prompt tokens for ``messages`` through the native counting endpoint."""
+    headers = {"anthropic-version": "2023-06-01"}
+    if auth_headers:
+        headers.update(auth_headers)
+    response = await client.post(
+        f"{base_url}/v1/messages/count_tokens",
+        json={"model": model, "messages": messages},
+        headers=headers,
+        timeout=httpx.Timeout(120.0, connect=30.0),
+    )
+    response.raise_for_status()
+    return int(response.json()["input_tokens"])
+
+
+async def fit_exact_tokens(client, base_url: str, model: str, ctx: int, prefix: str,
+                           body: str, auth_headers=None) -> list:
+    """Messages whose native prompt count is exactly ``ctx``.
+
+    Calibration counts one prefix; the per-sample uniqueness tag can tokenize to
+    a different length and push a prompt past a prefill chunk boundary. Search
+    the body length until the server reports ``ctx`` exactly, and fall back to
+    the untagged messages when the counting endpoint is unavailable.
+    """
+    async def count(length: int) -> int:
+        return await native_message_tokens(
+            client, base_url, model, build_messages(ctx, prefix + body[:length]), auth_headers)
+
+    try:
+        if await count(len(body)) <= ctx:
+            return build_messages(ctx, prefix + body)
+    except Exception:
+        return build_messages(ctx, prefix + body)
+    # Prompt tokens grow monotonically with body length. Keep the longest body
+    # that stays at or below ctx, and return early on an exact match.
+    low, high = 0, len(body)
+    best_length = 0
+    while low <= high:
+        middle = (low + high) // 2
+        try:
+            counted = await count(middle)
+        except Exception:
+            return build_messages(ctx, prefix + body)
+        if counted == ctx:
+            best_length = middle
+            break
+        if counted < ctx:
+            best_length = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return build_messages(ctx, prefix + body[:best_length])
+
+
 def build_user_prompt_messages(prompt: str, system_prompt: str = "") -> list:
     messages = []
     system_prompt = system_prompt.strip()
@@ -16590,10 +16645,11 @@ async def run_benchmark(args):
                             _skip_event.clear()
                             skipped = True
                             break
-                        # Unique prefix per iteration → no prefix cache hit
+                        # Unique prefix per iteration → no prefix cache hit. The
+                        # tag can change the token count, so refit to ctx exactly.
                         prefix = f"[BENCH_{run_id}_CTX_{ctx}_R{r}] "
-                        variant_text = prefix + context_cache[ctx][orig_prefix_len:]
-                        msgs = build_messages(ctx, variant_text)
+                        msgs = await fit_exact_tokens(client, base_url, args.model, ctx, prefix,
+                                                      context_cache[ctx][orig_prefix_len:], auth_headers)
                         sample = await measure_prefill_once(client, ctx, msgs)
                         if sample.get("tok_per_sec", 0) > 0:
                             prefill_samples.append(sample)
