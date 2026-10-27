@@ -3,7 +3,7 @@
 Typical use, in the dedicated image (GPUs 0-3 idle)::
 
     docker run --rm --gpus all --privileged --ipc=host --shm-size 16g \\
-        -e LIL_BENCH_TOKEN=lilb_... ghcr.io/local-inference-lab/lil-collectives
+        -v "$PWD":/cache/lil-bench -e LIL_BENCH_TOKEN=lilb_... ghcr.io/local-inference-lab/lil-collectives
 
 ``--tp 2`` or ``--gpus 4,5,6,7`` choose other ranks; ``--quick`` takes about five minutes.
 """
@@ -276,7 +276,10 @@ def main(argv: list[str]) -> int:
         reply = upload.upload_bytes(args.site, args.token, path.read_bytes(), path=UPLOAD_PATH)
     except upload.UploadError as error:
         out.error_panel("Upload failed", [str(error), "The result is saved; upload it later with:",
-                                          f"  lil-bench upload {path}"])
+                                          f"  lil-bench upload {path}",
+                                          "(in the image: docker run --rm -v \"$PWD\":/cache/lil-bench -e LIL_BENCH_TOKEN=… "
+                                          "--entrypoint lil-bench ghcr.io/local-inference-lab/lil-collectives upload "
+                                          f"/cache/lil-bench/{path.name})"])
         return EXIT_UPLOAD
     out.ok(f"uploaded: {reply.get('url')}")
     out.info(f"share this link; all collectives results: {args.site.rstrip('/')}/bench/collectives")
