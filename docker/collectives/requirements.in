@@ -1,0 +1,23 @@
+# Runtime of ghcr.io/local-inference-lab/lil-collectives. Regenerate requirements.lock with lock.sh.
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.14.1+cu132
+cuda-python==13.3.1
+nvidia-cutlass-dsl==4.7.1
+nvidia-cutlass-dsl-libs-base==4.7.1
+nvidia-cutlass-dsl-libs-core==4.7.1
+nvidia-cutlass-dsl-libs-cu12==4.7.1
+nvidia-cutlass-dsl-libs-cu13==4.7.1
+apache-tvm-ffi>=0.1.11,<0.2
+cuda-tile>=1.4.0
+nvidia-ml-py
+numpy
+packaging
+rich
+safetensors
+einops
+tqdm
+requests
+click
+tabulate
+httpx

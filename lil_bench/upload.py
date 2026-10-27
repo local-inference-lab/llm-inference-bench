@@ -48,11 +48,12 @@ def compress(document: dict) -> bytes:
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode(), compresslevel=9)
 
 
-def upload_bytes(site: str, token: str, payload: bytes, attempts: int = 3, sleep=time.sleep) -> dict:
+def upload_bytes(site: str, token: str, payload: bytes, attempts: int = 3, sleep=time.sleep,
+                 path: str = "/api/bench/runs") -> dict:
     delay = 3.0
     for attempt in range(1, attempts + 1):
         try:
-            return _request(f"{site.rstrip('/')}/api/bench/runs", token, data=payload, timeout=120)
+            return _request(f"{site.rstrip('/')}{path}", token, data=payload, timeout=120)
         except UploadError as error:
             if not error.retry or attempt == attempts:
                 raise
