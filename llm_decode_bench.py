@@ -11553,7 +11553,7 @@ async def run_one_cell(
                     else:
                         warmup_stable_since = None
                     # Give up after max_warmup — queue never drained (real capacity issue)
-                    if elapsed >= max_warmup_seconds:
+                    if not warmup_done and elapsed >= max_warmup_seconds:
                         warmup_timed_out = True
                         warmup_done = True
                         state.cell_warmup = False
