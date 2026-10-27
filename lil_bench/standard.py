@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import DEFAULT_SITE, SCHEMA, STANDARD, TOKEN_URL_PATH, VERSION
-from . import integrity, inventory, p2p, server, telemetry, upload
+from . import collectives, integrity, inventory, p2p, server, telemetry, upload
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "llm_decode_bench.py"
@@ -517,7 +517,8 @@ def no_token(out: Output, site: str, reason: str) -> int:
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="lil-bench", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", nargs="?", default="run", choices=("run", "upload", "inventory", "whoami"))
+    parser.add_argument("command", nargs="?", default="run", choices=("run", "upload", "inventory", "whoami"),
+                        help="'lil-bench collectives --help' measures the GPUs' all-reduce transports instead")
     parser.add_argument("file", nargs="?", help="result file for 'upload'")
     parser.add_argument("--token", default=os.environ.get("LIL_BENCH_TOKEN", ""),
                         help="uploader identifier (default: $LIL_BENCH_TOKEN)")
@@ -559,7 +560,12 @@ def command_upload(out: Output, args) -> int:
     if not payload.startswith(b"\x1f\x8b"):
         payload = gzip.compress(payload, compresslevel=9)
     try:
-        reply = upload.upload_bytes(args.site, args.token, payload)
+        schema = json.loads(gzip.decompress(payload)).get("schema")
+    except (OSError, ValueError):
+        schema = None
+    path = "/api/bench/collectives" if schema == collectives.SCHEMA else "/api/bench/runs"
+    try:
+        reply = upload.upload_bytes(args.site, args.token, payload, path=path)
     except upload.UploadError as error:
         out.error_panel("Upload failed", [str(error)])
         return EXIT_UPLOAD
@@ -827,6 +833,10 @@ def _safe_argv() -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["collectives"]:
+        from .collectives.command import main as collectives_main
+        return collectives_main(argv[1:])
     args = parse_args(argv)
     out = Output()
     if args.command == "upload":

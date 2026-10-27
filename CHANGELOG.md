@@ -1,5 +1,19 @@
 # Changelog
 
+## lil-bench 1.5 - 2026-10-27
+
+### Collective diagnostics (`lil-bench collectives`)
+
+- New subcommand that measures the PCIe fabric of one tensor-parallel group
+  (pairwise, all-to-all, ring, fan-out and incast peer reads and writes) and
+  every FlashInfer/b12x all-reduce transport at every launch configuration of
+  its joint tuner against NCCL, reports the fastest transport per message size,
+  the crossovers, the tuner's loss and unstable cells, and uploads one
+  `lil-collectives-result/1` document to `/api/bench/collectives`.
+- `docker/collectives/`: the `ghcr.io/local-inference-lab/lil-collectives`
+  image (PyTorch, cuda-python, CUTLASS DSL, a FlashInfer source tree, p2pmark).
+- `lil-bench upload` sends collectives results to their own endpoint.
+
 ## 0.8.0 - 2026-10-13
 
 ### Scheduler tests (`--scheduler`)

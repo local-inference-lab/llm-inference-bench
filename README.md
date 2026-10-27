@@ -299,6 +299,47 @@ lil-bench inventory            # print the hardware/topology record
 Without the image, run it from a checkout inside the container:
 `python3 -m lil_bench` (needs `httpx`, `rich`, and `pynvml`).
 
+### Collective diagnostics (`lil-bench collectives`)
+
+Which tensor-parallel all-reduce is fastest depends on how the GPUs reach each
+other: through a PCIe switch, peer writes ("push") are fast; when every GPU
+sits behind its own CPU host bridge or root port, writes (and on some hosts
+reads) to all peers at once can collapse while a ring keeps full speed.
+`lil-bench collectives` measures one tensor-parallel group of idle GPUs and
+uploads the result to <https://docker.local-inference-lab.ai/bench/collectives>,
+which prints a share link and collects statistics per topology, IOMMU mode and
+NVIDIA P2P driver setting. It needs PyTorch, cuda-python and FlashInfer with
+b12x, which the dedicated image provides:
+
+```bash
+docker run --rm --gpus all --privileged --ipc=host --shm-size 16g \
+  -e LIL_BENCH_TOKEN=lilb_... ghcr.io/local-inference-lab/lil-collectives:latest
+#   --gpus 4,5,6,7   other GPUs (default: GPUs 0-3, TP4)
+#   --tp 2           two GPUs
+#   --quick          six sizes and one tuner effort, about five minutes
+#   -v lil-collectives-cache:/root/.cache   keep compiled kernels between runs
+```
+
+The run takes about 15 minutes at TP4:
+
+1. hardware and PCIe inventory (the same record as `lil-bench`), the peer path
+   of every GPU pair (shared switch, CPU root complex, host bridges, sockets),
+   IOMMU mode and the NVIDIA driver's P2P registry settings;
+2. peer bandwidth with SM copy kernels: one pair at a time, all peers at once,
+   a ring, one GPU to all peers, and all peers into one GPU, read and write;
+3. p2pmark (copy-engine bandwidth, latency, custom all-reduce vs NCCL);
+4. every FlashInfer/b12x all-reduce transport at every launch configuration
+   its joint tuner considers, for 1-192 rows of 5120 BF16 values, the fastest
+   configuration of each measured in steady state (two passes) and race style,
+   the tuner's own selection at default and audit effort, and NCCL with vLLM's
+   settings and with the ring algorithm forced. Every result is checked against
+   an FP32 reference.
+
+`lil-bench collectives --report FILE...` prints saved results;
+`lil-bench upload FILE` uploads one later. The image recipe is in
+`docker/collectives/` (`build.sh FLASHINFER_TREE [TAG]`, `lock.sh` to refresh
+the pinned, hashed requirements).
+
 ## Measurement Methodology
 
 ### Prefill
