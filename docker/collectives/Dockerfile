@@ -15,6 +15,8 @@ RUN make -C /src/p2pmark -B NVCC=/usr/local/cuda/bin/nvcc LDFLAGS=-lnccl \
     "CFLAGS=-O2 -std=c++20 -gencode arch=compute_100,code=sm_100 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_121,code=sm_121 -gencode arch=compute_120,code=compute_120"
 
 FROM ${RUNTIME_BASE}
+LABEL org.opencontainers.image.source="https://github.com/local-inference-lab/llm-inference-bench" \
+      org.opencontainers.image.description="lil-bench collectives: PCIe fabric and all-reduce transport diagnostic"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv pciutils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
