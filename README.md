@@ -312,7 +312,9 @@ NVIDIA P2P driver setting. It needs PyTorch, cuda-python and FlashInfer with
 b12x, which the dedicated image provides:
 
 ```bash
+docker pull ghcr.io/local-inference-lab/lil-collectives:latest
 docker run --rm --gpus all --privileged --ipc=host --shm-size 16g \
+  -v "$PWD":/cache/lil-bench \
   -e LIL_BENCH_TOKEN=lilb_... ghcr.io/local-inference-lab/lil-collectives:latest
 #   --gpus 4,5,6,7   other GPUs (default: GPUs 0-3, TP4)
 #   --tp 2           two GPUs
@@ -335,8 +337,12 @@ The run takes about 15 minutes at TP4:
    settings and with the ring algorithm forced. Every result is checked against
    an FP32 reference.
 
-`lil-bench collectives --report FILE...` prints saved results;
-`lil-bench upload FILE` uploads one later. The image recipe is in
+The result is also saved in the current directory (`collectives-<run>.json.gz`).
+`lil-bench collectives --report FILE...` prints saved results; to upload one
+later: `docker run --rm -v "$PWD":/cache/lil-bench -e LIL_BENCH_TOKEN=lilb_...
+--entrypoint lil-bench ghcr.io/local-inference-lab/lil-collectives upload
+/cache/lil-bench/collectives-<run>.json.gz`. Step-by-step instructions are on
+<https://docker.local-inference-lab.ai/bench/collectives>. The image recipe is in
 `docker/collectives/` (`build.sh FLASHINFER_TREE [TAG]`, `lock.sh` to refresh
 the pinned, hashed requirements).
 
