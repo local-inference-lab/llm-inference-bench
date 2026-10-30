@@ -319,18 +319,31 @@ docker run --rm --gpus all --privileged --ipc=host --shm-size 16g \
 #   --gpus 4,5,6,7   other GPUs (default: GPUs 0-3, TP4)
 #   --tp 2           two GPUs
 #   --quick          six sizes and one tuner effort, about five minutes
+#   --stalls-only    only the peer read stall test, about half a minute
 #   -v lil-collectives-cache:/root/.cache   keep compiled kernels between runs
 ```
+
+Without Docker, `tools/read_stalls/lil_read_stalls.py` runs the read stall test
+from one file with only Python and the NVIDIA driver:
+`python3 lil_read_stalls.py --gpus 0,4,8,12` (see `tools/read_stalls/README.md`).
 
 The run takes about 15 minutes at TP4:
 
 1. hardware and PCIe inventory (the same record as `lil-bench`), the peer path
    of every GPU pair (shared switch, CPU root complex, host bridges, sockets),
    IOMMU mode and the NVIDIA driver's P2P registry settings;
-2. peer bandwidth with SM copy kernels: one pair at a time, all peers at once,
+2. peer read stalls: every GPU at once moves an 80 KiB message per operation
+   for several seconds (read from the next GPU, read from every peer, and
+   write to the next GPU as the control), timing every single operation. On
+   some CPU fabrics peer reads stall for 1-3 ms in periodic windows while
+   writes never do; pull transports then pay those stalls on average even
+   though their median looks best. The report says `READ STALLS: YES` or
+   `NONE`, with the longest read, the number of reads over 1 ms, the time
+   lost, the repeat period and which GPUs were involved;
+3. peer bandwidth with SM copy kernels: one pair at a time, all peers at once,
    a ring, one GPU to all peers, and all peers into one GPU, read and write;
-3. p2pmark (copy-engine bandwidth, latency, custom all-reduce vs NCCL);
-4. every FlashInfer/b12x all-reduce transport at every launch configuration
+4. p2pmark (copy-engine bandwidth, latency, custom all-reduce vs NCCL);
+5. every FlashInfer/b12x all-reduce transport at every launch configuration
    its joint tuner considers, for 1-192 rows of 5120 BF16 values, the fastest
    configuration of each measured in steady state (two passes) and race style,
    the tuner's own selection at default and audit effort, and NCCL with vLLM's

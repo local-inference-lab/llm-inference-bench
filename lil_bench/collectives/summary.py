@@ -1,4 +1,4 @@
-"""Verdicts of a collectives run: fabric class, winners and crossovers, tuner loss, recommendation."""
+"""Verdicts of a collectives run: read stalls, fabric class, winners and crossovers, tuner loss, recommendation."""
 
 from __future__ import annotations
 
@@ -49,6 +49,109 @@ def fabric_summary(fabric: dict | None) -> dict:
             "write_over_read": {"pair": ratio(pair), "all_to_all": ratio(rates["all_to_all"]),
                                 "ring": ratio(rates["ring"])},
             "class": verdict}
+
+
+# Peer read stalls: a pattern is "severe" with this many operations over 1 ms (all GPUs) or this share of
+# its time lost to stalls, "mild" with this many stalled operations (> max(100 us, 10x median)).
+STALL_SEVERE_OPS = 3
+STALL_SEVERE_LOST = 0.05
+STALL_MILD_OPS = 10
+STALL_ORDER = ("none", "mild", "severe")
+
+
+def _stall_pattern(pattern: dict | None) -> dict:
+    gpus = [g for g in (pattern or {}).get("gpus") or [] if g.get("ops")]
+    if not gpus:
+        return {}
+    periods = [g["period_s"] for g in gpus if g.get("period_s")]
+    windows = [g["window_ms"] for g in gpus if g.get("window_ms")]
+    means = [g["mean_us"] / g["p50_us"] for g in gpus if g.get("p50_us")]
+    result = {
+        "ops": sum(g["ops"] for g in gpus),
+        "p50_us": statistics.median(g["p50_us"] for g in gpus),
+        "p99_us": max(g["p99_us"] for g in gpus),
+        "p999_us": max(g["p999_us"] for g in gpus),
+        "max_us": max(g["max_us"] for g in gpus),
+        "mean_over_p50": statistics.median(means) if means else None,
+        "stalls": sum(g["stalls"] for g in gpus),
+        "over_1ms": sum(g["over_1ms"] for g in gpus),
+        "lost_fraction": max(g["lost_fraction"] for g in gpus),
+        "period_s": statistics.median(periods) if periods else None,
+        "window_ms": statistics.median(windows) if windows else None,
+        "stalled_fraction": max(g.get("stalled_fraction") or 0 for g in gpus),
+        "stalling_gpus": [i for i, g in enumerate((pattern or {}).get("gpus") or [])
+                          if g.get("ops") and (g["over_1ms"] or g["stalls"] >= STALL_MILD_OPS)],
+    }
+    if result["over_1ms"] >= STALL_SEVERE_OPS or result["lost_fraction"] >= STALL_SEVERE_LOST:
+        result["severity"] = "severe"
+    elif result["stalls"] >= STALL_MILD_OPS or (result["max_us"] >= 500 and result["stalls"] >= 3):
+        result["severity"] = "mild"
+    else:
+        result["severity"] = "none"
+    return result
+
+
+def stall_summary(stalls: dict | None, gpus: list[int] | None = None) -> dict:
+    """Do peer reads stall? Verdict over the read patterns, with the write ring as the control."""
+    patterns = (stalls or {}).get("patterns") or {}
+    if not patterns:
+        return {}
+    per = {name: _stall_pattern(pattern) for name, pattern in patterns.items()}
+    per = {name: value for name, value in per.items() if value}
+    reads = [per[name] for name in ("read_ring", "read_all") if name in per]
+    if not reads:
+        return {}
+    worst = max(reads, key=lambda p: (STALL_ORDER.index(p["severity"]), p["over_1ms"], p["max_us"]))
+    write = per.get("write_ring") or {}
+    gpus = gpus or list(range(len((patterns.get("read_ring") or {}).get("gpus") or [])))
+    ring = per.get("read_ring") or {}
+    stalling = sorted({gpus[r] for p in reads for r in p.get("stalling_gpus") or [] if r < len(gpus)})
+    pull = per.get("read_all") or ring
+    return {
+        "verdict": worst["severity"],
+        "write_verdict": write.get("severity"),
+        "read_specific": worst["severity"] != "none" and write.get("severity") == "none",
+        "bytes": (stalls or {}).get("bytes"),
+        "seconds": max((p.get("seconds") or 0) for p in patterns.values()),
+        "max_us": worst["max_us"],
+        "over_1ms": sum(p["over_1ms"] for p in reads),
+        "lost_fraction": max(p["lost_fraction"] for p in reads),
+        "period_s": ring.get("period_s"),
+        "window_ms": ring.get("window_ms"),
+        "stalled_fraction": ring.get("stalled_fraction"),
+        "stalling_gpus": stalling,
+        "pull_penalty": pull.get("mean_over_p50"),
+        "patterns": per,
+    }
+
+
+def stall_text(stalls: dict) -> list[str]:
+    """Plain-language verdict lines shared by the terminal report."""
+    if not stalls:
+        return []
+    verdict, kib = stalls["verdict"], (stalls.get("bytes") or 0) / 1024
+    if verdict == "none":
+        clean = stalls["patterns"].get("read_all") or stalls["patterns"].get("read_ring") or {}
+        return [f"READ STALLS: NONE — no peer read of {kib:.0f} KiB took longer than {clean.get('max_us', 0):.0f} µs "
+                f"(median {clean.get('p50_us', 0):.1f} µs) in {stalls['seconds']:.0f} s per pattern"]
+    lines = [f"READ STALLS: YES ({verdict}) — peer reads of {kib:.0f} KiB stall up to {stalls['max_us'] / 1000:.2f} ms; "
+             f"{stalls['over_1ms']} reads over 1 ms, up to {100 * stalls['lost_fraction']:.1f}% of the time lost"]
+    detail = []
+    if stalls.get("period_s"):
+        detail.append(f"periodic: every {stalls['period_s']:.2f} s"
+                      + (f", windows of ~{stalls['window_ms']:.0f} ms" if stalls.get("window_ms") else ""))
+    if stalls.get("stalling_gpus"):
+        detail.append("seen by GPU " + ", ".join(map(str, stalls["stalling_gpus"])))
+    if detail:
+        lines.append("  " + "; ".join(detail))
+    if stalls.get("read_specific"):
+        lines.append("  writes stay fast (control): the stalls are specific to peer reads")
+    elif stalls.get("write_verdict") and stalls["write_verdict"] != "none":
+        lines.append("  writes stall too: something disturbs the GPUs or the fabric in general (other load?)")
+    if stalls.get("pull_penalty"):
+        lines.append(f"  -> pull transports (one-shot/two-shot pull, NCCL with P2P reads) cost {stalls['pull_penalty']:.2f}x "
+                     "their median on average here; use write-only transports (push, phased, ring)")
+    return lines
 
 
 def best_by_implementation(size: dict) -> dict[str, dict]:
@@ -155,6 +258,7 @@ def summarize(document: dict) -> dict:
     results = document.get("results") or {}
     return {"fabric": fabric_summary(results.get("fabric")),
             "transports": transport_summary(results.get("transports")),
+            "stalls": stall_summary(results.get("stalls"), (document.get("selection") or {}).get("gpus")),
             "topology_class": (document.get("selection") or {}).get("topology_class"),
             "iommu": ((document.get("environment") or {}).get("iommu") or {}).get("mode"),
             "p2p_override": ((document.get("environment") or {}).get("driver") or {}).get("p2p_override_present")}
@@ -165,4 +269,5 @@ def crossover_text(segments: list[dict]) -> str:
                       f"{describe(s['transport'])}" for s in segments)
 
 
-__all__ = ["summarize", "fabric_summary", "transport_summary", "best_by_implementation", "crossover_text", "short"]
+__all__ = ["summarize", "fabric_summary", "transport_summary", "stall_summary", "stall_text", "best_by_implementation",
+           "crossover_text", "short"]

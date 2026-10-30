@@ -8,11 +8,12 @@ peers at once can collapse while reads ("pull") or a ring (NCCL) still run at
 full speed. This command measures the fabric and every transport FlashInfer
 offers, at every launch configuration its joint tuner considers, and reports
 which one wins at which message size, how far the tuner's own choice is from
-the fastest, and how NCCL compares.
+the fastest, and how NCCL compares. It first checks whether peer reads stall
+(milliseconds-long waits that make pull transports slow on average).
 """
 
 SCHEMA = "lil-collectives-result/1"
-PROBE_VERSION = 3
+PROBE_VERSION = 4
 # Message rows of a DeepSeek V4.1 TP decode/verification step (rows x hidden BF16 values).
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128, 192)
 QUICK_ROWS = (1, 4, 16, 64, 128, 192)

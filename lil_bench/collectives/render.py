@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from . import TRANSPORTS, describe, family, short
-from .summary import best_by_implementation, crossover_text
+from .summary import best_by_implementation, crossover_text, stall_text
 
 FABRIC_HELP = {
     "push-friendly": "writes to peers stay fast: push transports should win",
@@ -44,6 +44,21 @@ def lines(document: dict) -> list[str]:
     flashinfer = (environment.get("software") or {}).get("flashinfer") or {}
     out.append(f"FlashInfer {flashinfer.get('version') or ''} {(flashinfer.get('commit') or '')[:12]}"
                + (f" + {', '.join(flashinfer['patches'])}" if flashinfer.get("patches") else ""))
+
+    ssum = summary.get("stalls") or {}
+    if ssum:
+        out.append("")
+        out.append(f"Peer read stalls: {(ssum.get('bytes') or 0) / 1024:.0f} KiB per operation, every GPU at once, "
+                   f"{ssum['seconds']:.0f} s per read pattern")
+        out.append(f"  {'pattern':<28}{'ops':>9}{'p50 µs':>9}{'p99 µs':>9}{'p99.9 µs':>10}{'max µs':>10}"
+                   f"{'>1 ms':>7}{'lost':>7}")
+        for name, label in (("read_ring", "read ring (GPU r <- r+1)"), ("read_all", "read all peers (pull)"),
+                            ("write_ring", "write ring (control)")):
+            p = (ssum.get("patterns") or {}).get(name)
+            if p:
+                out.append(f"  {label:<28}{p['ops']:>9}{p['p50_us']:>9.1f}{p['p99_us']:>9.1f}{p['p999_us']:>10.1f}"
+                           f"{p['max_us']:>10.1f}{p['over_1ms']:>7}{100 * p['lost_fraction']:>6.1f}%")
+        out.extend("  " + line for line in stall_text(ssum))
 
     fabric = (document.get("results") or {}).get("fabric") or {}
     fsum = summary.get("fabric") or {}

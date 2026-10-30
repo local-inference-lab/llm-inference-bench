@@ -5,7 +5,8 @@ Typical use, in the dedicated image (GPUs 0-3 idle)::
     docker run --rm --gpus all --privileged --ipc=host --shm-size 16g \\
         -v "$PWD":/cache/lil-bench -e LIL_BENCH_TOKEN=lilb_... ghcr.io/local-inference-lab/lil-collectives
 
-``--tp 2`` or ``--gpus 4,5,6,7`` choose other ranks; ``--quick`` takes about five minutes.
+``--tp 2`` or ``--gpus 4,5,6,7`` choose other ranks; ``--quick`` takes about five minutes;
+``--stalls-only`` answers in about half a minute whether peer reads stall on this machine.
 """
 
 from __future__ import annotations
@@ -40,6 +41,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--rows", default="", help="message rows (default 1,2,4,...,192)")
     parser.add_argument("--quick", action="store_true", help="six sizes and the default tuner effort only (~5 min)")
     parser.add_argument("--efforts", default="", help="tuner efforts to report (default: default,audit)")
+    parser.add_argument("--stalls-only", action="store_true",
+                        help="only the peer read stall test (~30 s): do peer reads stall on these GPUs?")
+    parser.add_argument("--skip-stalls", action="store_true")
+    parser.add_argument("--stall-seconds", type=float, default=6.0,
+                        help="duration of each read pattern of the stall test (default 6 s)")
+    parser.add_argument("--stall-kib", type=int, default=80, help="message size of the stall test (default 80 KiB)")
     parser.add_argument("--skip-fabric", action="store_true")
     parser.add_argument("--skip-p2pmark", action="store_true")
     parser.add_argument("--skip-transports", action="store_true")
@@ -54,6 +61,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.gpus:
         args.tp = len([value for value in args.gpus.split(",") if value.strip()])
+    if args.stalls_only:
+        if args.skip_stalls:
+            parser.error("--stalls-only and --skip-stalls exclude each other")
+        args.skip_fabric = args.skip_p2pmark = args.skip_transports = True
     args.rows = args.rows or ",".join(map(str, QUICK_ROWS if args.quick else ROWS))
     args.efforts = [e for e in (args.efforts or ("default" if args.quick else "default,audit")).split(",") if e]
     return args
@@ -136,7 +147,8 @@ def main(argv: list[str]) -> int:
         return EXIT_SETUP
     paths = system.pair_paths(hardware, gpus)
     selection = {"gpus": gpus, "tp": len(gpus), "hidden": args.hidden, "rows": [int(r) for r in args.rows.split(",")],
-                 "dtype": "bfloat16", "quick": args.quick, "efforts": args.efforts, "pair_paths": paths,
+                 "dtype": "bfloat16", "quick": args.quick, "stalls_only": args.stalls_only,
+                 "efforts": args.efforts, "pair_paths": paths,
                  "topology_class": system.topology_class(paths)}
     environment = {"iommu": system.iommu(hardware, gpus), "driver": system.driver_params(hardware),
                    "software": system.software(), "acs": (hardware.get("pcie") or {}).get("acs")}
@@ -164,6 +176,27 @@ def main(argv: list[str]) -> int:
     status = "complete"
     scratch = Path(tempfile.mkdtemp(prefix="lil-collectives-"))
     try:
+        if not args.skip_stalls:
+            out.step(f"Peer read stalls: {args.stall_kib} KiB per operation, every GPU at once "
+                     f"(~{2.5 * max(2.0, args.stall_seconds) + 10:.0f} s)")
+            start = time.time()
+            target = scratch / "stalls.json"
+            code = _run(out, [sys.executable, "-m", "lil_bench.collectives.stalls", "--result", str(target),
+                              "--kib", str(args.stall_kib), "--seconds", str(args.stall_seconds)], env, "stall test")
+            results["stalls"] = json.loads(target.read_text()) if code == 0 and target.exists() else \
+                {"status": "failed", "returncode": code}
+            phases.append({"kind": "stalls", "start": start, "end": time.time()})
+            verdict = summary.stall_summary(results["stalls"], gpus)
+            for index, line in enumerate(summary.stall_text(verdict)):
+                if index:
+                    out.info(line.strip())
+                elif verdict["verdict"] == "none":
+                    out.ok(line)
+                else:
+                    out.warn(line)
+            if code:
+                status = "failed"
+
         if not args.skip_fabric:
             out.step("Peer bandwidth: pairs, all-to-all, ring, fan-out, incast")
             start = time.time()
