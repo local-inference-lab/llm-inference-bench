@@ -124,3 +124,45 @@ def test_parse_args_defaults_and_quick():
     assert args.tp == 4 and args.rows == "1,2,4,8,16,32,64,128,192" and args.efforts == ["default", "audit"]
     quick = command.parse_args(["--quick", "--gpus", "4,5"])
     assert quick.tp == 2 and quick.efforts == ["default"] and quick.rows.count(",") == 5
+
+
+def stall_gpu(p50, maximum, over_1ms=0, stalls=0, lost=0.0, period=None, window=None):
+    return {"ops": 100000, "p50_us": p50, "p99_us": p50 * 1.1, "p999_us": maximum / 2, "max_us": maximum,
+            "mean_us": p50 * (1 + lost * 2), "stalls": stalls, "over_100us": stalls, "over_1ms": over_1ms,
+            "lost_fraction": lost, "period_s": period, "window_ms": window, "stalled_fraction": 0.1 if stalls else 0.0}
+
+
+def stall_result(read, write, gpus=4):
+    return {"bytes": 81920, "patterns": {
+        "read_ring": {"seconds": 6.0, "gpus": [read] * gpus},
+        "read_all": {"seconds": 6.0, "gpus": [read] * gpus},
+        "write_ring": {"seconds": 3.0, "gpus": [write] * gpus}}}
+
+
+def test_stall_summary_reports_periodic_read_stalls():
+    read = stall_gpu(5.6, 1640.0, over_1ms=5, stalls=1500, lost=0.06, period=2.3, window=150.0)
+    result = summary.stall_summary(stall_result(read, stall_gpu(3.3, 22.0)), [0, 4, 8, 12])
+    assert result["verdict"] == "severe" and result["read_specific"]
+    assert result["stalling_gpus"] == [0, 4, 8, 12]
+    assert result["period_s"] == 2.3 and result["over_1ms"] == 40
+    text = summary.stall_text(result)
+    assert text[0].startswith("READ STALLS: YES (severe)") and "every 2.30 s" in text[1]
+
+
+def test_stall_summary_clean_and_mild():
+    clean = summary.stall_summary(stall_result(stall_gpu(7.0, 12.0), stall_gpu(3.3, 4.0)), [0, 1, 2, 3])
+    assert clean["verdict"] == "none" and not clean["read_specific"] and clean["stalling_gpus"] == []
+    assert summary.stall_text(clean)[0].startswith("READ STALLS: NONE")
+    mild = summary.stall_summary(stall_result(stall_gpu(7.0, 300.0, stalls=12), stall_gpu(3.3, 4.0)))
+    assert mild["verdict"] == "mild"
+    disturbed = summary.stall_summary(stall_result(stall_gpu(7.0, 1500.0, over_1ms=4, stalls=40),
+                                                   stall_gpu(3.3, 1500.0, over_1ms=4, stalls=40)))
+    assert disturbed["verdict"] == "severe" and not disturbed["read_specific"]
+    assert any("writes stall too" in line for line in summary.stall_text(disturbed))
+
+
+def test_stalls_only_skips_the_other_phases():
+    args = command.parse_args(["--stalls-only"])
+    assert args.skip_fabric and args.skip_p2pmark and args.skip_transports and not args.skip_stalls
+    with pytest.raises(SystemExit):
+        command.parse_args(["--stalls-only", "--skip-stalls"])
