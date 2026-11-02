@@ -11383,11 +11383,6 @@ async def run_one_cell(
         if cell_warmup_timeout_seconds and cell_warmup_timeout_seconds > 0
         else default_cell_warmup_timeout_seconds(context_tokens)
     )
-    if serial_server_mode:
-        # A single-flight server drains the C queued warmup generations one at
-        # a time, so readiness (first token on the last stream) is naturally
-        # serialized: scale the auto timeout by concurrency.
-        max_warmup_seconds *= concurrency
     last_metrics_time = 0.0
     gen_throughput_samples = []
     sglang_step_rate_samples = []
@@ -11586,6 +11581,11 @@ async def run_one_cell(
                             # get an actionable timeout_reason.
                             if shared_active_streams[0] < 1 or not generating:
                                 timeout_reason = "no_generation"
+                            elif serial_server_mode:
+                                timeout_reason = (
+                                    f"active_streams={shared_active_streams[0]}/{concurrency}, "
+                                    "not_stable (serial_server)"
+                                )
                             elif shared_active_streams[0] < concurrency:
                                 timeout_reason = (
                                     f"active_streams={shared_active_streams[0]}/{concurrency} "
@@ -22373,9 +22373,8 @@ def parse_args():
         "--serial-server", action="store_true",
         help="Single-flight servers (mlx-lm style, one request at a time) can "
              "never show concurrent active streams. Readiness becomes 'tokens "
-             "flowing on at least one stream', auto warmup timeouts scale with "
-             "concurrency, and aggregate tok/s at C>1 measures the serial queue, "
-             "not the model."
+             "flowing on at least one stream', and aggregate tok/s at C>1 "
+             "measures the serial queue, not the model."
     )
     parser.add_argument(
         "--prefill-duration", type=float, default=10.0,
