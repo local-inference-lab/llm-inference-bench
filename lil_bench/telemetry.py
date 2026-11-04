@@ -618,12 +618,13 @@ class ServerRecorder:
     """Samples the server's /metrics counters (``names``) and host CPU load in the background."""
 
     def __init__(self, base_url: str, t0: float, interval: float = 1.0, fetch=None,
-                 proc_root: str = "/proc", sys_root: str = "/sys", names: tuple = SERVER_METRICS):
+                 proc_root: str = "/proc", sys_root: str = "/sys", names: tuple = SERVER_METRICS,
+                 api_key: str | None = None):
         from . import server
         self.url = f"{base_url}/metrics"
         self.t0 = t0
         self.interval = interval
-        self.fetch = fetch or (lambda: server.http_text(self.url, timeout=5))
+        self.fetch = fetch or (lambda: server.http_text(self.url, timeout=5, api_key=api_key))
         self.parse = server.parse_metrics
         self.proc_root, self.sys_root = proc_root, sys_root
         self.times: list[int] = []

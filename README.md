@@ -173,7 +173,7 @@ python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval \
 |---|---|---|
 | `--host` | `localhost` | Server hostname or full URL (e.g. `https://openrouter.ai`) |
 | `--port` | `5000` | Server port (ignored when `--host` is a URL) |
-| `--api-key` | | API key sent as `Authorization: Bearer` header |
+| `--api-key` | | API key sent as `Authorization: Bearer` header; also `LLM_BENCH_API_KEY`, which keeps it out of the process list |
 | `--model` | `Qwen3.5` | Model name for API requests (auto-detected from server) |
 | `--concurrency` | `1,2,4,8,16,32,64,128` | Comma-separated concurrency levels |
 | `--contexts` | `0,16384,32768,65536,131072` | Comma-separated context lengths (tokens) |
@@ -343,6 +343,26 @@ column all-gather share modes 0 and 1 (`full` or `barrier`, `payload_rsag` or
 to, so those keep their raw value. The result stores the raw table and the
 decoded names. A package without startup tuning fixed its collectives at
 export, and its log has no table.
+
+### Servers with an API key
+
+A server started with an API key (Flare `--api-key-file`, vLLM `--api-key` or
+`VLLM_API_KEY`) answers only requests that carry it. Give lil-bench the same
+key in a file or in `LIL_BENCH_API_KEY`; `--api-key VALUE` is refused because
+every process list would show it:
+
+```bash
+# Flare: the file the server reads (the configurator's Compose setup keeps it in ./flare-api-key)
+LIL_BENCH_TOKEN=lilb_... .venv/bin/python -m lil_bench --url http://127.0.0.1:8000 --api-key-file /path/to/flare-api-key
+# vLLM: -e without a value passes LIL_BENCH_API_KEY from this shell's environment
+docker exec --privileged -it -e LIL_BENCH_TOKEN=lilb_... -e LIL_BENCH_API_KEY <container> lil-bench
+```
+
+The key goes only to the server (`Authorization: Bearer`) and to
+`llm_decode_bench` in its environment. It is never uploaded: key values in the
+recorded serving command become `***` (a `--api-key-file` path stays),
+secret-named variables are left out, and any other copy in the result is
+masked.
 
 ### Collective diagnostics (`lil-bench collectives`)
 

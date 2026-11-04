@@ -13,6 +13,10 @@ A Flare image holds only the ``flare`` binary, so for Flare lil-bench runs
 beside the container (``lil-bench --url http://127.0.0.1:8000``) and reads
 the container, its startup log and the package through Docker
 (``lil_bench.flare``); only the server's GPUs are recorded.
+
+A server started with an API key (Flare ``--api-key-file``, vLLM
+``--api-key``) needs that key: ``--api-key-file PATH`` or ``LIL_BENCH_API_KEY``.
+It goes to the server only and is never uploaded.
 """
 
 from __future__ import annotations
@@ -42,6 +46,11 @@ EXIT_NO_TOKEN = 2
 EXIT_SERVER = 3
 EXIT_BENCH = 4
 EXIT_UPLOAD = 5
+API_KEY_FILE_LIMIT = 64 * 1024
+# Copies of the API key are masked in the output and the result; a shorter key
+# would also hit unrelated text, so only its exact places (the serving command)
+# are masked.
+MASK_MIN_LENGTH = 8
 
 # The standard matrix. Changing any value is a new STANDARD version.
 PROFILES = {
@@ -74,11 +83,14 @@ class Output:
         self.stream = stream or sys.stdout
         self.color = self.stream.isatty() and os.environ.get("NO_COLOR") is None
         self.lock = threading.Lock()
+        self.secrets: list[str] = []  # printed as *** wherever they appear
 
     def _paint(self, text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.color else text
 
     def line(self, text: str = "", code: str = "") -> None:
+        for secret in self.secrets:
+            text = text.replace(secret, "***")
         with self.lock:
             print(self._paint(text, code) if code else text, file=self.stream, flush=True)
 
@@ -375,7 +387,7 @@ def free_gpu_memory(indices: list[int] | None = None) -> list[int]:
 
 
 def run_p2pmark(out: Output, hardware: dict, base_url: str | None, directory: Path | None,
-                selection: dict | None = None) -> dict:
+                selection: dict | None = None, api_key: str | None = None) -> dict:
     """p2pmark next to the loaded model; ``lil_bench.p2p`` keeps it out of the server's way.
 
     ``selection`` (UUIDs and NVML indices) limits it to the server's GPUs.
@@ -384,7 +396,7 @@ def run_p2pmark(out: Output, hardware: dict, base_url: str | None, directory: Pa
         bench = load_bench_module()
         from rich.console import Console
         # None when /metrics has no request gauges: p2pmark then treats the server as busy.
-        busy = (lambda: server.busy_requests(base_url, timeout=0.5, strict=True)) if base_url else None
+        busy = (lambda: server.busy_requests(base_url, timeout=0.5, strict=True, api_key=api_key)) if base_url else None
         indices = selection["indices"] if selection else None
         env = {"CUDA_VISIBLE_DEVICES": ",".join(selection["uuids"])} if selection else None
         return p2p.measure(out, hardware, bench, free_fn=lambda: free_gpu_memory(indices), busy_fn=busy,
@@ -555,10 +567,47 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--allow-busy", action="store_true",
                         help="measure even if the server has other requests (flagged; p2pmark does not run next to them)")
     parser.add_argument("--note", default="", help="free text stored with the result (max 500 characters)")
-    return parser.parse_args(argv)
+    parser.add_argument("--api-key-file", default="",
+                        help="file with the server's API key (Flare --api-key-file, vLLM --api-key); default: "
+                             "$LIL_BENCH_API_KEY. The key goes to the server only and is never uploaded")
+    # Defined so that "--api-key VALUE" is refused instead of being read as --api-key-file.
+    parser.add_argument("--api-key", dest="api_key_argv", default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.api_key_argv is not None:
+        parser.error("the API key is not taken on the command line, where every process list shows it: "
+                     "use --api-key-file PATH or set LIL_BENCH_API_KEY")
+    return args
 
 
-def flare_target(args, docker) -> dict | None:
+def read_api_key(args) -> tuple[str, str | None]:
+    """The server's API key and where it came from: ``--api-key-file``, else ``$LIL_BENCH_API_KEY``.
+
+    Surrounding whitespace is not part of the key (Flare trims its key file
+    the same way). ValueError says what is wrong without quoting the key.
+    """
+    if args.api_key_file:
+        path = Path(args.api_key_file)
+        source = f"--api-key-file {path}"
+        try:
+            if path.stat().st_size > API_KEY_FILE_LIMIT:
+                raise ValueError(f"{path} is larger than {API_KEY_FILE_LIMIT // 1024} KiB: not an API key file")
+            key = path.read_bytes().decode("utf-8").strip()
+        except UnicodeDecodeError:
+            raise ValueError(f"{path} is not UTF-8 text") from None
+        except OSError as error:
+            raise ValueError(f"cannot read {path}: {error.strerror or error}") from None
+        if not key:
+            raise ValueError(f"{path} is empty")
+    else:
+        key, source = os.environ.get("LIL_BENCH_API_KEY", "").strip(), "LIL_BENCH_API_KEY"
+        if not key:
+            return "", None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+        raise ValueError(f"the key from {source} spans several lines or contains control characters")
+    return key, source
+
+
+def flare_target(args, docker, api_key: str | None = None) -> dict | None:
     """The Flare server to measure ({"url", "container"}), or None for a vLLM server.
 
     --container or --server-log name one and a --url that answers as Flare is
@@ -574,7 +623,7 @@ def flare_target(args, docker) -> dict | None:
             raise flare.DockerError("--container needs the Docker socket or the docker CLI")
         return {"url": url or flare.container_url(docker.inspect(args.container)), "container": args.container}
     if url:
-        return {"url": url, "container": None} if args.server_log or server.is_flare(url) else None
+        return {"url": url, "container": None} if args.server_log or server.is_flare(url, api_key=api_key) else None
     process = server.find_server()
     if process and server.own_namespace(process["pid"]):
         return None
@@ -593,7 +642,26 @@ def flare_target(args, docker) -> dict | None:
     return None
 
 
-def prepare_flare(out: Output, args, docker, target: dict):
+def unanswered(out: Output, base_url: str, error: Exception, key_source: str | None) -> int:
+    """The error panel for a server whose /v1/models fails; a refused key says what to pass."""
+    status = getattr(error, "code", None)
+    if status in (401, 403) and key_source:
+        out.error_panel("The server rejected the API key", [
+            f"{base_url}/v1/models: HTTP {status}",
+            f"The key from {key_source} is not the one the server was started with."])
+    elif status in (401, 403):
+        out.error_panel("The server needs an API key", [
+            f"{base_url}/v1/models: HTTP {status}",
+            "Give lil-bench the key the server was started with (Flare --api-key-file, vLLM --api-key):",
+            "  lil-bench --api-key-file PATH, or LIL_BENCH_API_KEY in the environment"])
+    else:
+        out.error_panel("The server does not answer", [f"{base_url}/v1/models: {error}",
+                                                         "Wait until the model has loaded and try again."])
+    return EXIT_SERVER
+
+
+def prepare_flare(out: Output, args, docker, target: dict, api_key: str | None = None,
+                  key_source: str | None = None):
     """The API state and description of a Flare server, or an exit code after an error panel."""
     base_url = target["url"]
     if not base_url:
@@ -601,11 +669,9 @@ def prepare_flare(out: Output, args, docker, target: dict):
             "Pass the server's address: lil-bench --url http://HOST:PORT --container NAME"])
         return EXIT_SERVER
     try:
-        state = server.server_state(base_url)
+        state = server.server_state(base_url, api_key=api_key)
     except Exception as error:  # noqa: BLE001
-        out.error_panel("The server does not answer", [f"{base_url}/v1/models: {error}",
-                                                         "Wait until the model has loaded and try again."])
-        return EXIT_SERVER
+        return unanswered(out, base_url, error, key_source)
     try:
         described = flare.describe(state, base_url, container_name=target["container"],
                                    log_file=args.server_log or None, docker=docker)
@@ -719,9 +785,18 @@ def command_run(out: Output, args) -> int:
             return code
 
     out.step("Serving process")
+    try:
+        api_key, key_source = read_api_key(args)
+    except ValueError as error:
+        out.error_panel("Cannot read the API key", [str(error)])
+        return EXIT_SERVER
+    secrets = [api_key] if len(api_key) >= MASK_MIN_LENGTH else []
+    out.secrets += secrets
+    if key_source:
+        out.ok(f"API key from {key_source}")
     docker = flare.Docker.open()
     try:
-        target = flare_target(args, docker)
+        target = flare_target(args, docker, api_key)
     except flare.DockerError as error:
         out.error_panel("Cannot pick the Flare server", [str(error)])
         return EXIT_SERVER
@@ -729,7 +804,7 @@ def command_run(out: Output, args) -> int:
     described: dict = {}
     selection = None
     if target:
-        prepared = prepare_flare(out, args, docker, target)
+        prepared = prepare_flare(out, args, docker, target, api_key, key_source)
         if isinstance(prepared, int):
             return prepared
         described, state = prepared
@@ -759,11 +834,9 @@ def command_run(out: Output, args) -> int:
             return EXIT_SERVER
         base_url = args.url.rstrip("/") or f"http://127.0.0.1:{limits['port']}"
         try:
-            state = server.server_state(base_url)
+            state = server.server_state(base_url, api_key=api_key)
         except Exception as error:  # noqa: BLE001
-            out.error_panel("The server does not answer", [f"{base_url}/v1/models: {error}",
-                                                             "Wait until the model has loaded and try again."])
-            return EXIT_SERVER
+            return unanswered(out, base_url, error, key_source)
         dcp = None
         for key in ("decode-context-parallel-size", "dcp"):
             value = serve["options"].get(key)
@@ -797,7 +870,7 @@ def command_run(out: Output, args) -> int:
     busy = 0.0
     for _ in range(profile["idle_check_s"]):
         try:
-            busy = max(busy, server.busy_requests(base_url))
+            busy = max(busy, server.busy_requests(base_url, api_key=api_key))
         except Exception:  # noqa: BLE001
             break
         time.sleep(1)
@@ -824,7 +897,8 @@ def command_run(out: Output, args) -> int:
     indices = selection["indices"] if selection else None
     recorder = telemetry.Recorder(interval=0.5, indices=indices).start()
     server_recorder = telemetry.ServerRecorder(base_url, recorder.t0, names=telemetry.FLARE_SERVER_METRICS
-                                               if engine == "flare" else telemetry.SERVER_METRICS).start()
+                                               if engine == "flare" else telemetry.SERVER_METRICS,
+                                               api_key=api_key).start()
     pcie_recorder = telemetry.PcieRecorder(recorder.t0, indices=indices).start()
     workdir = result_dir()
     run_id = str(uuid.uuid4())
@@ -872,7 +946,7 @@ def command_run(out: Output, args) -> int:
             p2p_result = {"status": "skipped", "reason": "--no-p2pmark"}
         else:
             p2p_start = time.time()
-            p2p_result = run_p2pmark(out, hardware, base_url, workdir, selection)
+            p2p_result = run_p2pmark(out, hardware, base_url, workdir, selection, api_key=api_key)
             if p2p_result.pop("ran", False):
                 phases.append({"kind": "p2pmark", "name": "p2pmark", "start": p2p_start,
                                "measure_start": p2p_start, "end": time.time()})
@@ -883,7 +957,10 @@ def command_run(out: Output, args) -> int:
         cmd = bench_command(base_url, state.get("model_id") or serve.get("model") or "", profile, plan, output, dcp)
         env = {**os.environ, "LLM_BENCH_EVENT_FILE": str(events), "LLM_BENCH_NO_UPDATE_CHECK": "1",
                "LLM_BENCH_CACHE_DIR": str(workdir / "bench-cache"), "TERM": "dumb"}
-        env.pop("LIL_BENCH_TOKEN", None)
+        for name in ("LIL_BENCH_TOKEN", "LIL_BENCH_API_KEY", "LLM_BENCH_API_KEY"):
+            env.pop(name, None)
+        if api_key:
+            env["LLM_BENCH_API_KEY"] = api_key  # llm_decode_bench's --api-key, kept off its command line
         follower = EventFollower(events, out, total_steps, 2, estimate - 90)
         follower.start()
         with open(log, "w") as log_handle:
@@ -941,10 +1018,10 @@ def command_run(out: Output, args) -> int:
         "image": image,
         "integrity": code,
         "server": described["server"] if target else {
-            "pid": process and process["pid"], "argv": process and process["argv"],
+            "pid": process and process["pid"], "argv": process and server.redact_argv(process["argv"]),
             "environment": server.filtered_environment(process["pid"]) if process else {},
-            "model": serve.get("model"), "options": serve["options"], "limits": limits, "api": state,
-            "url": base_url, **({"nodes": nodes} if nodes else {})},
+            "model": serve.get("model"), "options": server.redact_options(serve["options"]),
+            "limits": limits, "api": state, "url": base_url, **({"nodes": nodes} if nodes else {})},
         **({"flare": described["flare"]} if target else {}),
         "hardware": hardware,
         "plan": plan,
@@ -958,6 +1035,7 @@ def command_run(out: Output, args) -> int:
                      "pcie": telemetry.link_health(link_events)},
     }
     document["summary"] = summarize(document)
+    document = scrub(document, secrets)  # e.g. a key the benchmark's log or an environment echoed
     path = save(document, workdir)
     if status == "complete":
         print_summary(out, document)
@@ -983,20 +1061,44 @@ def _bench_version() -> str | None:
         return None
 
 
+SECRET_ARGS = ("--token", "--api-key")
+
+
+def _secret_arg(name: str) -> bool:
+    """--token or --api-key, also as the abbreviation argparse accepts (--tok)."""
+    return len(name) > 2 and any(option.startswith(name) for option in SECRET_ARGS)
+
+
 def _safe_argv() -> list[str]:
     argv, skip = [], False
     for arg in sys.argv[1:]:
+        name, sep, _ = arg.partition("=")
         if skip:
             argv.append("***")
             skip = False
-        elif arg == "--token":
+        elif sep and _secret_arg(name):
+            argv.append(f"{name}=***")
+        elif _secret_arg(arg):
             argv.append(arg)
             skip = True
-        elif arg.startswith("--token="):
-            argv.append("--token=***")
         else:
             argv.append(arg)
     return argv
+
+
+def scrub(value, secrets: list[str]):
+    """``value`` with every copy of a secret in its strings, keys included, replaced by ``***``."""
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, "***")
+        return value
+    if isinstance(value, dict):
+        return {scrub(key, secrets): scrub(item, secrets) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub(item, secrets) for item in value]
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:

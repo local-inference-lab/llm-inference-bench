@@ -428,7 +428,7 @@ def test_host_discovery_prefers_flare_over_vllm_of_other_containers(tmp_path, mo
 def test_a_port_that_does_not_speak_http_is_not_flare(monkeypatch):
     import http.client
 
-    def broken(url, timeout=10.0):
+    def broken(url, timeout=10.0, api_key=None):
         raise http.client.BadStatusLine("garbage")
     monkeypatch.setattr(server, "http_json", broken)
     monkeypatch.setattr(server, "http_text", broken)
@@ -560,8 +560,8 @@ def test_server_state_of_flare(monkeypatch):
                         "flare": {"max_concurrency": 8, "prefill_chunk_size": 4096}}]}
     metrics = "flare_total_kv_tokens 1234567\nflare_kv_page_tokens 64\nflare_http_request_capacity 8\n" \
               "flare_active_requests 0\nflare_pending_requests 2\n"
-    monkeypatch.setattr(server, "http_json", lambda url, timeout=10.0: models if url.endswith("/v1/models") else {})
-    monkeypatch.setattr(server, "http_text", lambda url, timeout=10.0: metrics)
+    monkeypatch.setattr(server, "http_json", lambda url, timeout=10.0, api_key=None: models if url.endswith("/v1/models") else {})
+    monkeypatch.setattr(server, "http_text", lambda url, timeout=10.0, api_key=None: metrics)
     state = server.server_state("http://x")
     assert state["engine"] == "flare" and state["version"] is None and state["flare"]["max_concurrency"] == 8
     assert state["kv_tokens"] == 1234567 and state["kv_tokens_source"] == "flare" and state["kv_page_tokens"] == 64
@@ -583,11 +583,11 @@ def test_quick_run_beside_a_flare_container(monkeypatch, capsys, site, tmp_path)
     monkeypatch.setattr(flare.Docker, "open", classmethod(lambda cls: docker))
     monkeypatch.setattr(flare, "nvml_devices", lambda: DEVICES)
     monkeypatch.setattr(server, "find_server", lambda: pytest.fail("a Flare --url never looks for vLLM"))
-    monkeypatch.setattr(server, "is_flare", lambda url: True)
-    monkeypatch.setattr(server, "server_state", lambda url: {
+    monkeypatch.setattr(server, "is_flare", lambda url, api_key=None: True)
+    monkeypatch.setattr(server, "server_state", lambda url, api_key=None: {
         "model_id": "Example-Model", "max_model_len": 32768, "root": "example-base/Example-Model", "engine": "flare",
         "flare": {"max_concurrency": 8}, "kv_tokens": 100000, "kv_tokens_source": "flare", "version": None})
-    monkeypatch.setattr(server, "busy_requests", lambda url: 0.0)
+    monkeypatch.setattr(server, "busy_requests", lambda url, api_key=None: 0.0)
     monkeypatch.setattr(standard.time, "sleep", lambda s: None)
     sources = []
 
@@ -632,7 +632,7 @@ def test_quick_run_beside_a_flare_container(monkeypatch, capsys, site, tmp_path)
 
 
 def test_a_url_that_is_not_flare_keeps_the_vllm_path(monkeypatch):
-    monkeypatch.setattr(server, "is_flare", lambda url: False)
+    monkeypatch.setattr(server, "is_flare", lambda url, api_key=None: False)
 
     class Args:
         url, container, server_log = "http://127.0.0.1:8000", "", ""

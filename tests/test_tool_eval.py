@@ -610,7 +610,8 @@ if argv == ["--version"]:
     print("tool-eval-bench 2.7.1.dev14+g570951a77")
     sys.exit(0)
 record = {"argv": argv, "cwd": os.getcwd(),
-          "env": {k: os.environ.get(k) for k in ("TOOL_EVAL_API_KEY", "TOOL_EVAL_PROVIDER", "PYTHONPATH")}}
+          "env": {k: os.environ.get(k) for k in ("TOOL_EVAL_API_KEY", "TOOL_EVAL_PROVIDER", "PYTHONPATH",
+                                        "LLM_BENCH_API_KEY")}}
 with open(os.environ["FAKE_TOOL_EVAL_RECORD"], "w") as fh:
     json.dump(record, fh)
 mode = os.environ.get("FAKE_TOOL_EVAL_MODE", "ok")
@@ -651,11 +652,18 @@ sys.exit(int(os.environ.get("FAKE_TOOL_EVAL_EXIT", "0")))
 
 
 class StubServer:
-    def __init__(self, model="glm-5.3-flash"):
+    """/v1/models and /version; with ``api_key`` only for ``Authorization: Bearer <api_key>`` (401 otherwise)."""
+
+    def __init__(self, model="glm-5.3-flash", api_key=None):
         payload = json.dumps({"object": "list", "data": [{"id": model, "max_model_len": 131072}]}).encode()
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if api_key and self.headers.get("Authorization") != f"Bearer {api_key}":
+                    self.send_response(401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.path == "/v1/models":
                     body = payload
                 elif self.path == "/version":
@@ -735,7 +743,8 @@ def test_end_to_end_with_leaderboard_settings(monkeypatch, tmp_path, server, fak
     assert tool_eval["command"] == [str(fake_tool), *record["argv"]]
     artifacts = tmp_path / "glm.tool-eval"
     assert record["cwd"] == str(artifacts)
-    assert record["env"] == {"TOOL_EVAL_API_KEY": "sk-test", "TOOL_EVAL_PROVIDER": "", "PYTHONPATH": None}
+    assert record["env"] == {"TOOL_EVAL_API_KEY": "sk-test", "TOOL_EVAL_PROVIDER": "", "PYTHONPATH": None,
+                             "LLM_BENCH_API_KEY": None}
     assert "sk-test" not in json.dumps(report)
     assert (artifacts / "run.json").exists()
     assert tool_eval["report_path"] == str(artifacts / raw["report_path"])  # relative to its directory
@@ -745,6 +754,22 @@ def test_end_to_end_with_leaderboard_settings(monkeypatch, tmp_path, server, fak
     assert "Tool-Call Benchmark" in out and "leaderboard settings" in out
     assert f"{raw['final_score']}/100" in out
     assert "a plain warning line [not markup]" in out
+
+
+def test_api_key_from_the_environment_reaches_the_server_and_tool_eval(monkeypatch, tmp_path, fake_tool):
+    # lil-bench hands its key over as LLM_BENCH_API_KEY, the default of --api-key.
+    stub = StubServer(api_key="sk-env")
+    try:
+        monkeypatch.setenv("LLM_BENCH_API_KEY", "sk-env")
+        output = tmp_path / "env.json"
+        code = run_main(monkeypatch, "--tool-eval", "--host", "127.0.0.1", "--port", str(stub.port),
+                        "--tool-eval-bin", str(fake_tool), "--output", str(output))
+    finally:
+        stub.close()
+    assert code == 0
+    record = json.loads((tmp_path / "record.json").read_text())
+    assert record["env"]["TOOL_EVAL_API_KEY"] == "sk-env" and record["env"]["LLM_BENCH_API_KEY"] is None
+    assert "sk-env" not in json.dumps(record["argv"]) and "sk-env" not in output.read_text()
 
 
 @pytest.mark.parametrize("mode, kind, text", [
