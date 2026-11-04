@@ -181,7 +181,14 @@ def host_memory_mib(proc_root: str = "/proc") -> int | None:
     return int(match.group(1)) // 1024 if match else None
 
 
-def nvml_gpus(proc_root: str = "/proc") -> dict:
+def nvml_gpus(proc_root: str = "/proc", select: list[str] | None = None) -> dict:
+    """Every GPU NVML sees, or only the ``select`` UUIDs.
+
+    Selected GPUs are numbered 0..n-1 in NVML order, the way a container that
+    is given only those GPUs sees them; ``host_index`` keeps NVML's own
+    index. lil-bench selects the server's GPUs when it runs beside a Flare
+    container instead of inside the server's container.
+    """
     try:
         import pynvml
     except ImportError:
@@ -204,10 +211,14 @@ def nvml_gpus(proc_root: str = "/proc") -> dict:
         "nvml_version": call("nvmlSystemGetNVMLVersion"),
     }
     gpus = []
-    for index in range(call("nvmlDeviceGetCount") or 0):
-        handle = call("nvmlDeviceGetHandleByIndex", index)
+    for host_index in range(call("nvmlDeviceGetCount") or 0):
+        handle = call("nvmlDeviceGetHandleByIndex", host_index)
         if handle is None:
             continue
+        uuid = call("nvmlDeviceGetUUID", handle)
+        if select is not None and uuid not in select:
+            continue
+        index = host_index if select is None else len(gpus)
         pci = call("nvmlDeviceGetPciInfo_v3", handle) or call("nvmlDeviceGetPciInfo", handle)
         bus_id = pci.busId.decode() if pci is not None and isinstance(pci.busId, bytes) else getattr(pci, "busId", "")
         memory = call("nvmlDeviceGetMemoryInfo", handle)
@@ -221,7 +232,7 @@ def nvml_gpus(proc_root: str = "/proc") -> dict:
         gpu = {
             "index": index,
             "name": name,
-            "uuid_hash": identity_hash(call("nvmlDeviceGetUUID", handle)),
+            "uuid_hash": identity_hash(uuid),
             "bdf": normalize_bdf(bus_id) if bus_id else None,
             "pci_device_id": f"0x{pci.pciDeviceId:08x}" if pci is not None else None,
             "pci_subsystem_id": f"0x{pci.pciSubSystemId:08x}" if pci is not None else None,
@@ -276,6 +287,8 @@ def nvml_gpus(proc_root: str = "/proc") -> dict:
                 if hasattr(pynvml, const)
             },
         }
+        if select is not None:
+            gpu["host_index"] = host_index
         if integrated:
             gpu["integrated"] = True
             # The GPU allocates from the host's memory; NVML reports no
@@ -384,9 +397,47 @@ def host_inventory(proc_root: str = "/proc", sys_root: str = "/sys") -> dict:
     }
 
 
-def collect(sys_root: str = "/sys", proc_root: str = "/proc") -> dict:
-    nvml = nvml_gpus(proc_root)
+def select_matrix(text: str | None, mapping: dict[int, int]) -> str | None:
+    """An ``nvidia-smi topo`` matrix narrowed to the selected GPUs, renamed to their new indexes.
+
+    ``mapping`` is host index → selected index. NIC columns and rows, the
+    affinity columns and the legend stay.
+    """
+    if not text or not mapping:
+        return text
+    lines = re.sub(r"\x1b\[[0-9;]*m", "", text).split("\n")
+    header = next((i for i, line in enumerate(lines) if re.search(r"\tGPU\d+", line)), None)
+    if header is None:
+        return text
+    cells = lines[header].split("\t")
+
+    def keep(cell: str) -> bool:
+        match = re.fullmatch(r"\s*GPU(\d+)\s*", cell)
+        return not match or int(match.group(1)) in mapping
+
+    def rename(cell: str) -> str:
+        return re.sub(r"GPU(\d+)", lambda m: f"GPU{mapping[int(m.group(1))]}" if int(m.group(1)) in mapping else m.group(0), cell)
+
+    columns = [i for i, cell in enumerate(cells) if i == 0 or keep(cell)]
+    out = []
+    for number, line in enumerate(lines):
+        row = line.split("\t")
+        if number != header and not re.fullmatch(r"\s*(GPU|NIC)\d+\s*", row[0]):
+            out.append(line)  # legend and notes
+            continue
+        if number != header and not keep(row[0]):
+            continue
+        # Rows carry one more cell than the header (the empty one before GPU NUMA ID).
+        out.append("\t".join([rename(row[i]) for i in columns if i < len(row)] + row[len(cells):]))
+    return "\n".join(out)
+
+
+def collect(sys_root: str = "/sys", proc_root: str = "/proc", gpus_selected: list[str] | None = None) -> dict:
+    """The whole record; ``gpus_selected`` (UUIDs) limits GPUs, paths and matrices to those GPUs."""
+    nvml = nvml_gpus(proc_root) if gpus_selected is None else nvml_gpus(proc_root, gpus_selected)
     gpus = nvml.get("gpus", [])
+    mapping = {g["host_index"]: g["index"] for g in gpus if "host_index" in g}
+    narrow = (lambda text: select_matrix(text, mapping)) if gpus_selected is not None else (lambda text: text)
     topology = {}
     all_hops = []
     for gpu in gpus:
@@ -409,13 +460,14 @@ def collect(sys_root: str = "/sys", proc_root: str = "/proc") -> dict:
             "lspci_detail": detail,
             "acs": acs_summary(detail),
             "lspci_tree": run(["lspci", "-tv"]).get("stdout"),
-            "nvidia_smi_topo": run(["nvidia-smi", "topo", "-m"]).get("stdout"),
-            "nvidia_smi_p2p_read": run(["nvidia-smi", "topo", "-p2p", "r"]).get("stdout"),
-            "nvidia_smi_p2p_write": run(["nvidia-smi", "topo", "-p2p", "w"]).get("stdout"),
+            "nvidia_smi_topo": narrow(run(["nvidia-smi", "topo", "-m"]).get("stdout")),
+            "nvidia_smi_p2p_read": narrow(run(["nvidia-smi", "topo", "-p2p", "r"]).get("stdout")),
+            "nvidia_smi_p2p_write": narrow(run(["nvidia-smi", "topo", "-p2p", "w"]).get("stdout")),
             "nvidia_smi_nvlink": run(["nvidia-smi", "nvlink", "-s"]).get("stdout"),
         },
         "cpu": cpu_inventory(sys_root),
         "memory": memory_inventory(sys_root, proc_root),
         "board": dmi_inventory(sys_root),
         "host": host_inventory(proc_root, sys_root),
+        **({"gpu_selection": {"selected": len(gpus), "host_indices": sorted(mapping)}} if gpus_selected is not None else {}),
     }

@@ -1,5 +1,32 @@
 # Changelog
 
+## lil-bench 1.7 - 2026-11-04
+
+### Flare servers
+
+- `lil-bench --url http://127.0.0.1:PORT` measures a Flare server from beside
+  its container (Flare images hold only the `flare` binary). Without `--url`
+  it takes the only Flare container or `flare run` process on the machine;
+  `--container NAME` names one, `--server-log FILE` supplies the startup log
+  of a server outside Docker.
+- The result says `"engine": "flare"` (vLLM runs now say `"vllm"`) and carries
+  a `flare` block: image reference, registry digests and OCI revision label
+  (the Flare git revision), the `flare run` command, the `/v1/models` package
+  limits, the package (signed source repository, publisher and signing key,
+  Hugging Face revision and commit when the log or `hf download` metadata
+  names them, SHA-256 of the package file), startup steps and KV capacity,
+  and the startup collective choices as logged per tuning group and graph,
+  with decoded b12x profile names (modes 0 and 1 are shared by all-reduce and
+  all-gather and keep both readings). Of the startup log only the recognized
+  lines are stored: step results, the publisher disclosure, package and
+  startup tuning lines.
+- Only the server's GPUs are recorded (NVML process list, else the container's
+  devices and `--gpus`): inventory, `nvidia-smi topo` matrices, clocks, PCIe
+  traffic and p2pmark. Server telemetry samples Flare's counters.
+- Integrity for Flare: entrypoint, mounts and changed files over `/usr/local`,
+  and loader hooks of the container; the site checks the image digest
+  against the published Flare releases.
+
 ## lil-bench 1.5 - 2026-10-27
 
 ### Collective diagnostics (`lil-bench collectives`)

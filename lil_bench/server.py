@@ -3,10 +3,12 @@
 ``lil-bench`` runs through ``docker exec`` in the server's own container, so
 the exact vLLM command line and environment are read from ``/proc`` instead
 of being reconstructed, and the image identifies itself by its manifest.
+The API helpers also read a Flare server, which lil_bench.flare describes.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -59,9 +61,14 @@ def filtered_environment(pid: int | str, proc_root: str = "/proc") -> dict:
         raw = Path(proc_root, str(pid), "environ").read_bytes()
     except OSError:
         return {}
+    return filter_environment(item.decode(errors="replace") for item in raw.split(b"\0"))
+
+
+def filter_environment(items) -> dict:
+    """``KEY=value`` items reduced to the serving-relevant variables, never secrets."""
     env = {}
-    for item in raw.split(b"\0"):
-        key, sep, value = item.decode(errors="replace").partition("=")
+    for item in items:
+        key, sep, value = item.partition("=")
         if not sep or SECRET.search(key):
             continue
         if key in ENV_NAMES or key.startswith(ENV_PREFIXES):
@@ -69,9 +76,9 @@ def filtered_environment(pid: int | str, proc_root: str = "/proc") -> dict:
     return dict(sorted(env.items()))
 
 
-def parse_serve_args(argv: list[str]) -> dict:
-    """Model and options of ``vllm serve`` (``--a b``, ``--a=b`` and flags)."""
-    args = argv[argv.index("serve") + 1:] if "serve" in argv else list(argv)
+def parse_serve_args(argv: list[str], command: str = "serve") -> dict:
+    """Model and options of ``vllm serve`` or ``flare run`` (``--a b``, ``--a=b`` and flags)."""
+    args = argv[argv.index(command) + 1:] if command in argv else list(argv)
     model = None
     options: dict = {}
     index = 0
@@ -209,8 +216,30 @@ def kv_capacity(samples) -> dict:
     return {}
 
 
+def flare_capacity(samples) -> dict:
+    """KV capacity from flare_total_kv_tokens: logical tokens of the whole server.
+
+    Flare reports the cache in tokens after compressed storage, already for
+    the tensor-parallel group, so it is never multiplied by ranks or DCP.
+    """
+    names = {name for name, _, _ in samples}
+    if "flare_total_kv_tokens" not in names:
+        return {}
+    capacity = {"kv_tokens": int(metric_sum(samples, "flare_total_kv_tokens")), "kv_tokens_source": "flare"}
+    if "flare_kv_page_tokens" in names:
+        capacity["kv_page_tokens"] = int(metric_sum(samples, "flare_kv_page_tokens"))
+    if "flare_http_request_capacity" in names:
+        capacity["http_request_capacity"] = int(metric_sum(samples, "flare_http_request_capacity"))
+    return capacity
+
+
 def server_state(base_url: str) -> dict:
-    """What the API reports: served model, context limit and KV capacity."""
+    """What the API reports: served model, context limit and KV capacity.
+
+    A Flare server describes its package in the model entry's ``flare``
+    object (concurrency, prefill chunk, sampling defaults) and has no
+    /version endpoint; ``engine`` says which server answered.
+    """
     models = http_json(f"{base_url}/v1/models")
     entry = (models.get("data") or [{}])[0]
     state = {
@@ -218,20 +247,49 @@ def server_state(base_url: str) -> dict:
         "max_model_len": entry.get("max_model_len"),
         "root": entry.get("root"),
     }
-    try:
-        state["version"] = http_json(f"{base_url}/version").get("version")
-    except (OSError, ValueError, urllib.error.URLError):
-        state["version"] = None
+    if isinstance(entry.get("flare"), dict):
+        state.update(engine="flare", flare=entry["flare"], version=None)
+    else:
+        try:
+            state["version"] = http_json(f"{base_url}/version").get("version")
+        except (OSError, ValueError, urllib.error.URLError):
+            state["version"] = None
     try:
         samples = parse_metrics(http_text(f"{base_url}/metrics"))
-        state.update(kv_capacity(samples))
+        state.update(kv_capacity(samples) or flare_capacity(samples))
         state["metrics"] = True
+        if "engine" not in state and any(name.startswith("flare_") for name, _, _ in samples):
+            state["engine"] = "flare"
     except (OSError, urllib.error.URLError):
         state["metrics"] = False
     return state
 
 
-REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting")
+def is_flare(base_url: str) -> bool:
+    """The server at ``base_url`` is Flare (its model entry or its metrics say so); False if it does not answer."""
+    try:
+        entry = (http_json(f"{base_url}/v1/models", timeout=5).get("data") or [{}])[0]
+        if isinstance(entry, dict) and isinstance(entry.get("flare"), dict):
+            return True
+    except (OSError, ValueError, AttributeError, http.client.HTTPException):
+        pass
+    try:
+        return bool(re.search(r"(?m)^flare_active_requests(?:\{|\s)", http_text(f"{base_url}/metrics", timeout=5)))
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def own_namespace(pid: int | str, proc_root: str = "/proc") -> bool:
+    """The process shares lil-bench's PID namespace: the same container, or both on the host."""
+    try:
+        return os.readlink(f"{proc_root}/{pid}/ns/pid") == os.readlink(f"{proc_root}/self/ns/pid")
+    except OSError:
+        return True  # unreadable: assume the old single-container case
+
+
+# vLLM's running and waiting requests, Flare's active and pending ones.
+REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting",
+                  "flare_active_requests", "flare_pending_requests")
 
 
 def busy_requests(base_url: str, timeout: float = 5.0, strict: bool = False) -> float | None:

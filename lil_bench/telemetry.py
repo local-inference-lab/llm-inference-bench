@@ -56,13 +56,16 @@ SMI_QUERY = ("index,clocks.sm,clocks.mem,clocks.gr,power.draw,temperature.gpu,ut
 
 
 class NvmlSource:
+    """Every GPU, or the NVML ``indices`` of the server's GPUs in that order."""
+
     name = "nvml"
 
-    def __init__(self):
+    def __init__(self, indices: list[int] | None = None):
         import pynvml
         pynvml.nvmlInit()
         self.nvml = pynvml
-        self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
+        indices = range(pynvml.nvmlDeviceGetCount()) if indices is None else indices
+        self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in indices]
         reasons = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None)
         self.reasons = reasons or pynvml.nvmlDeviceGetCurrentClocksThrottleReasons
         self.pcie_fields = [(name, getattr(pynvml, const)) for name, const in PCIE_FIELDS if hasattr(pynvml, const)]
@@ -113,12 +116,13 @@ class NvmlSource:
 class SmiSource:
     name = "nvidia-smi"
 
-    def __init__(self):
+    def __init__(self, indices: list[int] | None = None):
         if shutil.which("nvidia-smi") is None:
             raise RuntimeError("neither NVML nor nvidia-smi is available")
+        self.select = [f"--id={','.join(map(str, indices))}"] if indices is not None else []
 
     def sample(self) -> list[dict]:
-        out = subprocess.run(["nvidia-smi", f"--query-gpu={SMI_QUERY}", "--format=csv,noheader,nounits"],
+        out = subprocess.run(["nvidia-smi", f"--query-gpu={SMI_QUERY}", "--format=csv,noheader,nounits", *self.select],
                              capture_output=True, text=True, timeout=10, check=False).stdout
         rows = []
         for line in out.strip().splitlines():
@@ -143,11 +147,11 @@ class SmiSource:
         return rows
 
 
-def open_source():
+def open_source(indices: list[int] | None = None):
     try:
-        return NvmlSource()
+        return NvmlSource(indices)
     except Exception:  # noqa: BLE001 - fall back to the CLI
-        return SmiSource()
+        return SmiSource(indices)
 
 
 def read_links(bdfs: list[str], sys_root: str = "/sys") -> dict:
@@ -171,9 +175,9 @@ class Recorder:
     """
 
     def __init__(self, interval: float = 0.5, source=None, link_bdfs: list[str] | None = None,
-                 link_every: int = 20, sys_root: str = "/sys"):
+                 link_every: int = 20, sys_root: str = "/sys", indices: list[int] | None = None):
         self.interval = interval
-        self.source = source or open_source()
+        self.source = source or (open_source(indices) if indices is not None else open_source())
         self.t0 = time.time()
         self.times: list[int] = []
         self.columns: list[dict[str, list]] = []
@@ -558,7 +562,7 @@ def overclock_signals(series: dict, gpus: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Server and host: vLLM Prometheus counters and CPU load, once per second
+# Server and host: vLLM or Flare Prometheus counters and CPU load, once per second
 # ---------------------------------------------------------------------------
 
 SERVER_METRICS = (
@@ -567,6 +571,13 @@ SERVER_METRICS = (
     "vllm:num_preemptions_total", "vllm:spec_decode_num_accepted_tokens_total",
     "vllm:spec_decode_num_draft_tokens_total", "vllm:spec_decode_num_drafts_total",
     "vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total", "vllm:request_success_total",
+)
+# Flare's committed tokens, requests, cache and speculation counters.
+FLARE_SERVER_METRICS = (
+    "flare_generated_tokens_total", "flare_prefill_tokens_total", "flare_cache_reused_tokens_total",
+    "flare_active_requests", "flare_pending_requests", "flare_free_kv_tokens", "flare_total_kv_tokens",
+    "flare_preemptions_total", "flare_accepted_draft_tokens_total", "flare_draft_request_rounds_total",
+    "flare_requests_completed_total", "flare_speculative_rounds_total", "flare_replay_gpu_nanoseconds_total",
 )
 
 
@@ -604,10 +615,10 @@ def cpu_temperature(sys_root: str = "/sys") -> float | None:
 
 
 class ServerRecorder:
-    """Samples vLLM /metrics counters and host CPU load in the background."""
+    """Samples the server's /metrics counters (``names``) and host CPU load in the background."""
 
     def __init__(self, base_url: str, t0: float, interval: float = 1.0, fetch=None,
-                 proc_root: str = "/proc", sys_root: str = "/sys"):
+                 proc_root: str = "/proc", sys_root: str = "/sys", names: tuple = SERVER_METRICS):
         from . import server
         self.url = f"{base_url}/metrics"
         self.t0 = t0
@@ -616,7 +627,8 @@ class ServerRecorder:
         self.parse = server.parse_metrics
         self.proc_root, self.sys_root = proc_root, sys_root
         self.times: list[int] = []
-        self.metrics: dict[str, list] = {name: [] for name in SERVER_METRICS}
+        self.engine = "Flare" if names and names[0].startswith("flare_") else "vLLM"
+        self.metrics: dict[str, list] = {name: [] for name in names}
         self.cpu_pct: list = []
         self.cpu_temp_c: list = []
         self.errors = 0
@@ -667,7 +679,7 @@ class ServerRecorder:
     def series(self) -> dict:
         return {"interval_s": self.interval, "t0": self.t0, "t_ms": self.times, "metrics": self.metrics,
                 "host": {"cpu_pct": self.cpu_pct, "cpu_temp_c": self.cpu_temp_c}, "errors": self.errors,
-                "fields": {"metrics": "vLLM Prometheus values summed over label sets; *_total are cumulative"}}
+                "fields": {"metrics": f"{self.engine} Prometheus values summed over label sets; *_total are cumulative"}}
 
 
 # ---------------------------------------------------------------------------
@@ -677,9 +689,10 @@ class ServerRecorder:
 class PcieRecorder:
     """Streams ``nvidia-smi dmon -s t`` (rx/tx MB/s per GPU, 1 s windows)."""
 
-    def __init__(self, t0: float, command=None):
+    def __init__(self, t0: float, command=None, indices: list[int] | None = None):
         self.t0 = t0
-        self.command = command or ["nvidia-smi", "dmon", "-s", "t", "-d", "1"]
+        self.command = command or ["nvidia-smi", "dmon", "-s", "t", "-d", "1",
+                                   *(["-i", ",".join(map(str, indices))] if indices is not None else [])]
         self.times: list[int] = []
         self.gpus: dict[int, dict[str, list]] = {}
         self.error = None

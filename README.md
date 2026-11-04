@@ -299,6 +299,51 @@ lil-bench inventory            # print the hardware/topology record
 Without the image, run it from a checkout inside the container:
 `python3 -m lil_bench` (needs `httpx`, `rich`, and `pynvml`).
 
+### Flare servers
+
+Flare images (`ghcr.io/local-inference-lab/flare`) contain only the `flare`
+binary, so `lil-bench` runs beside the container: from a checkout on the same
+machine, as root or another user who can use Docker:
+
+```bash
+git clone https://github.com/local-inference-lab/llm-inference-bench
+cd llm-inference-bench
+python3 -m venv .venv && .venv/bin/pip install httpx rich psutil nvidia-ml-py
+LIL_BENCH_TOKEN=lilb_... .venv/bin/python -m lil_bench --url http://127.0.0.1:8000
+```
+
+`--url` is the port the server publishes on this machine; without it
+lil-bench takes the only Flare container (or `flare run` process) here.
+`--container NAME` names the container when several serve or the URL is not
+local. Through the Docker socket (or the docker CLI) lil-bench reads:
+
+- the image reference, registry digest and OCI revision label (the Flare git
+  revision) and the container's `flare run` command;
+- the startup log since the container started (`docker logs`): the package's
+  publisher, signing key and signed source, the Hugging Face commit a hub
+  package resolved to, the KV cache size and the collective profiles startup
+  tuning selected for each captured graph;
+- the SHA-256 of the package file (through `/proc/<pid>/root` or the bind
+  mount), so the site can name the published revision of a local package
+  directory, and the commit `hf download --local-dir` recorded beside it;
+- whether the container runs its image's own binary: entrypoint, mounts and
+  changed files over `/usr/local`, loader hooks such as `LD_PRELOAD`.
+
+Only the server's GPUs are recorded: NVML's process list names them (else the
+container's devices narrowed by `--gpus`), and the inventory, topology,
+clocks, PCIe traffic and p2pmark use those GPUs. A server started outside
+Docker is found through `/proc`; give its startup log with `--server-log FILE`.
+
+Startup tuning logs one value per tuning group: the transport mode in the
+upper 16 bits and the number of active CTAs in the lower 16 (FlashInfer b12x
+joint PCIe profiles). Modes 2 to 6 are all-reduce kernels (`bulk_push`,
+`bulk_pull`, `pull`, `full_phased`, `payload_rsag_phased`). All-reduce and
+column all-gather share modes 0 and 1 (`full` or `barrier`, `payload_rsag` or
+`word_exchange`), and the log does not say which operation a value belongs
+to, so those keep their raw value. The result stores the raw table and the
+decoded names. A package without startup tuning fixed its collectives at
+export, and its log has no table.
+
 ### Collective diagnostics (`lil-bench collectives`)
 
 Which tensor-parallel all-reduce is fastest depends on how the GPUs reach each
