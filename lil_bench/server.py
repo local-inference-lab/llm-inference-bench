@@ -24,6 +24,10 @@ ENV_PREFIXES = (
     "FLASHINFER_", "TRITON_", "UCX_", "GLOO_", "HF_HUB_", "SAFETENSORS_", "LMCACHE_",
 )
 ENV_NAMES = {"MODEL", "TP", "DCP", "SPECULATOR", "HOST", "PORT"}
+# Serving options whose value is a credential: vLLM's --api-key (one or more
+# keys) and --hf-token, and any other --*-api-key, --*-token, --*-secret or
+# --*-password. File options such as Flare's --api-key-file name a path and stay.
+SECRET_OPTION = re.compile(r"(?:^|-)(?:api-key|token|secret|password|passwd|credentials?)$", re.I)
 MANIFEST = "/opt/venv/share/lil-runtime/manifest.json"
 CONTRACT = "/opt/lil/runtime/image-contract.json"
 # vLLM's own default when --max-num-seqs is not given (V1 engine, GPU).
@@ -74,6 +78,38 @@ def filter_environment(items) -> dict:
         if key in ENV_NAMES or key.startswith(ENV_PREFIXES):
             env[key] = value
     return dict(sorted(env.items()))
+
+
+def secret_option(name: str) -> bool:
+    """A serving option (without the leading dashes) whose value is a credential."""
+    return bool(SECRET_OPTION.search(name.replace("_", "-")))
+
+
+def redact_argv(argv: list[str]) -> list[str]:
+    """A serving command with the values of credential options replaced by ``***``.
+
+    Every value up to the next option is masked: vLLM's ``--api-key`` takes
+    several keys.
+    """
+    redacted, masking = [], False
+    for arg in argv:
+        if masking and not arg.startswith("-"):
+            redacted.append("***")
+            continue
+        masking = False
+        name, sep, _ = arg.partition("=")
+        if arg.startswith("--") and secret_option(name[2:]):
+            redacted.append(f"{name}=***" if sep else arg)
+            masking = not sep
+        else:
+            redacted.append(arg)
+    return redacted
+
+
+def redact_options(options: dict) -> dict:
+    """Parsed serving options (``parse_serve_args``) with credential values replaced by ``***``."""
+    return {name: "***" if isinstance(value, str) and secret_option(name) else value
+            for name, value in options.items()}
 
 
 def parse_serve_args(argv: list[str], command: str = "serve") -> dict:
@@ -158,13 +194,25 @@ def image_identity(manifest_path: str = MANIFEST, contract_path: str = CONTRACT)
     return identity
 
 
-def http_json(url: str, timeout: float = 10.0):
-    with urllib.request.urlopen(url, timeout=timeout) as response:
+def api_request(url: str, api_key: str | None = None) -> urllib.request.Request:
+    """A GET of the server's API, with ``Authorization: Bearer`` when it has an API key.
+
+    The header is not repeated when the server redirects, so the key never
+    reaches another host.
+    """
+    request = urllib.request.Request(url)
+    if api_key:
+        request.add_unredirected_header("Authorization", f"Bearer {api_key}")
+    return request
+
+
+def http_json(url: str, timeout: float = 10.0, api_key: str | None = None):
+    with urllib.request.urlopen(api_request(url, api_key), timeout=timeout) as response:
         return json.loads(response.read())
 
 
-def http_text(url: str, timeout: float = 10.0) -> str:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
+def http_text(url: str, timeout: float = 10.0, api_key: str | None = None) -> str:
+    with urllib.request.urlopen(api_request(url, api_key), timeout=timeout) as response:
         return response.read().decode(errors="replace")
 
 
@@ -233,14 +281,15 @@ def flare_capacity(samples) -> dict:
     return capacity
 
 
-def server_state(base_url: str) -> dict:
+def server_state(base_url: str, api_key: str | None = None) -> dict:
     """What the API reports: served model, context limit and KV capacity.
 
     A Flare server describes its package in the model entry's ``flare``
     object (concurrency, prefill chunk, sampling defaults) and has no
-    /version endpoint; ``engine`` says which server answered.
+    /version endpoint; ``engine`` says which server answered. ``api_key``
+    goes with every request (Flare --api-key-file, vLLM --api-key).
     """
-    models = http_json(f"{base_url}/v1/models")
+    models = http_json(f"{base_url}/v1/models", api_key=api_key)
     entry = (models.get("data") or [{}])[0]
     state = {
         "model_id": entry.get("id"),
@@ -251,11 +300,11 @@ def server_state(base_url: str) -> dict:
         state.update(engine="flare", flare=entry["flare"], version=None)
     else:
         try:
-            state["version"] = http_json(f"{base_url}/version").get("version")
+            state["version"] = http_json(f"{base_url}/version", api_key=api_key).get("version")
         except (OSError, ValueError, urllib.error.URLError):
             state["version"] = None
     try:
-        samples = parse_metrics(http_text(f"{base_url}/metrics"))
+        samples = parse_metrics(http_text(f"{base_url}/metrics", api_key=api_key))
         state.update(kv_capacity(samples) or flare_capacity(samples))
         state["metrics"] = True
         if "engine" not in state and any(name.startswith("flare_") for name, _, _ in samples):
@@ -265,16 +314,17 @@ def server_state(base_url: str) -> dict:
     return state
 
 
-def is_flare(base_url: str) -> bool:
+def is_flare(base_url: str, api_key: str | None = None) -> bool:
     """The server at ``base_url`` is Flare (its model entry or its metrics say so); False if it does not answer."""
     try:
-        entry = (http_json(f"{base_url}/v1/models", timeout=5).get("data") or [{}])[0]
+        entry = (http_json(f"{base_url}/v1/models", timeout=5, api_key=api_key).get("data") or [{}])[0]
         if isinstance(entry, dict) and isinstance(entry.get("flare"), dict):
             return True
     except (OSError, ValueError, AttributeError, http.client.HTTPException):
         pass
     try:
-        return bool(re.search(r"(?m)^flare_active_requests(?:\{|\s)", http_text(f"{base_url}/metrics", timeout=5)))
+        return bool(re.search(r"(?m)^flare_active_requests(?:\{|\s)",
+                              http_text(f"{base_url}/metrics", timeout=5, api_key=api_key)))
     except (OSError, ValueError, http.client.HTTPException):
         return False
 
@@ -292,13 +342,13 @@ REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting",
                   "flare_active_requests", "flare_pending_requests")
 
 
-def busy_requests(base_url: str, timeout: float = 5.0, strict: bool = False) -> float | None:
+def busy_requests(base_url: str, timeout: float = 5.0, strict: bool = False, api_key: str | None = None) -> float | None:
     """Requests the server is running or has queued.
 
     ``strict``: None when /metrics does not report the request gauges, so an
     unknown state is not mistaken for an idle server.
     """
-    samples = parse_metrics(http_text(f"{base_url}/metrics", timeout=timeout))
+    samples = parse_metrics(http_text(f"{base_url}/metrics", timeout=timeout, api_key=api_key))
     if strict and not {name for name, _, _ in samples} & set(REQUEST_GAUGES):
         return None
     return sum(metric_sum(samples, name) for name in REQUEST_GAUGES)

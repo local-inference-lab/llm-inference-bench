@@ -1,5 +1,28 @@
 # Changelog
 
+## lil-bench 1.7.1 - 2026-11-04
+
+### Servers with an API key
+
+- `--api-key-file PATH`, or `LIL_BENCH_API_KEY` in the environment, measures a
+  server started with an API key (Flare `--api-key-file`, vLLM `--api-key` or
+  `VLLM_API_KEY`). The key is never taken on the command line, where every
+  process list shows it: `--api-key VALUE` is refused.
+- lil-bench sends it as `Authorization: Bearer` with its own requests
+  (`/v1/models`, `/version`, `/metrics`, the idle checks and the server
+  telemetry), never after a redirect, and hands it to `llm_decode_bench` as
+  `LLM_BENCH_API_KEY`, now the default of its `--api-key` (also for
+  `--tool-eval`, which passes it on as `TOOL_EVAL_API_KEY` only).
+- A missing or refused key is named as such instead of "The server does not
+  answer".
+- The key is never recorded or uploaded: the values of `--api-key`,
+  `--hf-token` and other `--*-api-key`, `--*-token`, `--*-secret` or
+  `--*-password` options in the recorded vLLM or Flare command and its options
+  become `***` (a `--api-key-file` path stays), any other copy of the key in
+  the result or the terminal output is masked, and `llm_decode_bench` no
+  longer records secret-named variables such as `VLLM_API_KEY` in its startup
+  diagnostics.
+
 ## lil-bench 1.7 - 2026-11-04
 
 ### Flare servers

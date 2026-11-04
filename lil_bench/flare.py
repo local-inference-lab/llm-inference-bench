@@ -977,8 +977,9 @@ def describe(state: dict, base_url: str, *, docker: Docker | None, container_nam
     }
     if container is not None:
         flare["container"] = {k: v for k, v in flare["container"].items() if v is not None}
-    server_block = {"pid": pid, "argv": argv, "environment": environment, "model": serve.get("model"),
-                    "options": options, "limits": limits, "api": state, "url": base_url}
+    server_block = {"pid": pid, "argv": server.redact_argv(argv), "environment": environment,
+                    "model": serve.get("model"), "options": server.redact_options(options), "limits": limits,
+                    "api": state, "url": base_url}
     return {"flare": flare, "server": server_block, "image": image, "integrity": code, "gpus": gpus,
             "gpu_indices": [d["index"] for d in devices if gpus and d["uuid"] in gpus],
             "notes": notes, "container_name": (container or {}).get("Name", "").lstrip("/") or None}

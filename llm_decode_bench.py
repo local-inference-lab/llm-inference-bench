@@ -7497,12 +7497,16 @@ def print_amd_fabric_summary(console: Console, result: dict) -> None:
     )
 
 
+# Whole name segments only: VLLM_API_KEY is a secret, MAX_TOKENS is not (the rule of lil-bench).
+SECRET_ENV_NAME = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|KEY|CREDENTIALS?)($|_)", re.I)
+
+
 def collect_startup_diagnostics(args, base_url: str) -> dict:
     env_prefixes = ("NCCL_", "VLLM_", "SGLANG_", "CUDA_", "OMP_")
     env = {
         k: v
         for k, v in sorted(os.environ.items())
-        if k.startswith(env_prefixes)
+        if k.startswith(env_prefixes) and not SECRET_ENV_NAME.search(k)
     }
     diagnostics = {
         "version": VERSION,
@@ -18302,12 +18306,13 @@ def tool_eval_child_env(api_key: str = "", venv_dir: Optional[Path] = None) -> d
 
     TOOL_EVAL_PROVIDER is blanked so a named provider in the environment or a
     .env file cannot redirect the run, and the API key travels in the
-    environment instead of argv (process lists, the recorded command).
-    PYTHONPATH and PYTHONHOME are dropped so the serving environment's packages
-    cannot shadow tool-eval-bench's own.
+    environment instead of argv (process lists, the recorded command), as
+    TOOL_EVAL_API_KEY only. PYTHONPATH and PYTHONHOME are dropped so the
+    serving environment's packages cannot shadow tool-eval-bench's own.
     """
     env = dict(os.environ)
-    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"):
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__",
+                 "LLM_BENCH_API_KEY"):
         env.pop(name, None)
     if venv_dir is not None:
         env["VIRTUAL_ENV"] = str(venv_dir)
@@ -22086,8 +22091,9 @@ def parse_args():
     )
     parser.add_argument("--port", type=int, default=None, help="Server port (default: 5000, or appended to URL when --host is a URL)")
     parser.add_argument(
-        "--api-key", default="",
-        help="API key for authenticated endpoints (sent as Authorization: Bearer header)"
+        "--api-key", default=os.environ.get("LLM_BENCH_API_KEY", ""),
+        help="API key for authenticated endpoints (sent as Authorization: Bearer header; "
+             "default: $LLM_BENCH_API_KEY, which keeps the key out of the process list)"
     )
     parser.add_argument(
         "--prompt", default="",

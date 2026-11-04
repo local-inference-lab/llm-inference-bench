@@ -756,7 +756,7 @@ def test_unreachable_site_is_retryable():
 # ---------------------------------------------------------------------------
 
 def run_main(argv, monkeypatch, capsys, env=None):
-    for key in ("LIL_BENCH_TOKEN", "LIL_BENCH_SITE"):
+    for key in ("LIL_BENCH_TOKEN", "LIL_BENCH_SITE", "LIL_BENCH_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
@@ -814,8 +814,8 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
     # The reused case also stands for rank 0 of a server that spans two machines.
     nodes = ["--nnodes", "2", "--master-addr", "10.200.0.11"] if p2pmark == "reused" else []
     monkeypatch.setattr(server, "find_server", lambda: {"pid": os.getpid(), "argv": ["vllm", "serve", "org/M", "--port", "5091", "--max-num-seqs", "4", *nodes]})
-    monkeypatch.setattr(server, "server_state", lambda url: {"model_id": "org/M", "max_model_len": 32768, "kv_tokens": 100000})
-    monkeypatch.setattr(server, "busy_requests", lambda url: 0.0)
+    monkeypatch.setattr(server, "server_state", lambda url, api_key=None: {"model_id": "org/M", "max_model_len": 32768, "kv_tokens": 100000})
+    monkeypatch.setattr(server, "busy_requests", lambda url, api_key=None: 0.0)
     monkeypatch.setattr(server, "image_identity", lambda: {"alias": "ghcr.io/x:kk-beta", "assembly_sha256": "ab" * 32})
     monkeypatch.setattr(standard.time, "sleep", lambda s: None)
     counters = {"pcie_replay": 0, "pcie_corr_err": 0, "pcie_recovery": 7}
@@ -825,7 +825,7 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
         "tuning": [], "pcie": {"gpu_paths": {}}, "cpu": {"lscpu": {"Model name": "CPU"}}, "memory": {"mem_total_mib": 1024}})
     p2p_calls = []
 
-    def fake_p2pmark(out, hardware, base_url, directory, selection=None):
+    def fake_p2pmark(out, hardware, base_url, directory, selection=None, api_key=None):
         p2p_calls.append((base_url, directory))
         assert selection is None  # a vLLM container sees only its own GPUs
         if p2pmark == "measured":
@@ -867,8 +867,8 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
 
 def test_busy_server_is_refused(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(server, "find_server", lambda: {"pid": 1, "argv": ["vllm", "serve", "m"]})
-    monkeypatch.setattr(server, "server_state", lambda url: {"model_id": "m", "max_model_len": 4096})
-    monkeypatch.setattr(server, "busy_requests", lambda url: 3.0)
+    monkeypatch.setattr(server, "server_state", lambda url, api_key=None: {"model_id": "m", "max_model_len": 4096})
+    monkeypatch.setattr(server, "busy_requests", lambda url, api_key=None: 3.0)
     monkeypatch.setattr(server, "image_identity", lambda: {})
     monkeypatch.setattr(standard.time, "sleep", lambda s: None)
     code, out = run_main(["run", "--no-upload"], monkeypatch, capsys)
