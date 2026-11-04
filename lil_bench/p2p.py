@@ -226,8 +226,8 @@ def launched(result: dict) -> bool:
     return "returncode" in result or "stdout" in result
 
 
-def _diagnostic(bench, console, mode: str, size: int, abort, before) -> dict:
-    """One llm_p2pmark run; ``before`` is checked right before the launch."""
+def _diagnostic(bench, console, mode: str, size: int, abort, before, env: dict | None = None) -> dict:
+    """One llm_p2pmark run; ``before`` is checked right before the launch, ``env`` adds variables."""
     reason = before()
     if reason:
         return {"status": "aborted", "mode": mode, "reason": f"not started: {reason}"}
@@ -237,20 +237,21 @@ def _diagnostic(bench, console, mode: str, size: int, abort, before) -> dict:
         p2pmark_timeout=300.0, p2pmark_detail=False,
     )
     try:
-        return bench.run_p2pmark_diagnostic(args, console, abort=abort, summary=False, extra_env=P2PMARK_ENV)
+        return bench.run_p2pmark_diagnostic(args, console, abort=abort, summary=False,
+                                            extra_env={**P2PMARK_ENV, **(env or {})})
     except Exception as error:  # noqa: BLE001
         return {"status": "error", "error": f"{type(error).__name__}: {error}"}
 
 
-def execute(bench, console, chosen: dict, abort, before) -> dict:
+def execute(bench, console, chosen: dict, abort, before, env: dict | None = None) -> dict:
     """Run the planned parts: one ``all`` run, or ``bandwidth`` then ``latency``."""
     size = chosen["size_mib"]
     if "allreduce" in chosen["parts"]:
-        return _diagnostic(bench, console, "all", size, abort, before)
-    copies = _diagnostic(bench, console, "bandwidth", size, abort, before)
+        return _diagnostic(bench, console, "all", size, abort, before, env)
+    copies = _diagnostic(bench, console, "bandwidth", size, abort, before, env)
     if copies.get("status") != "ok":
         return copies
-    latency = _diagnostic(bench, console, "latency", size, abort, before)
+    latency = _diagnostic(bench, console, "latency", size, abort, before, env)
     data = {**(copies.get("data") or {}), "mode": "bandwidth+latency"}
     merged = {**copies, "mode": "bandwidth+latency", "data": data,
               "commands": [copies.get("cmd"), latency.get("cmd")],
@@ -293,11 +294,13 @@ def _brief(attempt: dict) -> dict:
 
 
 def measure(out, hardware: dict, bench, *, free_fn, busy_fn=None, directory: Path | None = None,
-            console=None, proc_root: str = "/proc", now=time.time) -> dict:
+            console=None, proc_root: str = "/proc", now=time.time, env: dict | None = None) -> dict:
     """p2pmark for this run: measured now, reused from an earlier run, or skipped with the reason.
 
     ``ran`` in the returned dict is True when llm_p2pmark was started (the
-    caller records a telemetry phase for it and removes the key).
+    caller records a telemetry phase for it and removes the key). ``env``
+    narrows llm_p2pmark to the server's GPUs (CUDA_VISIBLE_DEVICES) when
+    lil-bench runs beside the server and sees every GPU of the machine.
     """
     free = free_fn()
     if free:
@@ -331,7 +334,7 @@ def measure(out, hardware: dict, bench, *, free_fn, busy_fn=None, directory: Pat
                 out.info(f"no {part}: {reason}")
             started = now()
             before = lambda: server_busy(busy_fn) or memory_short(free_fn, chosen["need_mib"])  # noqa: E731
-            attempt = execute(bench, console, chosen, guard(free_fn, busy_fn), before)
+            attempt = execute(bench, console, chosen, guard(free_fn, busy_fn), before, env)
             attempt.update(buffer_mib=chosen["size_mib"], parts=chosen["parts"],
                            measured_at=datetime.fromtimestamp(started, timezone.utc).isoformat())
             if chosen.get("skipped_parts"):

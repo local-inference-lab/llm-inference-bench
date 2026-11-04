@@ -825,8 +825,9 @@ def test_quick_run_end_to_end_with_stub_bench(monkeypatch, capsys, site, tmp_pat
         "tuning": [], "pcie": {"gpu_paths": {}}, "cpu": {"lscpu": {"Model name": "CPU"}}, "memory": {"mem_total_mib": 1024}})
     p2p_calls = []
 
-    def fake_p2pmark(out, hardware, base_url, directory):
+    def fake_p2pmark(out, hardware, base_url, directory, selection=None):
         p2p_calls.append((base_url, directory))
+        assert selection is None  # a vLLM container sees only its own GPUs
         if p2pmark == "measured":
             return {"status": "ok", "ran": True, "data": P2P_DATA}
         return {"status": "ok", "ran": False, "data": P2P_DATA, "reused": {"run_id": "earlier"}}

@@ -1,4 +1,4 @@
-"""``lil-bench``: the standardized benchmark of a running Karmic Kraken container.
+"""``lil-bench``: the standardized benchmark of a running Karmic Kraken container or Flare server.
 
 Run it in the serving container itself::
 
@@ -8,6 +8,11 @@ It checks the uploader identity, reads the exact serving command from
 ``/proc``, records hardware and PCIe topology, runs p2pmark, the standard
 prefill/decode matrix (``llm_decode_bench.py``) while sampling GPU clocks and
 throttle reasons, then saves and uploads one result document.
+
+A Flare image holds only the ``flare`` binary, so for Flare lil-bench runs
+beside the container (``lil-bench --url http://127.0.0.1:8000``) and reads
+the container, its startup log and the package through Docker
+(``lil_bench.flare``); only the server's GPUs are recorded.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import DEFAULT_SITE, SCHEMA, STANDARD, TOKEN_URL_PATH, VERSION
-from . import collectives, integrity, inventory, p2p, server, telemetry, upload
+from . import collectives, flare, integrity, inventory, p2p, server, telemetry, upload
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "llm_decode_bench.py"
@@ -126,8 +131,12 @@ def fit_context(requested: int, output_tokens: int, max_model_len: int | None) -
 
 
 def concurrency_skip(concurrency: int, max_num_seqs: int, source: str | None = None) -> str:
-    """Why a cell above --max-num-seqs is not measured: expected, not a failure."""
-    setting = f"vLLM's default --max-num-seqs {max_num_seqs}" if source == "vllm_default" else f"--max-num-seqs {max_num_seqs}"
+    """Why a cell above --max-num-seqs (Flare: the concurrency) is not measured: expected, not a failure."""
+    setting = {
+        "vllm_default": f"vLLM's default --max-num-seqs {max_num_seqs}",
+        "flare_argv": f"Flare --max-concurrency {max_num_seqs}",
+        "flare_package": f"the Flare package's concurrency {max_num_seqs}",
+    }.get(source or "", f"--max-num-seqs {max_num_seqs}")
     return (f"the server runs at most {max_num_seqs} requests at once ({setting}), so C{concurrency} would measure "
             f"a queue, not {concurrency} concurrent users; expected with this configuration")
 
@@ -135,11 +144,12 @@ def concurrency_skip(concurrency: int, max_num_seqs: int, source: str | None = N
 def server_kv_tokens(state: dict, dcp: int | None) -> int:
     """KV capacity of the whole server in tokens (see server.kv_capacity).
 
-    vLLM's kv_cache_size_tokens already counts every DCP rank; blocks × block
-    size is one rank's share and is multiplied by the DCP size.
+    vLLM's kv_cache_size_tokens and Flare's flare_total_kv_tokens already
+    count the whole server; blocks × block size is one rank's share and is
+    multiplied by the DCP size.
     """
     tokens = state.get("kv_tokens") or 0
-    if state.get("kv_tokens_source") == "vllm":
+    if state.get("kv_tokens_source") in ("vllm", "flare"):
         return tokens
     return tokens * (dcp or 1)
 
@@ -351,12 +361,12 @@ def load_bench_module():
     return module
 
 
-def free_gpu_memory() -> list[int]:
+def free_gpu_memory(indices: list[int] | None = None) -> list[int]:
     try:
         import pynvml
         pynvml.nvmlInit()
         free = []
-        for i in range(pynvml.nvmlDeviceGetCount()):
+        for i in range(pynvml.nvmlDeviceGetCount()) if indices is None else indices:
             memory = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(i))
             free.append(memory.free // 2**20)
         return free
@@ -364,15 +374,21 @@ def free_gpu_memory() -> list[int]:
         return []
 
 
-def run_p2pmark(out: Output, hardware: dict, base_url: str | None, directory: Path | None) -> dict:
-    """p2pmark next to the loaded model; ``lil_bench.p2p`` keeps it out of the server's way."""
+def run_p2pmark(out: Output, hardware: dict, base_url: str | None, directory: Path | None,
+                selection: dict | None = None) -> dict:
+    """p2pmark next to the loaded model; ``lil_bench.p2p`` keeps it out of the server's way.
+
+    ``selection`` (UUIDs and NVML indices) limits it to the server's GPUs.
+    """
     try:
         bench = load_bench_module()
         from rich.console import Console
         # None when /metrics has no request gauges: p2pmark then treats the server as busy.
         busy = (lambda: server.busy_requests(base_url, timeout=0.5, strict=True)) if base_url else None
-        return p2p.measure(out, hardware, bench, free_fn=free_gpu_memory, busy_fn=busy, directory=directory,
-                           console=Console(force_terminal=out.color, width=120))
+        indices = selection["indices"] if selection else None
+        env = {"CUDA_VISIBLE_DEVICES": ",".join(selection["uuids"])} if selection else None
+        return p2p.measure(out, hardware, bench, free_fn=lambda: free_gpu_memory(indices), busy_fn=busy,
+                           directory=directory, console=Console(force_terminal=out.color, width=120), env=env)
     except Exception as error:  # noqa: BLE001 - p2pmark never fails the benchmark
         out.warn(f"p2pmark error: {type(error).__name__}: {error}")
         return {"status": "error", "error": f"{type(error).__name__}: {error}", "ran": False}
@@ -409,6 +425,10 @@ def bench_command(base_url: str, model_id: str, profile: dict, plan: list[dict],
 def result_dir() -> Path:
     for candidate in RESULT_DIRS:
         path = Path(candidate)
+        # /cache is the images' cache volume; beside a Flare container on a host
+        # without it, the results go to the home directory instead.
+        if candidate.startswith("/cache/") and not path.parent.is_dir():
+            continue
         try:
             path.mkdir(parents=True, exist_ok=True)
             probe = path / ".write-test"
@@ -446,6 +466,7 @@ def summarize(document: dict) -> dict:
     order = ["no_data", "ok", "power_capped", "thermal", "hw_slowdown"]
     code = document.get("integrity") or {}
     return {
+        "engine": document.get("engine", "vllm"),
         "integrity": {"status": code.get("status"), "changed": code.get("changed_count", 0),
                       "added": code.get("added_count", 0), "removed": code.get("removed_count", 0)},
         "prefill": prefill,
@@ -523,7 +544,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--token", default=os.environ.get("LIL_BENCH_TOKEN", ""),
                         help="uploader identifier (default: $LIL_BENCH_TOKEN)")
     parser.add_argument("--site", default=os.environ.get("LIL_BENCH_SITE", DEFAULT_SITE))
-    parser.add_argument("--url", default="", help="server URL (default: the port of the vLLM process in this container)")
+    parser.add_argument("--url", default="", help="server URL (default: the port of the vLLM process in this container, "
+                                                   "else of the only Flare container or process on this machine)")
+    parser.add_argument("--container", default="", help="the Flare container to describe (default: the one serving --url)")
+    parser.add_argument("--server-log", default="", help="Flare startup log, for a Flare server started outside Docker")
     parser.add_argument("--profile", choices=sorted(PROFILES), default="standard",
                         help="'quick' is for testing the setup; its uploads are kept out of statistics")
     parser.add_argument("--no-upload", action="store_true", help="measure and save locally only")
@@ -532,6 +556,118 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="measure even if the server has other requests (flagged; p2pmark does not run next to them)")
     parser.add_argument("--note", default="", help="free text stored with the result (max 500 characters)")
     return parser.parse_args(argv)
+
+
+def flare_target(args, docker) -> dict | None:
+    """The Flare server to measure ({"url", "container"}), or None for a vLLM server.
+
+    --container or --server-log name one and a --url that answers as Flare is
+    one. Without them a vLLM process in lil-bench's own container comes
+    first, then the only Flare container (or ``flare run`` process) on this
+    machine; several of them need --url or --container. On a host, /proc also
+    shows the processes of other containers: a vLLM process there wins only
+    when there is no Flare server.
+    """
+    url = args.url.rstrip("/")
+    if args.container:
+        if docker is None:
+            raise flare.DockerError("--container needs the Docker socket or the docker CLI")
+        return {"url": url or flare.container_url(docker.inspect(args.container)), "container": args.container}
+    if url:
+        return {"url": url, "container": None} if args.server_log or server.is_flare(url) else None
+    process = server.find_server()
+    if process and server.own_namespace(process["pid"]):
+        return None
+    if docker is not None:
+        container, why = flare.find_container(docker, None)
+        if container:
+            return {"url": flare.container_url(container), "container": container.get("Name", "").lstrip("/")}
+        if why and why.startswith("several"):
+            raise flare.DockerError(why.replace("pass --container", "pass --url or --container"))
+    candidates = flare.find_processes(None)
+    if len(candidates) > 1:
+        raise flare.DockerError(f"{len(candidates)} flare run processes on this machine; pass --url")
+    if candidates:
+        port = flare.flare_port(flare.run_options(candidates[0]["argv"])["options"])
+        return {"url": f"http://127.0.0.1:{port}", "container": None}
+    return None
+
+
+def prepare_flare(out: Output, args, docker, target: dict):
+    """The API state and description of a Flare server, or an exit code after an error panel."""
+    base_url = target["url"]
+    if not base_url:
+        out.error_panel("The Flare container publishes no HTTP port", [
+            "Pass the server's address: lil-bench --url http://HOST:PORT --container NAME"])
+        return EXIT_SERVER
+    try:
+        state = server.server_state(base_url)
+    except Exception as error:  # noqa: BLE001
+        out.error_panel("The server does not answer", [f"{base_url}/v1/models: {error}",
+                                                         "Wait until the model has loaded and try again."])
+        return EXIT_SERVER
+    try:
+        described = flare.describe(state, base_url, container_name=target["container"],
+                                   log_file=args.server_log or None, docker=docker)
+    except (flare.DockerError, OSError) as error:
+        out.error_panel("Cannot read the Flare server", [str(error)])
+        return EXIT_SERVER
+    return described, state
+
+
+def print_flare(out: Output, described: dict, state: dict, kv_tokens: int) -> None:
+    """Server, build, package, startup collectives, GPUs and integrity of a Flare server."""
+    block, limits = described["flare"], described["server"]["limits"]
+    where = (f"container {described['container_name']}" if described.get("container_name")
+             else f"process {described['server']['pid']}" if described["server"].get("pid") else "server")
+    out.ok(f"Flare {where} · {described['server']['url']}")
+    source = "--max-concurrency" if limits.get("max_num_seqs_source") == "flare_argv" else "package"
+    out.ok(f"model {state.get('model_id')} · max_model_len {state.get('max_model_len')} · "
+           f"max concurrency {limits.get('max_num_seqs')} ({source}) · KV {kv_tokens:,} tokens")
+    image = block.get("image") or {}
+    if image.get("reference"):
+        digest = image.get("digest") or next((d.split("@", 1)[1] for d in image.get("repo_digests") or []), None)
+        out.ok(f"Flare {(block.get('revision') or 'revision unknown')[:12]} · image {image['reference']}"
+               + (f" ({digest[:19]}…)" if digest else " (no registry digest: a local build)"))
+    else:
+        out.warn("the Flare image is unknown (no container): pass --container, or run lil-bench with Docker access")
+    package = block.get("package") or {}
+    publisher = package.get("publisher") or {}
+    name = package.get("repository") or package.get("argument") or "unknown package"
+    revision = "@" + package["revision"] if package.get("revision") else ""
+    commit = f" (commit {package['commit'][:8]})" if package.get("commit") else ""
+    signer = (f" · signed by {publisher.get('name')} ({publisher.get('namespace')})"
+              + (", verified" if publisher.get("verified") else "") if publisher else " · publisher unknown")
+    out.ok(f"package {name}{revision}{commit}{signer}")
+    file = package.get("file") or {}
+    if file.get("sha256"):
+        out.info(f"package file {file['name']} · {file['size']:,} bytes · sha256 {file['sha256'][:16]}…")
+    if not package.get("commit"):
+        out.info("package commit not named by the server or its download; the site matches the file hash "
+                 "with published revisions")
+    collectives = block.get("collectives") or {}
+    if collectives.get("devices"):
+        tuning = collectives.get("tuning") or {}
+        out.ok(f"startup collectives ({block.get('log_source')}): "
+               + (f"{tuning['graphs']} tuning graphs in {tuning['seconds']} s · " if tuning else "")
+               + flare.collective_summary(collectives))
+    else:
+        out.info(f"startup collectives {collectives.get('status', 'not reported')}: {collectives.get('reason', '')}")
+    if described.get("gpu_indices"):
+        out.ok(f"GPUs {', '.join(map(str, described['gpu_indices']))} of this machine "
+               f"({(block.get('gpus') or {}).get('source')}); only these are recorded")
+    else:
+        out.warn("the server's GPUs are unknown; every GPU of this machine is recorded")
+    for note in described.get("notes") or []:
+        out.warn(note)
+    code = described["integrity"]
+    if code["status"] == "modified":
+        out.error_panel("MODIFIED CONTAINER: the result will be flagged", [
+            "The container can run other code than its image's flare binary:", "  " + code["reason"]])
+    elif code["status"] == "unmodified":
+        out.ok(f"container code: {code['reason']}")
+    else:
+        out.warn(f"container code not verified: {code.get('reason')}")
 
 
 def check_identity(out: Output, args) -> tuple[int, dict | None]:
@@ -583,54 +719,80 @@ def command_run(out: Output, args) -> int:
             return code
 
     out.step("Serving process")
-    process = server.find_server()
-    if not process and not args.url:
-        out.error_panel("No vLLM server in this container", [
-            "lil-bench runs inside the serving container: docker exec --privileged -it … <container> lil-bench",
-            "Use --url http://127.0.0.1:PORT to measure another server (its command line is then unknown).",
-        ])
-        return EXIT_SERVER
-    serve = server.parse_serve_args(process["argv"]) if process else {"model": None, "options": {}}
-    limits = server.serve_limits(serve["options"])
-    nodes = server.serve_nodes(serve["options"])
-    if nodes and (nodes["node_rank"] or nodes["headless"]) and not args.url:
-        out.error_panel("This machine runs a worker rank without an API", [
-            f"The server spans {nodes['nnodes']} machines; this one is node rank {nodes['node_rank']}.",
-            "Run lil-bench in the container of node rank 0, which serves the API.",
-        ])
-        return EXIT_SERVER
-    base_url = args.url.rstrip("/") or f"http://127.0.0.1:{limits['port']}"
+    docker = flare.Docker.open()
     try:
-        state = server.server_state(base_url)
-    except Exception as error:  # noqa: BLE001
-        out.error_panel("The server does not answer", [f"{base_url}/v1/models: {error}",
-                                                         "Wait until the model has loaded and try again."])
+        target = flare_target(args, docker)
+    except flare.DockerError as error:
+        out.error_panel("Cannot pick the Flare server", [str(error)])
         return EXIT_SERVER
-    dcp = None
-    for key in ("decode-context-parallel-size", "dcp"):
-        value = serve["options"].get(key)
-        if isinstance(value, str) and value.isdigit():
-            dcp = int(value)
+    engine = "flare" if target else "vllm"
+    described: dict = {}
+    selection = None
+    if target:
+        prepared = prepare_flare(out, args, docker, target)
+        if isinstance(prepared, int):
+            return prepared
+        described, state = prepared
+        process, nodes, dcp = None, None, None
+        serve = {"model": described["server"]["model"], "options": described["server"]["options"]}
+        limits = described["server"]["limits"]
+        base_url = described["server"]["url"]
+        if described["gpus"]:
+            selection = {"uuids": described["gpus"], "indices": described["gpu_indices"]}
+    else:
+        process = server.find_server()
+        if not process and not args.url:
+            out.error_panel("No vLLM or Flare server found", [
+                "lil-bench runs inside a vLLM serving container: docker exec --privileged -it … <container> lil-bench",
+                "or beside a Flare server: lil-bench --url http://127.0.0.1:PORT [--container NAME]",
+                "Use --url http://127.0.0.1:PORT to measure another server (its command line is then unknown).",
+            ])
+            return EXIT_SERVER
+        serve = server.parse_serve_args(process["argv"]) if process else {"model": None, "options": {}}
+        limits = server.serve_limits(serve["options"])
+        nodes = server.serve_nodes(serve["options"])
+        if nodes and (nodes["node_rank"] or nodes["headless"]) and not args.url:
+            out.error_panel("This machine runs a worker rank without an API", [
+                f"The server spans {nodes['nnodes']} machines; this one is node rank {nodes['node_rank']}.",
+                "Run lil-bench in the container of node rank 0, which serves the API.",
+            ])
+            return EXIT_SERVER
+        base_url = args.url.rstrip("/") or f"http://127.0.0.1:{limits['port']}"
+        try:
+            state = server.server_state(base_url)
+        except Exception as error:  # noqa: BLE001
+            out.error_panel("The server does not answer", [f"{base_url}/v1/models: {error}",
+                                                             "Wait until the model has loaded and try again."])
+            return EXIT_SERVER
+        dcp = None
+        for key in ("decode-context-parallel-size", "dcp"):
+            value = serve["options"].get(key)
+            if isinstance(value, str) and value.isdigit():
+                dcp = int(value)
     kv_tokens = server_kv_tokens(state, dcp)
     limits.update(max_model_len=state.get("max_model_len"), kv_tokens=kv_tokens or None)
-    out.ok(f"model {state.get('model_id')} · max_model_len {state.get('max_model_len')} · "
-           f"max-num-seqs {limits['max_num_seqs']} ({limits['max_num_seqs_source']}) · KV {kv_tokens:,} tokens")
-    if nodes:
-        out.ok(f"one tensor-parallel group across {nodes['nnodes']} machines; this is node rank {nodes['node_rank']}")
-    image = server.image_identity()
-    out.ok(f"image {image.get('alias') or 'unknown'} · assembly {(image.get('assembly_sha256') or '?')[:16]}")
-    code = integrity.check(process["pid"] if process else None)
-    if code["status"] == "stock":
-        out.ok(f"image code matches its build ({code['files_checked']:,} files, {code['scan_seconds']} s)")
-    elif code["status"] == "modified":
-        out.error_panel("MODIFIED IMAGE: the result will be flagged", [
-            "Files differ from this image's build; the benchmark still runs and records what changed:",
-            *["  " + line for line in integrity.summary_lines(code)],
-            *([f"  … {code['changed_count'] + code['added_count'] + code['removed_count']} files in total"]
-              if code['changed_count'] + code['added_count'] + code['removed_count'] > 12 else []),
-        ])
+    if target:
+        image, code = described["image"], described["integrity"]
+        print_flare(out, described, state, kv_tokens)
     else:
-        out.warn(f"image code not verified: {code.get('reason')}")
+        out.ok(f"model {state.get('model_id')} · max_model_len {state.get('max_model_len')} · "
+               f"max-num-seqs {limits['max_num_seqs']} ({limits['max_num_seqs_source']}) · KV {kv_tokens:,} tokens")
+        if nodes:
+            out.ok(f"one tensor-parallel group across {nodes['nnodes']} machines; this is node rank {nodes['node_rank']}")
+        image = server.image_identity()
+        out.ok(f"image {image.get('alias') or 'unknown'} · assembly {(image.get('assembly_sha256') or '?')[:16]}")
+        code = integrity.check(process["pid"] if process else None)
+        if code["status"] == "stock":
+            out.ok(f"image code matches its build ({code['files_checked']:,} files, {code['scan_seconds']} s)")
+        elif code["status"] == "modified":
+            out.error_panel("MODIFIED IMAGE: the result will be flagged", [
+                "Files differ from this image's build; the benchmark still runs and records what changed:",
+                *["  " + line for line in integrity.summary_lines(code)],
+                *([f"  … {code['changed_count'] + code['added_count'] + code['removed_count']} files in total"]
+                  if code['changed_count'] + code['added_count'] + code['removed_count'] > 12 else []),
+            ])
+        else:
+            out.warn(f"image code not verified: {code.get('reason')}")
 
     busy = 0.0
     for _ in range(profile["idle_check_s"]):
@@ -659,9 +821,11 @@ def command_run(out: Output, args) -> int:
             out.info(f"· {label}: {cell['reason']}")
 
     started = datetime.now(timezone.utc)
-    recorder = telemetry.Recorder(interval=0.5).start()
-    server_recorder = telemetry.ServerRecorder(base_url, recorder.t0).start()
-    pcie_recorder = telemetry.PcieRecorder(recorder.t0).start()
+    indices = selection["indices"] if selection else None
+    recorder = telemetry.Recorder(interval=0.5, indices=indices).start()
+    server_recorder = telemetry.ServerRecorder(base_url, recorder.t0, names=telemetry.FLARE_SERVER_METRICS
+                                               if engine == "flare" else telemetry.SERVER_METRICS).start()
+    pcie_recorder = telemetry.PcieRecorder(recorder.t0, indices=indices).start()
     workdir = result_dir()
     run_id = str(uuid.uuid4())
     phases: list[dict] = []
@@ -674,7 +838,7 @@ def command_run(out: Output, args) -> int:
     total_steps = len(planned) + 2
     try:
         out.step(f"[1/{total_steps}] Hardware and PCIe topology")
-        hardware = inventory.collect()
+        hardware = inventory.collect(gpus_selected=selection["uuids"]) if selection else inventory.collect()
         gpus = hardware.get("gpus", [])
         recorder.link_bdfs = list(dict.fromkeys(
             hop["bdf"] for path in hardware["pcie"]["gpu_paths"].values() for hop in path["chain"]))
@@ -708,7 +872,7 @@ def command_run(out: Output, args) -> int:
             p2p_result = {"status": "skipped", "reason": "--no-p2pmark"}
         else:
             p2p_start = time.time()
-            p2p_result = run_p2pmark(out, hardware, base_url, workdir)
+            p2p_result = run_p2pmark(out, hardware, base_url, workdir, selection)
             if p2p_result.pop("ran", False):
                 phases.append({"kind": "p2pmark", "name": "p2pmark", "start": p2p_start,
                                "measure_start": p2p_start, "end": time.time()})
@@ -768,6 +932,7 @@ def command_run(out: Output, args) -> int:
         "profile": args.profile,
         "run_id": run_id,
         "status": status,
+        "engine": engine,
         "started": started.isoformat(),
         "finished": datetime.now(timezone.utc).isoformat(),
         "client": {"lil_bench": VERSION, "llm_decode_bench": _bench_version(), "argv": _safe_argv(),
@@ -775,10 +940,12 @@ def command_run(out: Output, args) -> int:
                    "allow_busy": bool(busy and args.allow_busy)},
         "image": image,
         "integrity": code,
-        "server": {"pid": process and process["pid"], "argv": process and process["argv"],
-                   "environment": server.filtered_environment(process["pid"]) if process else {},
-                   "model": serve.get("model"), "options": serve["options"], "limits": limits, "api": state,
-                   "url": base_url, **({"nodes": nodes} if nodes else {})},
+        "server": described["server"] if target else {
+            "pid": process and process["pid"], "argv": process and process["argv"],
+            "environment": server.filtered_environment(process["pid"]) if process else {},
+            "model": serve.get("model"), "options": serve["options"], "limits": limits, "api": state,
+            "url": base_url, **({"nodes": nodes} if nodes else {})},
+        **({"flare": described["flare"]} if target else {}),
         "hardware": hardware,
         "plan": plan,
         "results": {"p2pmark": p2p_result, "bench": bench_json, "bench_command": cmd,
